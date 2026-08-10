@@ -44,8 +44,76 @@ tc.saga("order-1001")
   结果: Failed
 ```
 
-**Go 做不到这个形态**：`c-shared` 会把整个运行时拖进宿主进程，还有 GC 和信号
-处理的冲突，实际没人这么用。所以 DTM 结构上必须独立部署。
+**Go 做不到这个形态**：`c-shared` 会把整个运行时（调度器 + GC + 信号处理）拖进
+宿主进程，跟宿主的线程/信号模型冲突，实际没人这么用。所以 DTM 结构上必须独立部署。
+
+### 任何语言都能嵌（C ABI）
+
+编出来就是一个普通 `.so`（8.5 MB，无运行时包袱）：
+
+```bash
+cargo build -p dtmrs-ffi --release      # → target/release/libdtmrs.so
+```
+
+Python（`bindings/python/`，纯 ctypes，零依赖）：
+
+```python
+import dtmrs
+tc = dtmrs.Tc("sqlite:/tmp/app.db")
+
+@tc.handler("转出")
+def transfer_out(ctx):
+    move(1, 2, 100)                     # 你自己的业务 SQL
+    return dtmrs.SUCCESS
+
+@tc.handler("转出撤销")
+def transfer_out_undo(ctx):
+    move(2, 1, 100)
+    return dtmrs.SUCCESS
+
+tc.start()
+tc.submit_saga("order-1", [("local://转出", "local://转出撤销")])
+```
+
+`python bindings/python/example.py` 的实际输出（账户余额真的在动）：
+
+```
+初始余额: {1: 1000, 2: 0}
+① 正常转账
+  [转出] gid=py-1 branch=01 op=action 线程=Dummy-1
+  结果: succeed  余额: {1: 900, 2: 100}
+
+② 风控拒绝 → 逆序补偿，钱要退回来
+  [转出] gid=py-2 branch=01 op=action
+  [风控拒绝] gid=py-2 branch=02 op=action
+  [空补偿] gid=py-2 branch=02 op=compensate      ← 逆序
+  [转出撤销] gid=py-2 branch=01 op=compensate
+  结果: failed  余额: {1: 900, 2: 100}          ← 转出被补偿抹平了
+
+③ 下游超时 → 只重试，不回滚
+  状态: submitted
+```
+
+C 也验过（`examples/c/demo.c` + `include/dtmrs.h`）：
+
+```bash
+gcc -I include examples/c/demo.c -L target/release -ldtmrs -o demo && ./demo
+```
+
+#### 跨语言这一跳的三个坑（都处理了）
+
+**1. 宿主回调是同步的，还可能抢 GIL。**
+Python handler 去查库、发 HTTP 动辄几十毫秒。直接在 tokio worker 线程里调会把
+运行时卡死 —— 所以每次回调都走 `spawn_blocking`，扔进专门的阻塞线程池。
+
+**2. 回调来自任意线程。**
+看上面输出里的 `线程=Dummy-1/2/3...` —— 那是 Rust 侧的线程回调进 Python。
+所以宿主 handler 必须线程安全（示例里每次现开 sqlite 连接，不共享）。
+ctypes 的 `CFUNCTYPE` 自动处理 GIL；JNI 需要自己 attach。
+
+**3. 宿主抛异常 = 结果未知，不是失败。**
+Python handler 抛异常、返回野值、甚至回调 panic —— 全都按 `UNKNOWN` 处理，
+只重试不回滚。不知道它到底做了没有，误判失败会把本该成功的事务毁掉。
 
 ### 嵌入式没有牺牲持久性
 
@@ -66,6 +134,7 @@ TC 在进程里，但状态在 DB 里。进程死了事务不丢 —— 新进�
 |---|---|
 | SAGA（正向提交 + 逆序补偿） | ✅ 可用 |
 | **嵌入式 TC（进程内分支 + 无需部署）** | ✅ 可用 |
+| **C ABI + Python 绑定（任何语言可嵌）** | ✅ 可用 |
 | 子事务屏障（幂等 / 空回滚 / 悬挂） | ✅ 可用 |
 | 崩溃恢复（未终结事务自动续推） | ✅ 可用 |
 | 多 TC 实例（DB 租约防重复推进） | ✅ 可用 |
@@ -76,7 +145,8 @@ TC 在进程里，但状态在 DB 里。进程死了事务不丢 —— 新进�
 | TCC / 二阶段消息 / XA | ⬜ 未做（`submit` 会明确报错，不假装支持） |
 | gRPC | ⬜ 未做 |
 
-**37 个测试全绿**：6 个走真实 HTTP 的端到端 + 5 个嵌入式（含跨进程重启恢复）。
+**41 个测试全绿**：6 个走真实 HTTP 的端到端 + 5 个嵌入式（含跨进程重启恢复）
++ 4 个 C ABI（含空指针/坏参数不崩）。Python 和 C 的示例都实际跑通。
 
 ## 跑起来
 
@@ -166,6 +236,10 @@ crates/
   dtmrs-store/    存储（sqlite）+ 租约抢占
   dtmrs-server/   TC：axum HTTP + 常驻推进器 + 嵌入式门面（registry / embedded）
   dtmrs-barrier/  客户端子事务屏障
+  dtmrs-ffi/      C ABI（cdylib + staticlib）
+include/dtmrs.h            C 头文件
+bindings/python/dtmrs.py   Python 绑定（纯 ctypes）
+examples/c/demo.c          C 示例
 ```
 
 把状态机跟 I/O 分开是刻意的：分布式事务的 bug 大多出在状态迁移上，

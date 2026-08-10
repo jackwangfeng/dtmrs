@@ -325,6 +325,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtmrs-ffi"
+version = "0.1.0"
+dependencies = [
+ "dtmrs-core",
+ "dtmrs-server",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "dtmrs-server"
 version = "0.1.0"
 dependencies = [
