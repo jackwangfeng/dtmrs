@@ -1,161 +1,250 @@
 # dtmrs
 
-Rust 写的分布式事务管理器，对标 [DTM](https://github.com/dtm-labs/dtm)（Go，10.9k★）。
+**English** | [简体中文](README.zh-CN.md)
 
-**为什么重做**：Rust 生态里没有能用的分布式事务管理器。唯一对标项目
-[rseata](https://github.com/oulover/rseata) 只有 88★、1 个贡献者、33 次提交、
-**而且没有 LICENSE 文件** —— 无许可证等于保留全部版权，法律上不能商用。
-其它 Rust 方案（restate/obelisk）是持久化执行范式，且分别受 BUSL / AGPL 限制。
+A distributed transaction manager written in Rust, targeting feature parity with
+[DTM](https://github.com/dtm-labs/dtm) (Go, 10.9k★).
 
-dtmrs 是 **Apache-2.0**，商用闭源接入没有障碍。
+**Why rebuild it**: the Rust ecosystem has no usable distributed transaction manager.
+The only comparable project, [rseata](https://github.com/oulover/rseata), has 88 stars,
+one contributor, 33 commits — **and no LICENSE file**, which legally means all rights
+reserved, so it cannot be used commercially. Other Rust options (restate/obelisk) are
+durable-execution engines, and are restricted by BUSL / AGPL respectively.
 
-## 差异化：嵌入式 TC（DTM 做不到的形态）
+dtmrs is **Apache-2.0**. Nothing blocks commercial or closed-source adoption.
 
-TC 当库链进你自己的进程，**不需要单独部署服务**：
+## What makes it different: the embeddable coordinator
+
+Link the transaction coordinator into your own process as a library — **no separate
+service to deploy**:
 
 ```text
-DTM:    你的服务 ──HTTP──► 独立部署的 TC 进程 ──► DB
-                           （要运维、要高可用、要监控）
-dtmrs:  你的服务（TC 就在进程里）──► DB
+DTM:    your service ──HTTP──► separately deployed TC process ──► DB
+                               (to operate, to keep available, to monitor)
+dtmrs:  your service (TC lives inside it) ──► DB
 ```
 
-分支不用是 HTTP URL，可以直接是进程内的函数 —— 没有网络、没有序列化：
+Branches don't have to be HTTP URLs. They can be plain in-process functions — no
+network, no serialization:
 
 ```rust
 let tc = Embedded::builder("sqlite:app.db")
-    .handler("扣款",     |ctx| async move { /* 业务逻辑 */ BranchResult::Success })
-    .handler("扣款撤销", |ctx| async move { BranchResult::Success })
+    .handler("deduct",      |ctx| async move { /* business logic */ BranchResult::Success })
+    .handler("deduct_undo", |ctx| async move { BranchResult::Success })
     .start().await?;
 
 tc.saga("order-1001")
-    .step("local://扣款", "local://扣款撤销")
-    .step("http://shipment/create", "http://shipment/cancel")   // 可跟远端混用
+    .step("local://deduct", "local://deduct_undo")
+    .step("http://shipment/create", "http://shipment/cancel")   // mix with remote calls
     .submit().await?;
 ```
 
-`cargo run --example embedded` 的实际输出：
+Actual output of `cargo run --example embedded`:
 
 ```
-② 库存不足（第 2 步要求回滚，应逆序补偿）
-  [扣款]      gid=order-2 branch=01
-  [库存不足]  gid=order-2 → 明确要求回滚
-  [发货撤销]  gid=order-2 ← 补偿
-  [扣款撤销]  gid=order-2 ← 补偿
-  结果: Failed
+② out of stock (step 2 demands rollback, compensations must run in reverse)
+  [deduct]        gid=order-2 branch=01
+  [out of stock]  gid=order-2 → explicitly demands rollback
+  [unship]        gid=order-2 ← compensating
+  [deduct_undo]   gid=order-2 ← compensating
+  result: Failed
 ```
 
-**Go 做不到这个形态**：`c-shared` 会把整个运行时（调度器 + GC + 信号处理）拖进
-宿主进程，跟宿主的线程/信号模型冲突，实际没人这么用。所以 DTM 结构上必须独立部署。
+**Go structurally cannot do this**: `c-shared` drags the entire runtime (scheduler, GC,
+signal handling) into the host process and conflicts with the host's threading and signal
+model. Nobody actually ships that. So DTM has to be deployed standalone.
 
-### 任何语言都能嵌（C ABI）
+### Embeddable from any language (C ABI)
 
-编出来就是一个普通 `.so`（8.5 MB，无运行时包袱）：
+The build output is an ordinary `.so` with no runtime baggage:
 
 ```bash
 cargo build -p dtmrs-ffi --release      # → target/release/libdtmrs.so
 ```
 
-Python（`bindings/python/`，纯 ctypes，零依赖）：
+| Language | Binding | Dispatch model |
+|---|---|---|
+| Python | `bindings/python/` — pure ctypes, zero deps | callback |
+| Node | `bindings/node/` — koffi, **async handlers** | pull |
+| JVM | `bindings/java/` — JNA, Java 8+, no maven/gradle needed | callback |
+| C | `include/dtmrs.h` + `examples/c/demo.c` | callback |
+
+Python:
 
 ```python
 import dtmrs
 tc = dtmrs.Tc("sqlite:/tmp/app.db")
 
-@tc.handler("转出")
+@tc.handler("transfer_out")
 def transfer_out(ctx):
-    move(1, 2, 100)                     # 你自己的业务 SQL
-    return dtmrs.SUCCESS
-
-@tc.handler("转出撤销")
-def transfer_out_undo(ctx):
-    move(2, 1, 100)
+    move(1, 2, 100)                     # your own business SQL
     return dtmrs.SUCCESS
 
 tc.start()
-tc.submit_saga("order-1", [("local://转出", "local://转出撤销")])
+tc.submit_saga("order-1", [("local://transfer_out", "local://transfer_out_undo")])
 ```
 
-`python bindings/python/example.py` 的实际输出（账户余额真的在动）：
+Node — handlers can be `async`, so you can `await` your database normally:
 
-```
-初始余额: {1: 1000, 2: 0}
-① 正常转账
-  [转出] gid=py-1 branch=01 op=action 线程=Dummy-1
-  结果: succeed  余额: {1: 900, 2: 100}
+```js
+const dtmrs = require('./dtmrs');
+const tc = new dtmrs.Tc('sqlite:/tmp/app.db');
 
-② 风控拒绝 → 逆序补偿，钱要退回来
-  [转出] gid=py-2 branch=01 op=action
-  [风控拒绝] gid=py-2 branch=02 op=action
-  [空补偿] gid=py-2 branch=02 op=compensate      ← 逆序
-  [转出撤销] gid=py-2 branch=01 op=compensate
-  结果: failed  余额: {1: 900, 2: 100}          ← 转出被补偿抹平了
+tc.handler('transfer_out', async (ctx) => {
+  await db.query('UPDATE account SET balance = balance - 100 WHERE id = 1');
+  return dtmrs.SUCCESS;
+});
 
-③ 下游超时 → 只重试，不回滚
-  状态: submitted
+await tc.start();
+await tc.submitSaga('order-1', [['local://transfer_out', 'local://transfer_out_undo']]);
 ```
 
-C 也验过（`examples/c/demo.c` + `include/dtmrs.h`）：
+JVM:
 
-```bash
-gcc -I include examples/c/demo.c -L target/release -ldtmrs -o demo && ./demo
+```java
+try (Dtmrs tc = new Dtmrs("sqlite:/tmp/app.db")) {
+    tc.handler("transfer_out", ctx -> {
+        jdbc.update("UPDATE account SET balance = balance - 100 WHERE id = 1");
+        return Dtmrs.SUCCESS;
+    });
+    tc.start();
+    tc.submitSaga("order-1", Dtmrs.step("local://transfer_out", "local://transfer_out_undo"));
+}
 ```
 
-#### 跨语言这一跳的三个坑（都处理了）
+All four examples actually run; balances really move. Actual Node output:
 
-**1. 宿主回调是同步的，还可能抢 GIL。**
-Python handler 去查库、发 HTTP 动辄几十毫秒。直接在 tokio worker 线程里调会把
-运行时卡死 —— 所以每次回调都走 `spawn_blocking`，扔进专门的阻塞线程池。
+```
+initial balances: { '1': 1000, '2': 0 }
 
-**2. 回调来自任意线程。**
-看上面输出里的 `线程=Dummy-1/2/3...` —— 那是 Rust 侧的线程回调进 Python。
-所以宿主 handler 必须线程安全（示例里每次现开 sqlite 连接，不共享）。
-ctypes 的 `CFUNCTYPE` 自动处理 GIL；JNI 需要自己 attach。
+① normal transfer
+  [transfer_out] gid=node-1 branch=01 op=action
+  result: succeed  balances: { '1': 900, '2': 100 }
 
-**3. 宿主抛异常 = 结果未知，不是失败。**
-Python handler 抛异常、返回野值、甚至回调 panic —— 全都按 `UNKNOWN` 处理，
-只重试不回滚。不知道它到底做了没有，误判失败会把本该成功的事务毁掉。
+② risk control rejects → reverse-order compensation, money comes back
+  [transfer_out] gid=node-2 branch=01 op=action
+  [risk_reject]  gid=node-2 branch=02 op=action
+  [null_comp]    gid=node-2 branch=02 op=compensate      ← reverse order
+  [transfer_undo] gid=node-2 branch=01 op=compensate
+  result: failed  balances: { '1': 900, '2': 100 }   ← the transfer was undone
 
-### 嵌入式没有牺牲持久性
+③ downstream timeout → retry only, never roll back
+  status: submitted
+```
 
-TC 在进程里，但状态在 DB 里。进程死了事务不丢 —— 新进程启动后自动接着推，
-**不需要客户端重新提交，也不会重做已完成的步骤**。
-（测试：`跨进程重启_事务不丢且已完成的步骤不重做`）
+#### Two kinds of host, two dispatch models
 
-### 一个必须知道的约束
+This split was discovered by testing, not by design:
 
-`local://` 分支存的是**名字**，因为闭包没法持久化。重启后必须注册同名 handler。
+| | Model | Why |
+|---|---|---|
+| Python / Java / C | **callback** (`dtmrs_register`) | the host can run handlers synchronously on any thread |
+| **Node** | **pull** (`dtmrs_register_pull`) | you cannot `await` inside a synchronous callback |
 
-- 漏注册 → 按「结果未知」处理，**只重试不回滚**（这是部署问题，不是业务失败）
-- `submit()` 时就检查名字是否都注册了 —— 宁可提交报错，也别等副作用落地才发现
+The initial assumption was that JS simply cannot be called back from a foreign thread.
+Testing disproved it — when the event loop is idle, koffi queues foreign-thread callbacks
+onto the main thread and they run fine.
 
-## 现在能用什么
+The real obstacle is different: **a C ABI callback must return an `int` synchronously**,
+while essentially all Node business code is asynchronous (database clients return
+Promises). No amount of documentation works around that, so the C ABI grew a second
+dispatch model:
 
-| 能力 | 状态 |
+```c
+int dtmrs_register_pull(DtmrsTc *tc, const char *name);
+int dtmrs_next_task(DtmrsTc *tc, int timeout_ms, char *out, size_t out_len);
+int dtmrs_reply(DtmrsTc *tc, unsigned long long task_id, int result);
+```
+
+The library queues pending branches; the host pulls them inside its own event loop, does
+whatever async work it likes, and replies. This **does not replace** the callback model —
+both can be used in one process, each owning different branch names.
+
+Two things you must know:
+
+- `timeout_ms = 0` means **non-blocking**. Event-loop hosts must pass 0 — blocking freezes
+  the loop, and then you cannot even deliver the reply.
+- If the host doesn't reply within **30 seconds**, the result is treated as **unknown**.
+  It may have completed the work and simply failed to answer; treating that as failure
+  would trigger a wrong rollback.
+
+For the same reason, the Node binding's `waitFinal` polls instead of calling
+`dtmrs_wait_final`: that C function blocks the calling thread, which in Node freezes the
+whole event loop, stops branch dispatch, and guarantees a timeout.
+
+**Two JVM-specific traps** (both handled inside the binding): JNA callback objects must be
+strongly referenced — once garbage collected, Rust still holds a raw function pointer and
+the next callback is a dangling pointer, i.e. a segfault; and exceptions must never
+propagate back across the FFI boundary (undefined behavior), so they are uniformly
+converted to "unknown".
+
+JNA was chosen over FFM (`java.lang.foreign`) because FFM only became final in JDK 22
+(preview in 21, incubator in 17); requiring users to be on 22+ is too steep. JNA works on
+Java 8+.
+
+#### Three cross-language hazards (all handled)
+
+**1. Host callbacks are synchronous and may block.** A Python handler doing a database
+query or an HTTP call easily takes tens of milliseconds, and CPython needs the GIL.
+Calling that directly on a tokio worker would stall the runtime, so every callback goes
+through `spawn_blocking` onto a dedicated blocking pool.
+
+**2. Callbacks arrive on arbitrary threads.** The `thread=Thread-0/Thread-1` in the JVM
+example output is Rust's thread calling into the JVM. Host handlers must be thread-safe.
+ctypes' `CFUNCTYPE` handles the GIL automatically; JNA attaches the thread for you; raw
+JNI would require `AttachCurrentThread` yourself.
+
+**3. A host exception means "unknown", not "failure".** If a handler raises, returns
+garbage, or panics, it is treated as `UNKNOWN` — retry, never roll back. You do not know
+whether it actually did the work, and misjudging it as failure would destroy a
+transaction that should have succeeded.
+
+### Embedding does not sacrifice durability
+
+The TC runs in your process, but state lives in the database. If the process dies, nothing
+is lost — a new process picks up where it left off, **without the client resubmitting and
+without redoing completed steps**.
+(Test: `跨进程重启_事务不丢且已完成的步骤不重做`)
+
+### One constraint you must know
+
+A `local://` branch stores a **name**, because closures cannot be persisted. After a
+restart you must register a handler under the same name.
+
+- Missing registration → treated as "unknown result", so it **retries and never rolls
+  back** (this is a deployment problem, not a business failure)
+- `submit()` verifies that every name is registered — better to fail at submit time than
+  to discover it after side effects have landed
+
+## What works today
+
+| Capability | Status |
 |---|---|
-| SAGA（正向提交 + 逆序补偿） | ✅ 可用 |
-| **嵌入式 TC（进程内分支 + 无需部署）** | ✅ 可用 |
-| **C ABI + Python 绑定（任何语言可嵌）** | ✅ 可用 |
-| 子事务屏障（幂等 / 空回滚 / 悬挂） | ✅ 可用 |
-| 崩溃恢复（未终结事务自动续推） | ✅ 可用 |
-| 多 TC 实例（DB 租约防重复推进） | ✅ 可用 |
-| 指数退避重试 | ✅ 可用 |
-| HTTP API（路径与 DTM 对齐） | ✅ 可用 |
-| SQLite 存储 | ✅ 可用 |
-| **Postgres 存储（多实例生产部署）** | ✅ 可用 |
-| **MySQL 存储** | ✅ 可用 |
-| **TCC（try/confirm/cancel）** | ✅ 可用 |
-| **二阶段消息（取代 MQ 事务消息）** | ✅ 可用 |
-| **XA（Postgres + MySQL 两阶段提交）** | ✅ 可用 |
-| gRPC | ⬜ 未做 |
+| SAGA (forward commit + reverse compensation) | ✅ |
+| **Embeddable TC (in-process branches, nothing to deploy)** | ✅ |
+| **C ABI + Python / Node / JVM bindings** | ✅ |
+| Sub-transaction barrier (idempotence / empty rollback / suspension) | ✅ |
+| Crash recovery (unfinished transactions resume automatically) | ✅ |
+| Multiple TC instances (DB lease prevents double-driving) | ✅ |
+| Exponential backoff retry | ✅ |
+| HTTP API (paths aligned with DTM) | ✅ |
+| SQLite storage | ✅ |
+| **Postgres storage (multi-instance production deployment)** | ✅ |
+| **MySQL storage** | ✅ |
+| **TCC (try / confirm / cancel)** | ✅ |
+| **Two-phase messaging (replaces transactional MQ)** | ✅ |
+| **XA (native two-phase commit on Postgres + MySQL)** | ✅ |
+| **gRPC (branch calls + TC server API)** | ✅ |
 
-**85 个测试全绿**：25 个状态机/方言单测 + 7 个存储 + 10 个屏障 + 6 个 XA 工具
-+ 4 个 C ABI + 4 个服务端单元 + 6 个 SAGA 端到端 + 12 个 TCC/msg + 5 个嵌入式
-+ **6 个 XA 端到端**。
-存储和屏障的 17 个会在 sqlite / 真 Postgres / 真 MySQL 上**各跑一遍**；
-XA 那 6 个必须有真 Postgres 或真 MySQL（两个都配就都跑）。
-Python 和 C 的示例都实际跑通。
+**105 tests, all green**: 27 state-machine/dialect unit tests + 7 storage + 10 barrier
++ 6 XA helper + 8 C ABI + 9 server unit + 6 SAGA e2e + 12 TCC/msg + 5 embedded
++ 6 XA e2e + 8 gRPC e2e.
+The 17 storage and barrier tests each run against **sqlite, real Postgres and real MySQL**;
+the 6 XA tests require a real Postgres or MySQL (both configured → both run).
+The Python, Node, Java and C examples all actually run.
 
-真库测试靠环境变量开关，**没配就是没跑，不是通过**：
+Real-database tests are gated by environment variables. **Not configured means not
+tested — it does not mean passed**:
 
 ```bash
 DTMRS_TEST_PG='postgres://postgres:pw@127.0.0.1:5432/dtmrs' \
@@ -165,7 +254,7 @@ DTMRS_TEST_XA_MYSQL='mysql://root:pw@127.0.0.1:3306/dtmrs' \
 cargo test --workspace
 ```
 
-## 存储：sqlite / Postgres / MySQL 一套 SQL
+## Storage: one set of SQL for sqlite / Postgres / MySQL
 
 ```bash
 DTMRS_DB='postgres://user:pass@host:5432/dtm' ./dtmrs
@@ -173,233 +262,322 @@ DTMRS_DB='mysql://user:pass@host:3306/dtm'    ./dtmrs
 DTMRS_DB='sqlite:dtmrs.db'                    ./dtmrs
 ```
 
-**三种库一份实现**，没有抽 `Store` trait、没有三份 SQL。靠 `sqlx::Any` 加一层
-薄薄的方言渲染（`dtmrs-core/src/dialect.rs`）。
+**Three databases, one implementation.** No `Store` trait, no three copies of the SQL —
+just `sqlx::Any` plus a thin dialect rendering layer (`dtmrs-core/src/dialect.rs`).
 
-只有两种后端的时候 `sqlx::Any` 配 `$N` 就够了，**MySQL 一进来同时打破三条**，
-才不得不有这一层。全部实测（sqlx 0.8 / pg16 / mysql 8.0.44）：
+With only two backends, `sqlx::Any` with `$N` placeholders was enough. **MySQL breaks
+three assumptions at once**, which is why the layer exists. All measured
+(sqlx 0.8 / pg16 / mysql 8.0.44):
 
 | | sqlite | postgres | mysql |
 |---|---|---|---|
-| `$1` 占位符 | ✅ | ✅ | ❌ `Unknown column '$1'` |
-| `?` 占位符 | ✅ | ❌ 语法错误 | ✅ |
-| `ON CONFLICT DO NOTHING` | ✅ | ✅ | ❌ 1064 语法错误 |
+| `$1` placeholders | ✅ | ✅ | ❌ `Unknown column '$1'` |
+| `?` placeholders | ✅ | ❌ syntax error | ✅ |
+| `ON CONFLICT DO NOTHING` | ✅ | ✅ | ❌ 1064 syntax error |
 | `INSERT IGNORE` | ❌ | ❌ | ✅ |
-| `TEXT PRIMARY KEY` | ✅ | ✅ | ❌ 1170 要 key length |
-| `CREATE INDEX IF NOT EXISTS` | ✅ | ✅ | ❌ 1064 语法错误 |
+| `TEXT PRIMARY KEY` | ✅ | ✅ | ❌ 1170 needs key length |
+| `CREATE INDEX IF NOT EXISTS` | ✅ | ✅ | ❌ 1064 syntax error |
 
-所以模板统一写 `?`（跟 MySQL 一致），非 MySQL 后端由 `Backend::q` 转成 `$1..$n`。
-代价是**模板的字符串字面量里不能出现 `?`**，否则会被当成占位符。
+Templates therefore use `?` uniformly (matching MySQL), and `Backend::q` rewrites them to
+`$1..$n` for the others. The cost: **string literals in templates must not contain `?`**,
+or they will be treated as placeholders.
 
-### MySQL 上三个必须知道的坑
+### Three MySQL traps you must know
 
-**1. `ON DUPLICATE KEY UPDATE` 重复时 `rows_affected` 返回 1，不是 0。**
-拿它做幂等判断会把"已存在"误判成"刚插入"。所以 MySQL 必须用 `INSERT IGNORE`
-（重复时返回 0，跟另外两家一致）。
+**1. `ON DUPLICATE KEY UPDATE` returns `rows_affected = 1` on a duplicate, not 0.**
+Using it for idempotence checks misreads "already existed" as "just inserted". MySQL must
+use `INSERT IGNORE` (which returns 0 on duplicates, consistent with the other two).
 
-**2. 经 `sqlx::Any` 读 MySQL 的 `TEXT` 一律报类型不匹配。**
+**2. Reading MySQL `TEXT` through `sqlx::Any` always fails as a type mismatch.**
 
 ```
 mismatched types; Rust type String is not compatible with SQL type BLOB
 ```
 
-`LONGTEXT`、`MEDIUMTEXT`、显式 `CHARACTER SET utf8mb4` 都一样，
-五种写法里只有 `VARCHAR` 能解成 String。所以自由文本列在 MySQL 上是
-`VARCHAR(n)`，n 要够装最长的内容（单行还有 65535 字节总限制，utf8mb4 每字符 4 字节）。
+`LONGTEXT`, `MEDIUMTEXT`, and explicit `CHARACTER SET utf8mb4` all behave the same. Of the
+five spellings tried, only `VARCHAR` decodes into `String`. So free-text columns are
+`VARCHAR(n)` on MySQL, with `n` large enough for the longest content (note the 65535-byte
+per-row limit, and utf8mb4 counts 4 bytes per character).
 
-**3. 索引写法是二选一的。**
-MySQL 没有 `CREATE INDEX IF NOT EXISTS`，只能建表时内联 `KEY`；
-另外两家反过来。dialect 层用 `create_index()` / `inline_index()` 一对返回空值来切。
+**3. Index syntax is mutually exclusive.** MySQL has no
+`CREATE INDEX IF NOT EXISTS` and requires inline `KEY` at table creation; the other two are
+the opposite. The dialect layer switches via a `create_index()` / `inline_index()` pair
+where one of the two returns empty.
 
-整数列一律 `BIGINT` —— postgres 的 `INTEGER` 只有 4 字节，装不下时间戳。
+Integer columns are always `BIGINT` — Postgres `INTEGER` is only 4 bytes and cannot hold a
+timestamp.
 
-### 实测：两个实例并发，没有重复推进
+Values that are too long are rejected in Rust (`check_len`) rather than at the database:
+MySQL's `INSERT IGNORE` **silently truncates** oversized values (1406 downgraded to a 1265
+warning), and a truncated `gid` would make two unrelated transactions collide on the same
+barrier row.
 
-Postgres 的意义就在这儿（sqlite 撑不住多实例写）。20 笔事务、两个实例、
-业务端故意每次 sleep 50ms 制造撞车窗口：
+### Measured: two instances, no double-driving
+
+This is what Postgres is for (sqlite cannot take multi-instance writes). 20 transactions,
+two instances, with the business side sleeping 50 ms on purpose to widen the race window:
 
 ```
-被调用的分支数: 40 （20 笔 × 2 步）
-调用次数分布: {1: 40}          ← 每个分支正好 1 次
-重复调用: 无 ✓
+branches invoked: 40 (20 × 2 steps)
+call count distribution: {1: 40}     ← each branch exactly once
+duplicate calls: none ✓
 
-事务归属:  succeed|tc-1|10
-          succeed|tc-2|10     ← 两个实例各推了一半
+ownership: succeed|tc-1|10
+           succeed|tc-2|10           ← each instance drove half
 ```
 
-### 踩到的坑：Postgres 的 CREATE TABLE IF NOT EXISTS 不是并发安全的
+### A trap we hit: Postgres `CREATE TABLE IF NOT EXISTS` is not concurrency-safe
 
-两个实例同时启动，实例 1 直接崩了：
+Start two instances simultaneously and instance 1 crashes outright:
 
 ```
 duplicate key value violates unique constraint "pg_type_typname_nsp_index"
 ```
 
-`CREATE TABLE IF NOT EXISTS` 在 Postgres 里会在系统目录上撞唯一键 ——
-sqlite 单写永远不会暴露这个问题，**只有真起两个实例才能撞出来**。
-现在建表带重试（输的那个重试时表已经建好，`IF NOT EXISTS` 正常跳过）。
+In Postgres, `CREATE TABLE IF NOT EXISTS` can collide on a unique key in the system
+catalog. A single-writer sqlite setup will never expose this — **only actually running two
+instances will**. Table creation now retries (by the time the loser retries, the table
+exists and `IF NOT EXISTS` skips normally).
+
+## gRPC: supported in both directions
+
+The branch address prefix selects the protocol, and **one transaction can mix all three**:
+
+```json
+{"action": "grpc://ship:9000/busi.Busi/Ship", "compensate": "grpc://ship:9000/busi.Busi/Unship"}
+{"action": "http://pay/deduct",               "compensate": "http://pay/deduct-undo"}
+{"action": "local://deduct",                  "compensate": "local://deduct_undo"}
+```
+
+The TC also serves a gRPC API equivalent to the HTTP one (`dtmrs.v1.Tc`, port 36790 by
+default):
+
+```bash
+DTMRS_ADDR=0.0.0.0:36789 DTMRS_GRPC_ADDR=0.0.0.0:36790 ./dtmrs
+```
+
+Both surfaces share one implementation (`api.rs`), so a transaction submitted over gRPC
+can be queried over HTTP and vice versa.
+
+### Your services don't need to change for dtmrs
+
+Calling a gRPC branch **does not require the callee's proto**. A custom byte-shuffling
+codec replaces tonic's default prost codec: the request body is raw bytes, the response is
+raw bytes, and the method path is a runtime string anyway.
+
+So **any existing gRPC method can serve as a branch**. The request body is empty bytes (an
+empty protobuf message is valid for *any* message type), and branch identity travels in
+metadata:
+
+| metadata key | contents |
+|---|---|
+| `dtm-gid` | global transaction id |
+| `dtm-trans_type` | saga / tcc / msg / xa |
+| `dtm-branch_id` | branch number (`01`, `02`, …) |
+| `dtm-op` | action / compensate / confirm / cancel / … |
+
+Those four are exactly what the sub-transaction barrier needs — the same information HTTP
+passes as query parameters.
+
+### Status code mapping: the one place that can cause inconsistency
+
+HTTP uses 409 / 425 to express "explicit failure" and "still working". gRPC has neither, so
+each had to be mapped onto a standard code that infrastructure won't produce by accident:
+
+| gRPC code | meaning | HTTP equivalent |
+|---|---|---|
+| `OK`(0) | success | 200 |
+| `ABORTED`(10) | business **explicitly** demands rollback | 409 |
+| `FAILED_PRECONDITION`(9) | still working, not a failure | 425 |
+| **everything else** | result **unknown** — retry, never roll back | 5xx / timeout |
+
+The last row is the critical one. `UNAVAILABLE`(14), `DEADLINE_EXCEEDED`(4) and
+`INTERNAL`(13) are precisely the codes produced by network flakiness and timeouts — and on
+a timeout the callee may well have succeeded, so compensating would create inconsistency.
+
+`CANCELLED`(1) is the easiest to get wrong: that is **us** giving up, not the callee
+refusing.
+
+(Tests: `grpc只有aborted才算失败` exhausts all 16 codes; `grpc与http的判定语义一致`
+pins that both protocols reach the same verdict for the same intent.)
 
 ## TCC
 
-try 阶段由**客户端**驱动（先 `registerBranch` 再调 try），TC 只管 confirm/cancel：
+The try phase is driven by the **client** (register the branch first, then call try); the
+TC only handles confirm/cancel:
 
 ```bash
 curl -XPOST :36789/api/dtmsvr/prepare -d '{"gid":"tcc-A","trans_type":"tcc"}'
 curl -XPOST :36789/api/dtmsvr/registerBranch -d '{"gid":"tcc-A","branch_id":"01",
   "try":"http://b/try1","confirm":"http://b/confirm1","cancel":"http://b/cancel1"}'
-# ← 客户端在这里自己调 try。全成功则 submit，任一失败则 abort
+# ← the client calls try here. All succeeded → submit; any failed → abort
 curl -XPOST :36789/api/dtmsvr/submit -d '{"gid":"tcc-A","trans_type":"tcc"}'
 ```
 
-**必须先登记再调 try**。反过来的话 try 成功但登记失败，TC 不知道有这个分支，
-回滚时不会 cancel 它 —— 预留的资源永久泄漏。
+**Register before calling try.** The other order means try succeeds but registration fails,
+the TC never learns the branch exists, and it will not cancel it on rollback — the reserved
+resources leak permanently.
 
-## TCC 跟 SAGA 的关键语义差别
+### The critical semantic difference from SAGA
 
-SAGA 的 action 返回 FAILURE → 逆序补偿。
-**TCC 的 confirm 返回 FAILURE 绝不能触发 cancel** —— try 已经成功、资源已预留、
-全局已决定提交，这时候 cancel 会把已确认的事务撤掉。唯一正确处理是无限重试 + 报警。
+A SAGA action returning FAILURE triggers reverse compensation.
+**A TCC confirm returning FAILURE must never trigger cancel** — try already succeeded,
+resources are reserved, and the global decision to commit is made; cancelling now would
+undo a confirmed transaction. The only correct handling is infinite retry plus alerting.
 
-`tcc_advance` 在 Submitted 阶段**永远不会**返回 `Finish(Aborting)`，
-测试里穷举了 3×3 种分支状态组合来钉住这条。
-（测试：`confirm失败绝不能触发cancel`、`tcc_confirm失败只重试绝不转cancel`）
+`tcc_advance` **never** returns `Finish(Aborting)` from the Submitted phase, and the test
+exhausts all 3×3 branch-state combinations to pin it down.
+(Tests: `confirm失败绝不能触发cancel`, `tcc_confirm失败只重试绝不转cancel`)
 
-## 二阶段消息：不用 MQ 也能保证消息必达
+## Two-phase messaging: guaranteed delivery without an MQ
 
-流程：`prepare` 落库 → 业务提交本地事务 → `submit`。
-**如果进程崩在这两步之间**，TC 会回查业务方问"你那个本地事务到底提交了没有"：
+The flow: `prepare` persists → the business commits its local transaction → `submit`.
+**If the process dies between those two steps**, the TC asks the business side whether that
+local transaction actually committed:
 
-| 回查回答 | TC 动作 |
+| callback answer | TC action |
 |---|---|
-| SUCCESS | 本地事务已提交 → 继续推正向分支 |
-| FAILURE | 本地事务没提交 → 整单作废 |
-| ONGOING / 超时 | **不能当成"没提交"** → 退避重试 |
+| SUCCESS | local transaction committed → keep driving forward branches |
+| FAILURE | not committed → discard the whole transaction |
+| ONGOING / timeout | **must not be read as "not committed"** → back off and retry |
 
-实测（客户端 prepare 后永不 submit）：
+Measured (client calls prepare and never submits):
 
 ```
 prepare → SUCCESS
-（不调 submit，等 TC 自己回查…）
-状态: succeed  分支: [('action', 'succeed')]
-业务侧调用: {'/query': 1, '/notify': 1}     ← 回查一次，然后消息发出去了
+(no submit; waiting for the TC to check back…)
+status: succeed  branches: [('action', 'succeed')]
+business-side calls: {'/query': 1, '/notify': 1}     ← queried once, then the message went out
 ```
 
-`prepare` 不给 `query_prepared` 会被**直接拒绝** —— 没有回查地址，客户端崩了
-就没人能决断这单，猜"已提交"会重复扣款，猜"没提交"会丢单。
+A `prepare` without `query_prepared` is **rejected outright** — with no callback address,
+nobody can adjudicate the transaction if the client dies; guessing "committed" double-charges,
+guessing "not committed" loses the order.
 
-msg 没有补偿分支，只保证最终送达，所以分支必须幂等 + 可无限重试。
+msg has no compensation branches. It only guarantees eventual delivery, so branches must be
+idempotent and retryable forever.
 
-## XA：数据库原生两阶段提交
+## XA: native two-phase commit
 
-不靠补偿，靠数据库原生的两阶段提交。分支的业务 SQL 跑完就 prepare，
-改动**已持久化但对外不可见**，等 TC 统一决定 commit 还是 rollback。
-好处是强一致（没有中间态可见），代价是**全程持锁**。
+Instead of compensation, this relies on the database's own two-phase commit. A branch runs
+its business SQL and then prepares; the changes are **durable but invisible** until the TC
+decides to commit or roll back. The upside is strong consistency (no visible intermediate
+state); the cost is **locks held for the entire duration**.
 
-**Postgres 和 MySQL 都支持**（各跑同一套 6 个端到端测试）：
+**Both Postgres and MySQL are supported** (the same 6 e2e tests run against each):
 
 ```rust
-// 业务方（RM）的一阶段
-let xa = Xa::from_url(&db_url)?;           // 认库，两种语法自动分流
+// business side (RM), phase one
+let xa = Xa::from_url(&db_url)?;           // detects the database, picks the syntax
 let mut br = xa.begin(&pool, gid, "01").await?;
-sqlx::query("UPDATE acct SET bal = bal - ? WHERE id = ?")   // 占位符按你的库来
+sqlx::query("UPDATE acct SET bal = bal - ? WHERE id = ?")   // placeholders per your DB
     .bind(100i64).bind(1i32).execute(br.conn()).await?;
-let xid = br.prepare().await?;             // 一阶段完成
-// 然后把 (xid, commit/rollback 回调地址) 登记给 TC
+let xid = br.prepare().await?;             // phase one done
+// then register (xid, commit/rollback callback addresses) with the TC
 ```
 
-### 两种库的语法完全不同（都实测过）
+### The two databases have completely different syntax (both measured)
 
 | | Postgres 16 | MySQL 8.0 |
 |---|---|---|
-| 开始 | `BEGIN` | `XA START 'xid'` |
-| 一阶段 | `PREPARE TRANSACTION 'xid'` | `XA END 'xid'` + `XA PREPARE 'xid'` |
-| 提交 | `COMMIT PREPARED 'xid'` | `XA COMMIT 'xid'` |
-| 回滚 | `ROLLBACK PREPARED 'xid'` | `XA ROLLBACK 'xid'` |
-| 列出悬挂的 | `pg_prepared_xacts` | `XA RECOVER` |
-| 重复解决的错误码 | `42704` | `XAE04` |
-| 默认是否开启 | ❌ `max_prepared_transactions=0` | ✅ 开着 |
-| 能看到 prepare 时长 | ✅ | ❌ `XA RECOVER` 不给时间 |
-| xid 长度上限 | 200 字节 | gtrid **64 字节** |
+| begin | `BEGIN` | `XA START 'xid'` |
+| phase one | `PREPARE TRANSACTION 'xid'` | `XA END 'xid'` + `XA PREPARE 'xid'` |
+| commit | `COMMIT PREPARED 'xid'` | `XA COMMIT 'xid'` |
+| rollback | `ROLLBACK PREPARED 'xid'` | `XA ROLLBACK 'xid'` |
+| list dangling | `pg_prepared_xacts` | `XA RECOVER` |
+| already-resolved error | `42704` | `XAE04` |
+| enabled by default | ❌ `max_prepared_transactions=0` | ✅ |
+| exposes prepare age | ✅ | ❌ `XA RECOVER` has no timestamp |
+| xid length limit | 200 bytes | gtrid **64 bytes** |
 
-SQLite 根本没有两阶段提交，`Xa::from_url` 直接拒掉。
+SQLite has no two-phase commit at all; `Xa::from_url` rejects it.
 
-实测（真 Postgres，两个分支模拟跨库转账；MySQL 上同一套测试同样绿）：
+Measured (real Postgres, two branches simulating a cross-database transfer; the same suite
+is green on MySQL):
 
 ```
-prepare 后余额: [1000, 0]        ← 改动已持久化但不可见
-挂着的 prepared 事务: 2
+balances after prepare: [1000, 0]     ← durable but invisible
+dangling prepared transactions: 2
 submit → COMMIT PREPARED
-提交后余额: [900, 100]           ← 两个分支的改动一起生效
-挂着的 prepared 事务: 0
+balances after commit:  [900, 100]    ← both branches take effect together
+dangling prepared transactions: 0
 ```
 
-### ⚠ XA 的三条硬约束（都是实测撞出来的，各有测试钉着）
+### ⚠ Three hard XA constraints (all hit in practice, each pinned by a test)
 
-**1. 没解决的 prepared 事务会永久持锁**（Postgres 里还阻塞 VACUUM）。
-写这套测试时，一个测试中途失败留下一个 prepared 事务，**后面完全不相关的
-UPDATE 就无限期阻塞了**，整个测试进程卡死两分钟。生产上这会放大成整库不可写。
-两种库都一样：`Xa::list_prepared` 必须上监控。
-（测试：`xa_没解决的prepared事务会阻塞无关写入`，pg / mysql 各跑一遍）
+**1. Unresolved prepared transactions hold locks forever** (and block VACUUM on Postgres).
+While writing this suite, one test failed midway and left a prepared transaction behind —
+**a completely unrelated UPDATE then blocked indefinitely** and the test process hung for
+two minutes. In production this scales up to an unwritable database. Both engines behave
+the same: `Xa::list_prepared` must be monitored.
+(Test: `xa_没解决的prepared事务会阻塞无关写入`, run against pg and mysql)
 
-⚠ **MySQL 上 `age_secs` 恒为 0** —— `XA RECOVER` 不提供 prepare 时间，
-所以"挂了多久"这个指标在 MySQL 上拿不到，只能靠"这个 xid 还在不在"报警。
+⚠ **`age_secs` is always 0 on MySQL** — `XA RECOVER` does not report prepare time, so
+"how long has it been hanging" is unavailable there; you can only alert on "this xid still
+exists".
 
-**2. XA 的分支必须操作不相交的数据。**
-第一版把两个分支写成改同几行，分支 02 直接被锁死（`55P03 lock timeout`）——
-分支 01 已经 prepare，行锁一直持着。这不是 bug，是 XA 的本质：
-**一个分支对应一个资源管理器**，真实场景里天然分布在不同库。
-（MySQL 上对应 `innodb_lock_wait_timeout`，测试里设 5 秒把"卡住"变成"报错"）
+**2. XA branches must touch disjoint data.** The first version had both branches writing
+the same rows, and branch 02 deadlocked (`55P03 lock timeout`) — branch 01 had already
+prepared and was holding row locks. That is not a bug, it is the nature of XA:
+**one branch corresponds to one resource manager**, and in real deployments they naturally
+live in different databases.
+(On MySQL the equivalent is `innodb_lock_wait_timeout`; the tests set it to 5 s to turn
+"hangs" into "errors".)
 
-**3. 两种库的可用性检查不是一回事，但都得在启动时做。**
-`ensure_enabled()` 分流：
+**3. The availability check differs per engine, but both must run at startup.**
+`ensure_enabled()` dispatches:
 
-| | 检查什么 | 不合格的后果 |
+| | checks | consequence if unmet |
 |---|---|---|
-| Postgres | `max_prepared_transactions` > 0 | 默认就是 **0**，XA 完全用不了 |
-| MySQL | 版本 ≥ **5.7.7** | XA 能用，但 prepared 的事务**重启后会丢** —— 等于没有持久性 |
+| Postgres | `max_prepared_transactions` > 0 | defaults to **0**, XA is entirely unusable |
+| MySQL | version ≥ **5.7.7** | XA works, but prepared transactions **are lost on restart** — no durability |
 
-别等第一笔事务才发现（那时可能已经有别的分支 prepare 成功了）。
+Do not wait for the first transaction to discover this (by then another branch may already
+have prepared successfully).
 
 ```bash
-postgres -c max_prepared_transactions=32     # MySQL 8.0 默认就行，不用配
+postgres -c max_prepared_transactions=32     # MySQL 8.0 needs no configuration
 ```
 
-### MySQL 特有的两个坑
+### Two MySQL-specific traps
 
-**1. XA 语句不能走预处理协议。**
+**1. XA statements cannot use the prepared-statement protocol.**
 
 ```
 1295 This command is not supported in the prepared statement protocol yet
 ```
 
-`sqlx::query()` 默认走预处理，所以两阶段相关的语句一律改用 `sqlx::raw_sql`
-（文本协议）。**连带后果**：xid 没法当参数绑定，只能拼进 SQL 字面量 ——
-注入防护全靠 `xid_for()` 里的字符白名单（只留字母数字和 `_-`）。
+`sqlx::query()` uses prepared statements by default, so all two-phase statements use
+`sqlx::raw_sql` (text protocol). **Consequence**: the xid cannot be bound as a parameter
+and must be interpolated into the SQL — injection protection relies entirely on the
+character allowlist in `xid_for()` (alphanumerics plus `_-`).
 
-**2. xid 只有 64 字节，比 Postgres 的 200 严得多。**
-gid 稍微长一点就超。直接截断是**灾难性的** —— 两个不相关的长 gid 会撞成同一个
-xid，然后互相提交对方的事务。所以超长时截断 + 拼 16 位 FNV-1a 摘要。
-（测试：`mysql的xid上限更严且截断不撞车`）
+**2. The xid limit is 64 bytes, far stricter than Postgres' 200.** A slightly long gid
+overflows it. Plain truncation would be **catastrophic** — two unrelated long gids would
+collide into the same xid and then commit each other's transactions. Oversized values are
+truncated and suffixed with a 16-bit FNV-1a digest.
+(Test: `mysql的xid上限更严且截断不撞车`)
 
-### 二阶段幂等靠状态机保证
+### Second-phase idempotence comes from the state machine
 
-重复解决同一个 xid 会报错：Postgres `42704 undefined_object`，
-MySQL `XAE04 XAER_NOTA`。TC 一定会重试，所以这两个错误都被当成
-`AlreadyResolved`（成功）。
+Resolving the same xid twice errors: Postgres `42704 undefined_object`, MySQL
+`XAE04 XAER_NOTA`. The TC will definitely retry, so both are treated as `AlreadyResolved`
+(success).
 
-**这个"找不到就算成功"之所以安全**，靠的是 `xa_advance` 的保证：
-Submitted 阶段永远不返回 `Finish(Aborting)`，所以"找不到"只可能是之前已经
-commit 过，不可能是被 rollback 了。用 SQLSTATE 判断而不是匹配错误文本 ——
-文本会随版本和语言变。（测试：`错误码按方言区分`）
+**That "not found means success" is safe** because of a guarantee from `xa_advance`: the
+Submitted phase never returns `Finish(Aborting)`, so "not found" can only mean it was
+already committed, never that it was rolled back. The check uses SQLSTATE rather than
+error-message matching — messages change across versions and locales.
+(Test: `错误码按方言区分`)
 
-## 跑起来
+## Running it
 
 ```bash
 cargo build --release
 DTMRS_DB=sqlite:dtmrs.db DTMRS_ADDR=127.0.0.1:36789 ./target/release/dtmrs
 ```
 
-提交一个两步 SAGA：
+Submit a two-step SAGA:
 
 ```bash
 curl -XPOST localhost:36789/api/dtmsvr/submit -H 'content-type: application/json' -d '{
@@ -412,98 +590,122 @@ curl -XPOST localhost:36789/api/dtmsvr/submit -H 'content-type: application/json
 curl 'localhost:36789/api/dtmsvr/query?gid=order-1001'
 ```
 
-实测的回滚链路（`/a2fail` 返回 409）：
+Measured rollback path (`/a2fail` returns 409):
 
 ```
-状态: failed   回滚原因: 分支 02 返回 FAILURE
+status: failed   rollback reason: branch 02 returned FAILURE
   01 action      succeed
-  01 compensate  succeed     ← 逆序补偿
+  01 compensate  succeed     ← reverse order
   02 action      failed
   02 compensate  succeed
 ```
 
-## 业务侧接入：必须用屏障
+### Environment variables
 
-分支接口**一定会**被重复调用（TC 重试 + 崩溃恢复），所以业务侧必须幂等。
-用 `dtmrs-barrier`，把屏障记录和业务 SQL 放进**同一个本地事务**：
+| Variable | Default | Meaning |
+|---|---|---|
+| `DTMRS_DB` | `sqlite:dtmrs.db` | storage DSN (sqlite / postgres / mysql) |
+| `DTMRS_ADDR` | `0.0.0.0:36789` | HTTP listen address |
+| `DTMRS_GRPC_ADDR` | `0.0.0.0:36790` | gRPC listen address |
+| `DTMRS_OWNER` | `tc-<pid>` | instance identity for lease ownership |
+
+## Integrating: you must use the barrier
+
+Branch endpoints **will** be called more than once (TC retries plus crash recovery), so the
+business side must be idempotent. Use `dtmrs-barrier` and put the barrier record and your
+business SQL **in the same local transaction**:
 
 ```rust
 use dtmrs_barrier::{BranchBarrier, Decision};
 use dtmrs_core::Backend;
 
-let be = Backend::from_url(&db_url);        // 屏障表的 DDL 和 SQL 都按它渲染
-BranchBarrier::migrate(&pool, be).await?;   // 启动时建表一次
+let be = Backend::from_url(&db_url);        // barrier DDL and SQL render per backend
+BranchBarrier::migrate(&pool, be).await?;   // create the table once at startup
 
-// gid / branch_id / op / trans_type 由 TC 通过 query 参数传进来
+// gid / branch_id / op / trans_type arrive from the TC as query params (HTTP) or metadata (gRPC)
 let mut bb = BranchBarrier::new(be, trans_type, gid, branch_id, op)?;
 let mut tx = pool.begin().await?;
 
 if bb.decide(&mut tx).await? == Decision::Execute {
-    // 业务 SQL —— 必须在这个 tx 里
+    // business SQL — must be inside this tx
     sqlx::query("UPDATE account SET balance = balance - ? WHERE id = ?")
         .bind(amount).bind(uid).execute(&mut *tx).await?;
 }
-tx.commit().await?;   // 原子性的来源：屏障记录与业务变更同生共死
+tx.commit().await?;   // atomicity: the barrier record and the business change live or die together
 ```
 
-`decide` 返回三种结论：
+`decide` returns one of three verdicts:
 
-| 结论 | 含义 |
+| verdict | meaning |
 |---|---|
-| `Execute` | 该干活 |
-| `NullCompensation` | **空回滚** —— 正向分支从没跑过，补偿空转 |
-| `Duplicated` | **重复或悬挂** —— 这次调用已处理过，跳过 |
+| `Execute` | do the work |
+| `NullCompensation` | **empty rollback** — the forward branch never ran, compensation is a no-op |
+| `Duplicated` | **duplicate or suspended** — this call was already handled, skip it |
 
-**前提：barrier 表必须和业务表在同一个数据库实例**，否则共用不了本地事务。
-这不是实现限制，是这个方案成立的根本条件。
+**Prerequisite: the barrier table must live in the same database instance as your business
+tables**, otherwise they cannot share a local transaction. This is not an implementation
+limitation; it is the condition that makes the whole approach work.
 
-## 三个容易写错的地方（都有测试守着）
+## Three things that are easy to get wrong (each guarded by a test)
 
-**1. 超时不等于失败。**
-500 / 连接超时代表**结果未知** —— 对方可能已经成功了。这时候回滚会造成
-不一致，正确做法是退避重试，直到拿到明确的 SUCCESS 或 FAILURE。
-只有 HTTP 409 或响应体里的 `FAILURE` 才触发补偿。
-（测试：`超时不能触发回滚而要重试`）
+**1. A timeout is not a failure.** A 500 or a connection timeout means the result is
+**unknown** — the callee may have succeeded. Rolling back here creates inconsistency; the
+correct action is backoff and retry until you get an explicit SUCCESS or FAILURE. Only
+HTTP 409, gRPC `ABORTED`, or `FAILURE` in the response body triggers compensation.
+(Test: `超时不能触发回滚而要重试`)
 
-**2. 补偿要发给所有分支，不只是成功的那些。**
-某个 action 超时但实际上执行成功了 —— 如果因为"它没成功"就跳过它的补偿，
-钱就漏出去了。所以回滚时逆序补偿**全部**分支，多余的那些由屏障空转掉。
-宁可多发补偿，不可漏发。
-（测试：`没跑过的分支也要补偿`、`主动中止会触发补偿`）
+**2. Compensate every branch, not just the successful ones.** An action may have timed out
+yet actually succeeded — skipping its compensation because "it didn't succeed" leaks money.
+So rollback compensates **all** branches in reverse order, and the barrier turns the
+unnecessary ones into no-ops. Better to over-compensate than to under-compensate.
+(Tests: `没跑过的分支也要补偿`, `主动中止会触发补偿`)
 
-**3. 重复提交必须成功而不是报错。**
-客户端网络抖动重试提交同一个 gid，返回错误会让客户端以为没受理。
-`INSERT OR IGNORE` + 返回 SUCCESS。
-（测试：`重复提交同一个gid是幂等的`）
+**3. Duplicate submits must succeed, not error.** A client retrying the same gid after a
+network hiccup will assume the request was not accepted if you return an error.
+`INSERT OR IGNORE` plus SUCCESS.
+(Test: `重复提交同一个gid是幂等的`)
 
-## 结构
+## Layout
 
 ```
 crates/
-  dtmrs-core/     状态机，纯逻辑无 I/O —— 状态迁移的 bug 全在这层测
-                  dialect.rs：sqlite / postgres / mysql 的 SQL 方言渲染
-  dtmrs-store/    存储（三种库一套 SQL）+ 租约抢占
-  dtmrs-server/   TC：axum HTTP + 常驻推进器 + 嵌入式门面（registry / embedded）
-  dtmrs-barrier/  客户端子事务屏障
-  dtmrs-xa/       业务方（RM）的 XA 助手：pg 的 PREPARE TRANSACTION / mysql 的 XA
-  dtmrs-ffi/      C ABI（cdylib + staticlib）
-include/dtmrs.h            C 头文件
-bindings/python/dtmrs.py   Python 绑定（纯 ctypes）
-examples/c/demo.c          C 示例
+  dtmrs-core/     state machine, pure logic, no I/O — where state-transition bugs get tested
+                  dialect.rs: SQL dialect rendering for sqlite / postgres / mysql
+  dtmrs-store/    storage (one SQL set, three databases) + lease acquisition
+  dtmrs-server/   TC: api.rs (protocol-agnostic operations)
+                      main.rs (axum HTTP) / grpc/ (tonic, both directions)
+                      driver.rs (resident driver) / registry.rs + embedded.rs
+  dtmrs-barrier/  client-side sub-transaction barrier
+  dtmrs-xa/       XA helper for the business side (RM): pg PREPARE TRANSACTION / mysql XA
+  dtmrs-ffi/      C ABI (cdylib + staticlib), callback and pull dispatch
+include/dtmrs.h   C header
+bindings/python/  Python binding (pure ctypes, zero deps)
+bindings/node/    Node binding (koffi, async handlers)
+bindings/java/    JVM binding (JNA, Java 8+, no maven/gradle needed)
+examples/c/       C example
 ```
 
-把状态机跟 I/O 分开是刻意的：分布式事务的 bug 大多出在状态迁移上，
-隔离出来就能穷举测试，不用起网络。
+Separating the state machine from I/O is deliberate: most distributed-transaction bugs live
+in state transitions, and isolating them makes exhaustive testing possible without any
+network. HTTP and gRPC are both thin wrappers over `api.rs` — writing the logic twice would
+eventually drift, and drift here means "the same request is rejected over HTTP but accepted
+over gRPC".
 
-## 协议出处
+## Protocol provenance
 
-状态机、表结构、屏障算法都是**逐条核对 DTM 源码**得出的，不是二手资料：
+The state machine, schema, and barrier algorithm were derived by **checking DTM's source
+line by line**, not from secondary sources:
 
-- `sqls/dtmsvr.storage.mysql.sql` —— 全局/分支状态与字段
-- `sqls/dtmcli.barrier.mysql.sql` —— 屏障表与唯一键
-- `client/dtmcli/barrier.go` 的 `BranchBarrier.Call` —— 屏障算法
-- `dtmsvr/trans_type_{saga,tcc,msg,xa}.go` —— 各模式实现
+- `sqls/dtmsvr.storage.mysql.sql` — global/branch states and fields
+- `sqls/dtmcli.barrier.mysql.sql` — barrier table and unique key
+- `client/dtmcli/barrier.go`, `BranchBarrier.Call` — barrier algorithm
+- `dtmsvr/trans_type_{saga,tcc,msg,xa}.go` — per-mode implementations
 
-只实现协议，不抄代码。DTM 是 BSD-3，与 Apache-2.0 兼容。
+Only the protocol is reimplemented; no code is copied. DTM is BSD-3, which is compatible
+with Apache-2.0.
 
-详细设计见 [DESIGN.md](DESIGN.md)。
+Design notes: [DESIGN.md](DESIGN.md) (Chinese).
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

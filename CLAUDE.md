@@ -15,21 +15,26 @@ Apache-2.0。只实现 DTM 的协议，不抄它的代码。
 
 ```bash
 cargo build --release                 # 二进制在 target/release/dtmrs
-cargo test --workspace                # 85 个测试（真库那部分会被跳过，见下）
+cargo test --workspace                # 105 个测试（真库那部分会被跳过，见下）
 cargo run --example embedded -p dtmrs-server   # 嵌入式模式的可运行示例
 
-# 起 TC
+# 起 TC（HTTP 和 gRPC 各占一个端口）
 DTMRS_DB=sqlite:dtmrs.db DTMRS_ADDR=127.0.0.1:36789 ./target/release/dtmrs
 ```
 
 环境变量：`DTMRS_DB`（默认 `sqlite:dtmrs.db`）、`DTMRS_ADDR`（默认 `0.0.0.0:36789`）、
-`DTMRS_OWNER`（默认自动生成，多实例部署时用来区分租约持有者）。
+`DTMRS_GRPC_ADDR`（默认 `0.0.0.0:36790`）、`DTMRS_OWNER`（默认 `tc-<pid>`，
+多实例部署时用来区分租约持有者）。
 
-C / Python 绑定：
+编 gRPC 需要 **protoc**；关掉 `grpc` feature 就不需要（`dtmrs-ffi` 就是这么做的）。
+
+四个语言绑定：
 
 ```bash
-cargo build -p dtmrs-ffi --release    # → target/release/libdtmrs.so
+cargo build -p dtmrs-ffi --release    # → target/release/libdtmrs.so（所有绑定都靠它）
 python bindings/python/example.py     # 纯 ctypes，DTMRS_LIB 可指定 .so 路径
+cd bindings/node && npm install && node example.js
+cd bindings/java && ./run.sh          # 自动下载 jna jar，不需要 maven/gradle
 gcc -I include examples/c/demo.c -L target/release -ldtmrs -o demo && ./demo
 ```
 
@@ -79,10 +84,15 @@ crates/
   dtmrs-ffi/      C ABI（cdylib + staticlib，产物名 libdtmrs）
 ```
 
-**最重要的一条结构约束**：`dtmrs-core` 里的 `saga_advance` / `tcc_advance` /
-`msg_advance` / `xa_advance` 决定「下一步做什么」，`driver.rs` 只负责把决策落成
-HTTP 调用和状态更新。**状态迁移逻辑不要往 driver 里写** —— 放在 core 才能穷举单测，
-分布式事务的 bug 绝大多数就在状态迁移上。
+**两条结构约束，都别破坏：**
+
+1. `dtmrs-core` 里的 `saga_advance` / `tcc_advance` / `msg_advance` / `xa_advance`
+   决定「下一步做什么」，`driver.rs` 只负责把决策落成网络调用和状态更新。
+   **状态迁移逻辑不要往 driver 里写** —— 放在 core 才能穷举单测，
+   分布式事务的 bug 绝大多数就在状态迁移上。
+2. HTTP（`main.rs`）和 gRPC（`grpc/server.rs`）都只做协议转换，业务判断只在
+   `api.rs`。**别在任一协议层里加判断** —— 两边漂移的后果是「同一个请求走 HTTP
+   被拒、走 gRPC 却受理了」。
 
 `dtmrs-server` 同时是 lib 和 bin（bin crate 不能被 `tests/` import，所以推进器
 必须在 lib 里）。
@@ -92,8 +102,10 @@ HTTP 调用和状态更新。**状态迁移逻辑不要往 driver 里写** —�
 这几条每条都有测试钉着，改动前先读对应测试：
 
 1. **超时 ≠ 失败。** 5xx / 连接超时是 `BranchResult::Unknown`，只重试不回滚 ——
-   对方可能已经成功了。只有 HTTP 409 或响应体含 `FAILURE` 才触发补偿。
-   FFI 层同理：宿主返回野值、抛异常、panic，一律按 UNKNOWN 处理。
+   对方可能已经成功了。只有 HTTP 409、gRPC `ABORTED`(10)、或响应体含 `FAILURE`
+   才触发补偿。gRPC 侧尤其注意：`UNAVAILABLE`(14) / `DEADLINE_EXCEEDED`(4) /
+   `CANCELLED`(1) 全是 Unknown（`CANCELLED` 是我们自己放弃，不是对方拒绝）。
+   FFI 层同理：宿主返回野值、抛异常、panic、拉取式超时未回填，一律按 UNKNOWN 处理。
 
 2. **confirm / commit 失败绝不能转成 cancel / rollback。** `tcc_advance` 和
    `xa_advance` 在 `Submitted` 阶段**永远不返回** `Finish(Aborting)`，测试里穷举了
@@ -138,6 +150,14 @@ HTTP 调用和状态更新。**状态迁移逻辑不要往 driver 里写** —�
   handler。`submit()` 时就检查名字是否都注册了，漏注册按「结果未知」处理只重试。
 - FFI 的回调一律走 `spawn_blocking` —— 宿主 handler 是同步的还可能抢 GIL，
   直接在 tokio worker 上调会卡死运行时。
+- **FFI 有两套分发，别混淆**：回调式（`dtmrs_register`，Python/Java/C 用）和
+  拉取式（`dtmrs_register_pull` + `next_task` + `reply`，Node 用）。
+  Node 必须用拉取式不是因为跨线程回调不行（实测可以），而是因为 C ABI 的回调
+  必须同步返回 int，而 Node 的业务代码全是 async。改这块前先读
+  `bindings/node/dtmrs.js` 的文件头。
+- gRPC 分支调用用自定义 `BytesCodec` 做动态转发，**不需要业务方的 proto**。
+  改 `grpc/client.rs` 时注意：请求体发空字节是刻意的（空 protobuf 消息对任何
+  message 类型都合法），分支身份走 metadata。
 - MySQL 的 XA 语句不能走预处理协议（错误 1295），所以两阶段相关语句用
   `sqlx::raw_sql`；xid 因此只能拼进 SQL，注入防护靠 `xid_for()` 的字符白名单。
   MySQL 的 gtrid 只有 64 字节，超长时截断 + 拼 FNV-1a 摘要，**不能直接截断**。

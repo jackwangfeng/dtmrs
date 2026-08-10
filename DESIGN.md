@@ -164,7 +164,8 @@ TC 崩溃后重启，所有未终结事务会被 cron 重新捞起继续推进�
 | 嵌入式 TC + C ABI / Python 绑定 | ✅ 第二版（DTM 没有的形态） |
 | XA（Postgres） | ✅ 第三版 |
 | **MySQL 存储 + MySQL XA** | ✅ 第三版 |
-| gRPC 协议 | ⬜ 未做 |
+| **gRPC（分支调用 + TC 服务端 API）** | ✅ 第四版 |
+| **Node / JVM 绑定** | ✅ 第四版 |
 | workflow 模式 | 待定（DTM 里最复杂，收益待评估） |
 
 ## 七、工程结构
@@ -176,10 +177,11 @@ dtmrs/
     dtmrs-store/     存储层（sqlx::Any + 方言渲染，一套 SQL 跑
                      sqlite / postgres / mysql）。**没有抽 Store trait** ——
                      三种库的差异小到一层模板就能吸收，抽 trait 是过早抽象
-    dtmrs-server/    axum HTTP + cron 调度器 + 嵌入式门面
+    dtmrs-server/    api.rs（协议无关的操作层，HTTP 与 gRPC 共用）
+                     axum HTTP + tonic gRPC + cron 调度器 + 嵌入式门面
     dtmrs-barrier/   客户端子事务屏障库
     dtmrs-xa/        业务方 XA 助手（pg / mysql 两套语法）
-    dtmrs-ffi/       C ABI（cdylib + staticlib）
+    dtmrs-ffi/       C ABI（cdylib + staticlib），回调式 + 拉取式两种分发
   tests/             端到端：正常提交 / 分支失败补偿 / 崩溃恢复 / 幂等
 ```
 
