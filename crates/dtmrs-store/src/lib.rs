@@ -26,6 +26,9 @@ pub struct GlobalRow {
     pub next_cron_interval: i64,
     pub owner: String,
     pub rollback_reason: String,
+    /// 二阶段消息的回查地址。进程在 prepare 和 submit 之间崩了，
+    /// TC 靠它问业务方"这单本地事务到底提交了没有"
+    pub query_prepared: String,
     pub create_time: i64,
     pub finish_time: Option<i64>,
 }
@@ -69,6 +72,7 @@ impl Store {
               next_cron_interval INTEGER NOT NULL DEFAULT 0,
               owner              TEXT NOT NULL DEFAULT '',
               rollback_reason    TEXT NOT NULL DEFAULT '',
+              query_prepared     TEXT NOT NULL DEFAULT '',
               create_time        INTEGER NOT NULL,
               update_time        INTEGER NOT NULL,
               finish_time        INTEGER
@@ -121,8 +125,8 @@ impl Store {
         let n = sqlx::query(
             "INSERT OR IGNORE INTO trans_global
              (gid,trans_type,status,payload,next_cron_time,next_cron_interval,
-              owner,rollback_reason,create_time,update_time)
-             VALUES (?,?,?,?,?,?,'','',?,?)",
+              owner,rollback_reason,query_prepared,create_time,update_time)
+             VALUES (?,?,?,?,?,?,'','',?,?,?)",
         )
         .bind(&g.gid)
         .bind(g.trans_type.to_string())
@@ -130,6 +134,7 @@ impl Store {
         .bind(&g.payload)
         .bind(g.next_cron_time)
         .bind(g.next_cron_interval)
+        .bind(&g.query_prepared)
         .bind(t)
         .bind(t)
         .execute(&mut *tx)
@@ -163,7 +168,7 @@ impl Store {
     pub async fn get_global(&self, gid: &str) -> Result<Option<GlobalRow>> {
         let row = sqlx::query(
             "SELECT gid,trans_type,status,payload,next_cron_time,next_cron_interval,
-                    owner,rollback_reason,create_time,finish_time
+                    owner,rollback_reason,query_prepared,create_time,finish_time
              FROM trans_global WHERE gid=?",
         )
         .bind(gid)
@@ -251,8 +256,13 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let t = now();
         let gid: Option<String> = sqlx::query_scalar(
+            // prepared 的 msg 也要捞：客户端可能在 prepare 之后就崩了，
+            // 得靠 TC 回查 query_prepared 决定这单是提交还是作废。
+            // 其它类型的 prepared 不碰 —— TCC 的 try 阶段由客户端驱动。
             "SELECT gid FROM trans_global
-             WHERE status IN ('submitted','aborting') AND next_cron_time <= ?
+             WHERE (status IN ('submitted','aborting')
+                    OR (status = 'prepared' AND trans_type = 'msg'))
+               AND next_cron_time <= ?
              ORDER BY next_cron_time LIMIT 1",
         )
         .bind(t)
@@ -281,7 +291,7 @@ impl Store {
         }
         let row = sqlx::query(
             "SELECT gid,trans_type,status,payload,next_cron_time,next_cron_interval,
-                    owner,rollback_reason,create_time,finish_time
+                    owner,rollback_reason,query_prepared,create_time,finish_time
              FROM trans_global WHERE gid=?",
         )
         .bind(&gid)
@@ -317,10 +327,44 @@ impl Store {
         Ok(())
     }
 
+    /// TCC 的 try 阶段：客户端在调 try 之前先来登记这个分支的 confirm/cancel。
+    ///
+    /// **必须先登记再调 try**。反过来的话：try 成功了但登记失败，
+    /// TC 就不知道有这个分支，回滚时不会 cancel 它 —— 资源永久泄漏。
+    ///
+    /// 用 INSERT OR IGNORE，所以重复登记是幂等的（客户端重试很常见）。
+    pub async fn register_branch(
+        &self,
+        gid: &str,
+        branch_id: &str,
+        ops: &[(BranchOp, String)],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let t = now();
+        for (op, url) in ops {
+            sqlx::query(
+                "INSERT OR IGNORE INTO trans_branch_op
+                 (gid,branch_id,op,url,payload,status,create_time,update_time)
+                 VALUES (?,?,?,?,'',?,?,?)",
+            )
+            .bind(gid)
+            .bind(branch_id)
+            .bind(op.as_str())
+            .bind(url)
+            .bind(BranchStatus::Prepared.as_str())
+            .bind(t)
+            .bind(t)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<GlobalRow>> {
         let rows = sqlx::query(
             "SELECT gid,trans_type,status,payload,next_cron_time,next_cron_interval,
-                    owner,rollback_reason,create_time,finish_time
+                    owner,rollback_reason,query_prepared,create_time,finish_time
              FROM trans_global ORDER BY create_time DESC LIMIT ?",
         )
         .bind(limit)
@@ -342,6 +386,7 @@ fn global_from_row(r: sqlx::sqlite::SqliteRow) -> GlobalRow {
         next_cron_interval: r.get("next_cron_interval"),
         owner: r.get("owner"),
         rollback_reason: r.get("rollback_reason"),
+        query_prepared: r.get("query_prepared"),
         create_time: r.get("create_time"),
         finish_time: r.get("finish_time"),
     }
@@ -365,6 +410,7 @@ mod tests {
             next_cron_interval: 0,
             owner: String::new(),
             rollback_reason: String::new(),
+            query_prepared: String::new(),
             create_time: 0,
             finish_time: None,
         }

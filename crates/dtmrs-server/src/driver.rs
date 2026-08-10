@@ -4,7 +4,10 @@
 //! 本文件只负责 I/O。这样状态迁移的正确性可以在 core 里纯单测覆盖。
 
 use crate::registry::{parse_target, BranchCtx, Registry, Target};
-use dtmrs_core::{saga_advance, Advance, BranchOp, BranchResult, BranchStatus, GlobalStatus, SagaStep};
+use dtmrs_core::{
+    msg_advance, saga_advance, tcc_advance, Advance, BranchOp, BranchResult, BranchStatus,
+    GlobalStatus, SagaStep, TransType,
+};
 use dtmrs_store::{GlobalRow, Store};
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +66,22 @@ impl Driver {
     ///
     /// 可以被重复调用（崩溃恢复就靠这个）—— 分支的幂等由客户端屏障保证。
     pub async fn process(&self, g: &GlobalRow) -> anyhow::Result<()> {
+        match g.trans_type {
+            TransType::Saga => self.process_saga(g).await,
+            TransType::Tcc => self.process_tcc(g).await,
+            TransType::Msg => self.process_msg(g).await,
+            TransType::Xa => {
+                // XA 要数据库原生 XA 支持，还没实现。**不假装成功** ——
+                // 留在库里比错误地标成 succeed 安全得多
+                warn!(gid = %g.gid, "xa 模式尚未实现，跳过不处理");
+                Ok(())
+            }
+        }
+    }
+
+    // ---------------- SAGA ----------------
+
+    async fn process_saga(&self, g: &GlobalRow) -> anyhow::Result<()> {
         let steps: Vec<SagaStep> = serde_json::from_str(&g.payload).unwrap_or_default();
         if steps.is_empty() {
             self.store.set_global_status(&g.gid, GlobalStatus::Succeed, "").await?;
@@ -91,8 +110,7 @@ impl Driver {
                         BranchOp::Action => &steps[index].action,
                         _ => &steps[index].compensate,
                     };
-                    let res = self.call_branch(&g, &branch_id, op, url).await;
-                    match res {
+                    match self.call_branch(g, &branch_id, op, url).await {
                         BranchResult::Success => {
                             self.store
                                 .set_branch_status(&g.gid, &branch_id, op, BranchStatus::Succeed)
@@ -122,6 +140,163 @@ impl Driver {
                         }
                         BranchResult::Ongoing | BranchResult::Unknown => {
                             // **绝不能当成失败**：对方可能已经成功了。退避重试。
+                            self.retry_later(g).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------- TCC ----------------
+
+    /// TCC 的 try 阶段是**客户端驱动**的（客户端先 registerBranch 再调 try），
+    /// TC 只负责 confirm / cancel。所以分支的 URL 来自 `trans_branch_op` 表，
+    /// 不是全局 payload。
+    async fn process_tcc(&self, g: &GlobalRow) -> anyhow::Result<()> {
+        let rows = self.store.list_branches(&g.gid).await?;
+        let n = rows
+            .iter()
+            .filter_map(|r| index_of(&r.branch_id))
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        if n == 0 {
+            // 一个分支都没登记就 submit/abort 了 —— 空事务，直接落终态
+            let s = if g.status == GlobalStatus::Aborting {
+                GlobalStatus::Failed
+            } else {
+                GlobalStatus::Succeed
+            };
+            self.store.set_global_status(&g.gid, s, "").await?;
+            return Ok(());
+        }
+
+        let status = g.status;
+        loop {
+            let rows = self.store.list_branches(&g.gid).await?;
+            let (confirms, cancels) = split_by_op(&rows, n, BranchOp::Confirm, BranchOp::Cancel);
+            match tcc_advance(status, &confirms, &cancels) {
+                Advance::Finish(s) => {
+                    info!(gid = %g.gid, status = s.as_str(), "TCC 事务终结");
+                    self.store.set_global_status(&g.gid, s, "").await?;
+                    return Ok(());
+                }
+                Advance::Wait => return Ok(()),
+                Advance::Call { index, op } => {
+                    let bid = branch_id(index);
+                    let Some(url) = url_of(&rows, &bid, op) else {
+                        // 登记时漏了这个 op 的 URL。当未知处理，等人修
+                        warn!(gid = %g.gid, branch = %bid, op = op.as_str(),
+                              "分支没登记这个操作的 URL，无法调用");
+                        self.retry_later(g).await?;
+                        return Ok(());
+                    };
+                    match self.call_branch(g, &bid, op, &url).await {
+                        BranchResult::Success => {
+                            self.store
+                                .set_branch_status(&g.gid, &bid, op, BranchStatus::Succeed)
+                                .await?;
+                        }
+                        // confirm/cancel 失败**绝不改变全局方向**：
+                        // try 已经成功、方向已经定了，反向操作会造成不一致。
+                        // 唯一正确处理是无限重试 + 报警。
+                        BranchResult::Failure => {
+                            self.store
+                                .set_branch_status(&g.gid, &bid, op, BranchStatus::Failed)
+                                .await?;
+                            warn!(gid = %g.gid, branch = %bid, op = op.as_str(),
+                                  "TCC 二阶段失败，会持续重试，需要人工介入");
+                            self.retry_later(g).await?;
+                            return Ok(());
+                        }
+                        BranchResult::Ongoing | BranchResult::Unknown => {
+                            self.retry_later(g).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------- 二阶段消息 ----------------
+
+    /// 流程：`prepare` 落库 → 业务提交本地事务 → `submit`。
+    ///
+    /// 如果进程在这两步之间崩了，事务会一直停在 prepared。这时 TC 靠回查
+    /// `query_prepared` 问业务方"你那个本地事务到底提交了没有"，据此决定
+    /// 是往前推还是整单作废。**这是取代 MQ 事务消息的关键一环。**
+    async fn process_msg(&self, g: &GlobalRow) -> anyhow::Result<()> {
+        let mut status = g.status;
+
+        if status == GlobalStatus::Prepared {
+            if g.query_prepared.is_empty() {
+                // 没给回查地址就没法自动决断。不能瞎猜 —— 猜错要么丢单要么重复扣款
+                warn!(gid = %g.gid, "msg 事务没提供 query_prepared，无法回查，等人处理");
+                self.retry_later(g).await?;
+                return Ok(());
+            }
+            // 借用分支调用的通道做回查，branch_id 用 "00" 跟真实分支区分开
+            match self
+                .call_branch(g, "00", BranchOp::Action, &g.query_prepared)
+                .await
+            {
+                BranchResult::Success => {
+                    info!(gid = %g.gid, "回查：本地事务已提交 → 继续推进");
+                    self.store
+                        .set_global_status(&g.gid, GlobalStatus::Submitted, "")
+                        .await?;
+                    status = GlobalStatus::Submitted;
+                }
+                BranchResult::Failure => {
+                    // 业务方明确说"这单没提交" → 整单作废。msg 没有补偿分支，
+                    // 但也不需要：正向分支压根还没跑过
+                    info!(gid = %g.gid, "回查：本地事务未提交 → 整单作废");
+                    self.store
+                        .set_global_status(
+                            &g.gid,
+                            GlobalStatus::Failed,
+                            "回查得到 FAILURE：本地事务未提交",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                BranchResult::Ongoing | BranchResult::Unknown => {
+                    // 回查本身失败了，不能当作"没提交"。退避重试。
+                    self.retry_later(g).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let steps: Vec<SagaStep> = serde_json::from_str(&g.payload).unwrap_or_default();
+        if steps.is_empty() {
+            self.store.set_global_status(&g.gid, GlobalStatus::Succeed, "").await?;
+            return Ok(());
+        }
+        loop {
+            let (actions, _) = self.branch_states(&g.gid, steps.len()).await?;
+            match msg_advance(status, &actions) {
+                Advance::Finish(s) => {
+                    info!(gid = %g.gid, status = s.as_str(), "消息事务终结");
+                    self.store.set_global_status(&g.gid, s, "").await?;
+                    return Ok(());
+                }
+                Advance::Wait => return Ok(()),
+                Advance::Call { index, op } => {
+                    let bid = branch_id(index);
+                    match self.call_branch(g, &bid, op, &steps[index].action).await {
+                        BranchResult::Success => {
+                            self.store
+                                .set_branch_status(&g.gid, &bid, op, BranchStatus::Succeed)
+                                .await?;
+                        }
+                        // msg 保证"最终一定送达"，没有补偿一说。失败只能重试。
+                        BranchResult::Failure
+                        | BranchResult::Ongoing
+                        | BranchResult::Unknown => {
                             self.retry_later(g).await?;
                             return Ok(());
                         }
@@ -246,6 +421,35 @@ pub fn branch_id(index: usize) -> String {
 
 fn index_of(branch_id: &str) -> Option<usize> {
     branch_id.parse::<usize>().ok().and_then(|v| v.checked_sub(1))
+}
+
+/// 按 op 把分支行拆成两列（正向 / 反向），按步序对齐
+fn split_by_op(
+    rows: &[dtmrs_store::BranchRow],
+    n: usize,
+    fwd: BranchOp,
+    bwd: BranchOp,
+) -> (Vec<BranchStatus>, Vec<BranchStatus>) {
+    let mut a = vec![BranchStatus::Prepared; n];
+    let mut b = vec![BranchStatus::Prepared; n];
+    for r in rows {
+        let Some(i) = index_of(&r.branch_id) else { continue };
+        if i >= n {
+            continue;
+        }
+        if r.op == fwd {
+            a[i] = r.status;
+        } else if r.op == bwd {
+            b[i] = r.status;
+        }
+    }
+    (a, b)
+}
+
+fn url_of(rows: &[dtmrs_store::BranchRow], branch_id: &str, op: BranchOp) -> Option<String> {
+    rows.iter()
+        .find(|r| r.branch_id == branch_id && r.op == op)
+        .map(|r| r.url.clone())
 }
 
 /// MVP 阶段各分支共用同一份请求体。真实场景应该每步独立 payload，

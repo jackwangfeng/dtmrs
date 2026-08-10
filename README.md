@@ -142,11 +142,64 @@ TC 在进程里，但状态在 DB 里。进程死了事务不丢 —— 新进�
 | HTTP API（路径与 DTM 对齐） | ✅ 可用 |
 | SQLite 存储 | ✅ 可用 |
 | Postgres 存储 | ⬜ 未做 |
-| TCC / 二阶段消息 / XA | ⬜ 未做（`submit` 会明确报错，不假装支持） |
+| **TCC（try/confirm/cancel）** | ✅ 可用 |
+| **二阶段消息（取代 MQ 事务消息）** | ✅ 可用 |
+| XA | ⬜ 未做（`submit` 明确报错，推进器也不假装成功） |
 | gRPC | ⬜ 未做 |
 
-**41 个测试全绿**：6 个走真实 HTTP 的端到端 + 5 个嵌入式（含跨进程重启恢复）
-+ 4 个 C ABI（含空指针/坏参数不崩）。Python 和 C 的示例都实际跑通。
+**58 个测试全绿**：6 个 SAGA 端到端 + 11 个 TCC/msg + 5 个嵌入式（含跨进程重启恢复）
++ 4 个 C ABI（含空指针/坏参数不崩）+ 10 个屏障 + 13 个状态机单测。
+Python 和 C 的示例都实际跑通。
+
+## TCC
+
+try 阶段由**客户端**驱动（先 `registerBranch` 再调 try），TC 只管 confirm/cancel：
+
+```bash
+curl -XPOST :36789/api/dtmsvr/prepare -d '{"gid":"tcc-A","trans_type":"tcc"}'
+curl -XPOST :36789/api/dtmsvr/registerBranch -d '{"gid":"tcc-A","branch_id":"01",
+  "try":"http://b/try1","confirm":"http://b/confirm1","cancel":"http://b/cancel1"}'
+# ← 客户端在这里自己调 try。全成功则 submit，任一失败则 abort
+curl -XPOST :36789/api/dtmsvr/submit -d '{"gid":"tcc-A","trans_type":"tcc"}'
+```
+
+**必须先登记再调 try**。反过来的话 try 成功但登记失败，TC 不知道有这个分支，
+回滚时不会 cancel 它 —— 预留的资源永久泄漏。
+
+### TCC 跟 SAGA 的关键语义差别
+
+SAGA 的 action 返回 FAILURE → 逆序补偿。
+**TCC 的 confirm 返回 FAILURE 绝不能触发 cancel** —— try 已经成功、资源已预留、
+全局已决定提交，这时候 cancel 会把已确认的事务撤掉。唯一正确处理是无限重试 + 报警。
+
+`tcc_advance` 在 Submitted 阶段**永远不会**返回 `Finish(Aborting)`，
+测试里穷举了 3×3 种分支状态组合来钉住这条。
+（测试：`confirm失败绝不能触发cancel`、`tcc_confirm失败只重试绝不转cancel`）
+
+## 二阶段消息：不用 MQ 也能保证消息必达
+
+流程：`prepare` 落库 → 业务提交本地事务 → `submit`。
+**如果进程崩在这两步之间**，TC 会回查业务方问"你那个本地事务到底提交了没有"：
+
+| 回查回答 | TC 动作 |
+|---|---|
+| SUCCESS | 本地事务已提交 → 继续推正向分支 |
+| FAILURE | 本地事务没提交 → 整单作废 |
+| ONGOING / 超时 | **不能当成"没提交"** → 退避重试 |
+
+实测（客户端 prepare 后永不 submit）：
+
+```
+prepare → SUCCESS
+（不调 submit，等 TC 自己回查…）
+状态: succeed  分支: [('action', 'succeed')]
+业务侧调用: {'/query': 1, '/notify': 1}     ← 回查一次，然后消息发出去了
+```
+
+`prepare` 不给 `query_prepared` 会被**直接拒绝** —— 没有回查地址，客户端崩了
+就没人能决断这单，猜"已提交"会重复扣款，猜"没提交"会丢单。
+
+msg 没有补偿分支，只保证最终送达，所以分支必须幂等 + 可无限重试。
 
 ## 跑起来
 

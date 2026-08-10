@@ -8,24 +8,30 @@ pub mod registry;
 use dtmrs_core::{BranchOp, BranchStatus, GlobalStatus, SagaStep, TransType};
 use dtmrs_store::{BranchRow, GlobalRow};
 
+/// 各模式共用的全局事务骨架
+fn global(gid: &str, tt: TransType, status: GlobalStatus, payload: String) -> GlobalRow {
+    GlobalRow {
+        gid: gid.to_string(),
+        trans_type: tt,
+        status,
+        payload,
+        next_cron_time: dtmrs_store::now(),
+        next_cron_interval: 0,
+        owner: String::new(),
+        rollback_reason: String::new(),
+        query_prepared: String::new(),
+        create_time: 0,
+        finish_time: None,
+    }
+}
+
 /// 把一组 SAGA 步骤展开成"1 个全局事务 + 2N 个分支"。
 ///
 /// HTTP `submit` 和集成测试都走这里，避免两处构造逻辑漂移 ——
 /// 分支号规则错位是那种测试全绿、线上补偿补错对象的 bug。
 pub fn saga_rows(gid: &str, steps: &[SagaStep]) -> (GlobalRow, Vec<BranchRow>) {
     let payload = serde_json::to_string(steps).unwrap_or_else(|_| "[]".into());
-    let g = GlobalRow {
-        gid: gid.to_string(),
-        trans_type: TransType::Saga,
-        status: GlobalStatus::Submitted,
-        payload,
-        next_cron_time: dtmrs_store::now(),
-        next_cron_interval: 0,
-        owner: String::new(),
-        rollback_reason: String::new(),
-        create_time: 0,
-        finish_time: None,
-    };
+    let g = global(gid, TransType::Saga, GlobalStatus::Submitted, payload);
     let mut branches = Vec::with_capacity(steps.len() * 2);
     for (i, s) in steps.iter().enumerate() {
         let bid = driver::branch_id(i);
@@ -44,4 +50,44 @@ pub fn saga_rows(gid: &str, steps: &[SagaStep]) -> (GlobalRow, Vec<BranchRow>) {
         }
     }
     (g, branches)
+}
+
+/// 二阶段消息：**只有正向分支，没有补偿**。
+///
+/// `grace_secs` 是回查前的宽限期：客户端 prepare 之后正常会很快 submit，
+/// 立刻回查是白问一次。给几秒钟等它自己来。
+pub fn msg_rows(
+    gid: &str,
+    actions: &[String],
+    query_prepared: &str,
+    grace_secs: i64,
+) -> (GlobalRow, Vec<BranchRow>) {
+    // 用 SagaStep 复用 payload 格式，compensate 留空（msg 没有补偿）
+    let steps: Vec<SagaStep> = actions
+        .iter()
+        .map(|a| SagaStep { action: a.clone(), compensate: String::new() })
+        .collect();
+    let payload = serde_json::to_string(&steps).unwrap_or_else(|_| "[]".into());
+    let mut g = global(gid, TransType::Msg, GlobalStatus::Prepared, payload);
+    g.query_prepared = query_prepared.to_string();
+    g.next_cron_time = dtmrs_store::now() + grace_secs.max(0);
+    let branches = actions
+        .iter()
+        .enumerate()
+        .map(|(i, a)| BranchRow {
+            gid: gid.to_string(),
+            branch_id: driver::branch_id(i),
+            op: BranchOp::Action,
+            url: a.clone(),
+            payload: String::new(),
+            status: BranchStatus::Prepared,
+        })
+        .collect();
+    (g, branches)
+}
+
+/// TCC：`prepare` 只建全局事务，**分支是客户端在 try 阶段动态登记的**
+/// （`Store::register_branch`）。所以这里不产生任何分支行。
+pub fn tcc_rows(gid: &str) -> GlobalRow {
+    global(gid, TransType::Tcc, GlobalStatus::Prepared, "[]".into())
 }

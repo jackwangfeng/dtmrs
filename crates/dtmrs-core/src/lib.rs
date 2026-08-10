@@ -358,3 +358,183 @@ mod tests {
         assert_eq!(next_interval(300), 300);
     }
 }
+
+/// TCC 推进决策。
+///
+/// # 跟 SAGA 的关键差别
+///
+/// SAGA 的正向分支（action）返回 FAILURE 会触发逆序补偿。
+/// **TCC 的 confirm 返回 FAILURE 绝不能触发 cancel** —— try 阶段资源已经预留成功、
+/// 全局也已经决定提交了，这时候去 cancel 会把已确认的事务撤掉，造成不一致。
+/// confirm 失败的唯一正确处理是**无限重试 + 报警等人介入**。
+///
+/// 所以这个函数在 Submitted 阶段永远不会返回 `Finish(Aborting)`。
+///
+/// Try 阶段不在这里 —— TCC 的 try 是**客户端自己驱动**的（这也是 TCC 要
+/// `registerBranch` 接口的原因），TC 只负责 confirm/cancel。
+pub fn tcc_advance(
+    status: GlobalStatus,
+    confirms: &[BranchStatus],
+    cancels: &[BranchStatus],
+) -> Advance {
+    debug_assert_eq!(confirms.len(), cancels.len());
+    match status {
+        // 客户端还在跑 try，TC 不插手
+        GlobalStatus::Prepared => Advance::Wait,
+        GlobalStatus::Submitted => {
+            for (i, st) in confirms.iter().enumerate() {
+                match st {
+                    BranchStatus::Succeed => continue,
+                    // Failed 也要继续重试 —— 见上面注释，绝不转 aborting
+                    BranchStatus::Prepared | BranchStatus::Failed => {
+                        return Advance::Call { index: i, op: BranchOp::Confirm }
+                    }
+                }
+            }
+            Advance::Finish(GlobalStatus::Succeed)
+        }
+        GlobalStatus::Aborting => {
+            // 逆序 cancel。全部 cancel，空回滚由屏障负责
+            for i in (0..cancels.len()).rev() {
+                if cancels[i] != BranchStatus::Succeed {
+                    return Advance::Call { index: i, op: BranchOp::Cancel };
+                }
+            }
+            Advance::Finish(GlobalStatus::Failed)
+        }
+        s => Advance::Finish(s),
+    }
+}
+
+/// 二阶段消息推进决策。
+///
+/// # 这个模式解决什么
+///
+/// "本地事务 + 可靠消息" —— 取代 RocketMQ 那类事务消息，不需要 MQ。
+/// 流程：`prepare` 落库 → 业务提交本地事务 → `submit`。
+/// 如果进程在两者之间崩了，TC 会回查业务方（`query_prepared`）问这单到底成没成。
+///
+/// # 没有补偿
+///
+/// msg 只保证"最终一定送达"，分支必须最终成功（幂等 + 无限重试）。
+/// 所以正向分支返回 FAILURE **不触发补偿**（压根没有补偿分支），
+/// 只能重试。真要放弃只能靠 `query_prepared` 回答 FAILURE 让整单作废。
+pub fn msg_advance(status: GlobalStatus, actions: &[BranchStatus]) -> Advance {
+    match status {
+        // 等 cron 去回查 query_prepared
+        GlobalStatus::Prepared => Advance::Wait,
+        GlobalStatus::Submitted => {
+            for (i, st) in actions.iter().enumerate() {
+                if *st != BranchStatus::Succeed {
+                    return Advance::Call { index: i, op: BranchOp::Action };
+                }
+            }
+            Advance::Finish(GlobalStatus::Succeed)
+        }
+        // 回查得到 FAILURE：整单作废，没有补偿可做
+        GlobalStatus::Aborting => Advance::Finish(GlobalStatus::Failed),
+        s => Advance::Finish(s),
+    }
+}
+
+#[cfg(test)]
+mod tcc_msg_tests {
+    use super::*;
+    use BranchStatus::{Failed, Prepared, Succeed};
+
+    #[test]
+    fn tcc的try阶段tc不插手() {
+        assert_eq!(
+            tcc_advance(GlobalStatus::Prepared, &[Prepared], &[Prepared]),
+            Advance::Wait
+        );
+    }
+
+    #[test]
+    fn tcc按序confirm() {
+        let c = [Prepared, Prepared];
+        let x = [Prepared, Prepared];
+        assert_eq!(
+            tcc_advance(GlobalStatus::Submitted, &c, &x),
+            Advance::Call { index: 0, op: BranchOp::Confirm }
+        );
+        assert_eq!(
+            tcc_advance(GlobalStatus::Submitted, &[Succeed, Prepared], &x),
+            Advance::Call { index: 1, op: BranchOp::Confirm }
+        );
+        assert_eq!(
+            tcc_advance(GlobalStatus::Submitted, &[Succeed, Succeed], &x),
+            Advance::Finish(GlobalStatus::Succeed)
+        );
+    }
+
+    #[test]
+    fn confirm失败绝不能触发cancel() {
+        // 这是 TCC 最容易写错的地方：try 已成功、已决定提交，
+        // 这时候 cancel 会把已确认的事务撤掉 —— 必须重试而不是回滚
+        let c = [Succeed, Failed];
+        let x = [Prepared, Prepared];
+        assert_eq!(
+            tcc_advance(GlobalStatus::Submitted, &c, &x),
+            Advance::Call { index: 1, op: BranchOp::Confirm },
+            "confirm 失败要继续重试 confirm，不能转 cancel"
+        );
+        // 穷举：Submitted 阶段永远不会返回 Aborting
+        for a in [Prepared, Succeed, Failed] {
+            for b in [Prepared, Succeed, Failed] {
+                let r = tcc_advance(GlobalStatus::Submitted, &[a, b], &x);
+                assert_ne!(r, Advance::Finish(GlobalStatus::Aborting));
+                assert_ne!(r, Advance::Finish(GlobalStatus::Failed));
+            }
+        }
+    }
+
+    #[test]
+    fn tcc逆序cancel() {
+        let c = [Prepared, Prepared];
+        assert_eq!(
+            tcc_advance(GlobalStatus::Aborting, &c, &[Prepared, Prepared]),
+            Advance::Call { index: 1, op: BranchOp::Cancel }
+        );
+        assert_eq!(
+            tcc_advance(GlobalStatus::Aborting, &c, &[Prepared, Succeed]),
+            Advance::Call { index: 0, op: BranchOp::Cancel }
+        );
+        assert_eq!(
+            tcc_advance(GlobalStatus::Aborting, &c, &[Succeed, Succeed]),
+            Advance::Finish(GlobalStatus::Failed)
+        );
+        // cancel 失败也要重试，不能就这么算了
+        assert_eq!(
+            tcc_advance(GlobalStatus::Aborting, &c, &[Succeed, Failed]),
+            Advance::Call { index: 1, op: BranchOp::Cancel }
+        );
+    }
+
+    #[test]
+    fn msg等回查而不是自己推() {
+        assert_eq!(msg_advance(GlobalStatus::Prepared, &[Prepared]), Advance::Wait);
+    }
+
+    #[test]
+    fn msg只往前不补偿() {
+        assert_eq!(
+            msg_advance(GlobalStatus::Submitted, &[Prepared, Prepared]),
+            Advance::Call { index: 0, op: BranchOp::Action }
+        );
+        // 分支失败也只能重试 —— msg 没有补偿分支
+        assert_eq!(
+            msg_advance(GlobalStatus::Submitted, &[Failed]),
+            Advance::Call { index: 0, op: BranchOp::Action }
+        );
+        assert_eq!(
+            msg_advance(GlobalStatus::Submitted, &[Succeed, Succeed]),
+            Advance::Finish(GlobalStatus::Succeed)
+        );
+        // 回查得到 FAILURE → 整单作废，无补偿可做
+        assert_eq!(
+            msg_advance(GlobalStatus::Aborting, &[Succeed]),
+            Advance::Finish(GlobalStatus::Failed)
+        );
+    }
+}

@@ -9,8 +9,8 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use dtmrs_server::driver::Driver;
-use dtmrs_server::saga_rows;
-use dtmrs_core::{GlobalStatus, SagaStep, TransType};
+use dtmrs_server::{msg_rows, saga_rows, tcc_rows};
+use dtmrs_core::{BranchOp, GlobalStatus, SagaStep, TransType};
 use dtmrs_store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -27,7 +27,37 @@ struct SubmitReq {
     gid: String,
     #[serde(default = "default_trans_type")]
     trans_type: String,
+    /// saga 一次性给全部步骤；tcc/msg 走 prepare + submit，这里可以不带
+    #[serde(default)]
     steps: Vec<SagaStep>,
+}
+
+/// 二阶段消息 / TCC 的第一阶段
+#[derive(Deserialize)]
+struct PrepareReq {
+    gid: String,
+    trans_type: String,
+    /// msg 用：正向分支列表（没有补偿）
+    #[serde(default)]
+    actions: Vec<String>,
+    /// msg 用：回查地址。进程在 prepare 和 submit 之间崩了，TC 靠它决断
+    #[serde(default)]
+    query_prepared: String,
+    /// msg 用：回查前的宽限秒数，默认 10
+    #[serde(default)]
+    grace_secs: Option<i64>,
+}
+
+/// TCC 的 try 阶段：客户端**先登记再调 try**
+#[derive(Deserialize)]
+struct RegisterBranchReq {
+    gid: String,
+    branch_id: String,
+    confirm: String,
+    cancel: String,
+    /// 可选，只为可观测性存一份
+    #[serde(default)]
+    r#try: String,
 }
 
 fn default_trans_type() -> String {
@@ -100,6 +130,8 @@ async fn main() -> anyhow::Result<()> {
 fn router(app: App) -> Router {
     Router::new()
         .route("/api/dtmsvr/newGid", get(new_gid))
+        .route("/api/dtmsvr/prepare", post(prepare))
+        .route("/api/dtmsvr/registerBranch", post(register_branch))
         .route("/api/dtmsvr/submit", post(submit))
         .route("/api/dtmsvr/abort", post(abort))
         .route("/api/dtmsvr/query", get(query))
@@ -124,24 +156,123 @@ async fn submit(
     if req.gid.is_empty() {
         return (StatusCode::BAD_REQUEST, Reply::err("gid 不能为空"));
     }
-    if req.steps.is_empty() {
-        return (StatusCode::BAD_REQUEST, Reply::err("steps 不能为空"));
-    }
     let Some(tt) = TransType::parse(&req.trans_type) else {
         return (StatusCode::BAD_REQUEST, Reply::err("未知 trans_type"));
     };
-    if tt != TransType::Saga {
-        // 老实说做不到，别假装支持
-        return (
-            StatusCode::BAD_REQUEST,
-            Reply::err("当前版本只实现了 saga，tcc/msg/xa 在路线图上"),
-        );
+
+    // tcc / msg：prepare 已经建过事务了，submit 只是把它推成 submitted
+    if let Ok(Some(g)) = app.store.get_global(&req.gid).await {
+        if g.status == GlobalStatus::Prepared {
+            let _ = app
+                .store
+                .set_global_status(&req.gid, GlobalStatus::Submitted, "")
+                .await;
+            let _ = app.store.schedule_now(&req.gid).await;
+            return (StatusCode::OK, Reply::ok());
+        }
+        // 已经提交过 —— 幂等，返回成功而不是报错
+        return (StatusCode::OK, Reply::ok());
     }
 
-    let (g, branches) = saga_rows(&req.gid, &req.steps);
-    match app.store.create_global(&g, &branches).await {
-        // 重复提交同一个 gid 返回成功 —— 幂等，客户端重试不该失败
-        Ok(_) => (StatusCode::OK, Reply::ok()),
+    match tt {
+        TransType::Saga => {
+            if req.steps.is_empty() {
+                return (StatusCode::BAD_REQUEST, Reply::err("saga 的 steps 不能为空"));
+            }
+            let (g, branches) = saga_rows(&req.gid, &req.steps);
+            match app.store.create_global(&g, &branches).await {
+                // 重复提交同一个 gid 返回成功 —— 幂等，客户端重试不该失败
+                Ok(_) => (StatusCode::OK, Reply::ok()),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Reply::err(e.to_string())),
+            }
+        }
+        TransType::Tcc | TransType::Msg => (
+            StatusCode::BAD_REQUEST,
+            Reply::err("tcc/msg 要先调 /api/dtmsvr/prepare"),
+        ),
+        TransType::Xa => (
+            StatusCode::BAD_REQUEST,
+            Reply::err("xa 模式尚未实现"),
+        ),
+    }
+}
+
+/// 第一阶段。msg 建 prepared 事务 + 正向分支；tcc 只建空事务（分支后面登记）。
+async fn prepare(
+    State(app): State<App>,
+    Json(req): Json<PrepareReq>,
+) -> (StatusCode, Json<Reply>) {
+    if req.gid.is_empty() {
+        return (StatusCode::BAD_REQUEST, Reply::err("gid 不能为空"));
+    }
+    match TransType::parse(&req.trans_type) {
+        Some(TransType::Msg) => {
+            if req.actions.is_empty() {
+                return (StatusCode::BAD_REQUEST, Reply::err("msg 的 actions 不能为空"));
+            }
+            if req.query_prepared.is_empty() {
+                // 没有回查地址，客户端崩在中间就没人能决断这单了 —— 直接拒绝
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Reply::err("msg 必须提供 query_prepared，否则崩溃后无法决断"),
+                );
+            }
+            let (g, br) = msg_rows(
+                &req.gid,
+                &req.actions,
+                &req.query_prepared,
+                req.grace_secs.unwrap_or(10),
+            );
+            match app.store.create_global(&g, &br).await {
+                Ok(_) => (StatusCode::OK, Reply::ok()),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Reply::err(e.to_string())),
+            }
+        }
+        Some(TransType::Tcc) => {
+            let g = tcc_rows(&req.gid);
+            match app.store.create_global(&g, &[]).await {
+                Ok(_) => (StatusCode::OK, Reply::ok()),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Reply::err(e.to_string())),
+            }
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Reply::err("prepare 只支持 tcc 和 msg；saga 直接 submit"),
+        ),
+    }
+}
+
+/// TCC 的分支登记。**必须先登记再调 try**：
+/// 反过来的话 try 成功但登记失败，TC 就不知道有这个分支，
+/// 回滚时不会 cancel 它 —— 预留的资源永久泄漏。
+async fn register_branch(
+    State(app): State<App>,
+    Json(req): Json<RegisterBranchReq>,
+) -> (StatusCode, Json<Reply>) {
+    if req.gid.is_empty() || req.branch_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Reply::err("gid / branch_id 不能为空"));
+    }
+    if req.confirm.is_empty() || req.cancel.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Reply::err("confirm 和 cancel 都必须提供"),
+        );
+    }
+    match app.store.get_global(&req.gid).await {
+        Ok(Some(g)) if g.trans_type == TransType::Tcc => {}
+        Ok(Some(_)) => return (StatusCode::BAD_REQUEST, Reply::err("只有 tcc 需要登记分支")),
+        Ok(None) => return (StatusCode::NOT_FOUND, Reply::err("gid 不存在，先 prepare")),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Reply::err(e.to_string())),
+    }
+    let mut ops = vec![
+        (BranchOp::Confirm, req.confirm.clone()),
+        (BranchOp::Cancel, req.cancel.clone()),
+    ];
+    if !req.r#try.is_empty() {
+        ops.push((BranchOp::Try, req.r#try.clone()));
+    }
+    match app.store.register_branch(&req.gid, &req.branch_id, &ops).await {
+        Ok(()) => (StatusCode::OK, Reply::ok()),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Reply::err(e.to_string())),
     }
 }
