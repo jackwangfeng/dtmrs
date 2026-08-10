@@ -319,6 +319,40 @@ impl Store {
         Ok(())
     }
 
+    /// 落一个分支的状态**和结果数据**。
+    ///
+    /// workflow 模式的重放靠这个：函数崩溃后会从头再跑一遍，已完成的分支
+    /// 不重新执行，而是把上次存的 `payload` 原样还给它。所以这个值必须跟
+    /// 「分支已成功」在**同一条 UPDATE 里**落盘 —— 分两步写的话，中间崩了
+    /// 就会出现「标了成功但结果丢了」，重放时拿不到返回值。
+    pub async fn set_branch_result(
+        &self,
+        gid: &str,
+        branch_id: &str,
+        op: BranchOp,
+        status: BranchStatus,
+        payload: &str,
+    ) -> Result<()> {
+        len_ok("payload", payload, MID)?;
+        let t = now();
+        sqlx::query(&self.be.q(
+            "UPDATE trans_branch_op SET status=?, payload=?, update_time=?,
+             finish_time = CASE WHEN ? <> 'prepared' THEN ? ELSE finish_time END
+             WHERE gid=? AND branch_id=? AND op=?",
+        ))
+        .bind(status.as_str())
+        .bind(payload)
+        .bind(t)
+        .bind(status.as_str())
+        .bind(t)
+        .bind(gid)
+        .bind(branch_id)
+        .bind(op.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn set_branch_status(
         &self,
         gid: &str,

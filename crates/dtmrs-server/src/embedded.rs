@@ -43,7 +43,8 @@
 use crate::driver::Driver;
 use crate::registry::{BranchCtx, Registry};
 use crate::saga_rows;
-use dtmrs_core::{BranchResult, GlobalStatus, SagaStep};
+use crate::workflow::{WorkflowCtx, WorkflowRegistry, WorkflowResult};
+use dtmrs_core::{BranchResult, GlobalStatus, SagaStep, TransType};
 use dtmrs_store::Store;
 use std::future::Future;
 use std::sync::Arc;
@@ -53,6 +54,7 @@ pub struct EmbeddedBuilder {
     db: String,
     owner: String,
     registry: Registry,
+    workflows: WorkflowRegistry,
     tick: Duration,
 }
 
@@ -78,15 +80,34 @@ impl EmbeddedBuilder {
         self
     }
 
+    /// 注册一个 workflow：把整个事务流程写成一个普通函数。
+    ///
+    /// 跟 saga 的区别是**步骤由函数自己决定** —— 可以有 if、有循环、
+    /// 可以依赖前一步的返回值。崩溃后靠重放 + 结果记忆化续跑。
+    ///
+    /// 详见 [`crate::workflow`]，尤其是「你的函数必须是确定性的」那节。
+    pub fn workflow<F, Fut>(mut self, name: &str, f: F) -> Self
+    where
+        F: Fn(WorkflowCtx) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = WorkflowResult<()>> + Send + 'static,
+    {
+        self.workflows.register(name, f);
+        self
+    }
+
     pub async fn start(self) -> anyhow::Result<Embedded> {
         let store = Store::open(&self.db).await?;
         let registry = Arc::new(self.registry);
-        let driver = Driver::new(store.clone(), self.owner).with_registry(registry.clone());
+        let workflows = Arc::new(self.workflows);
+        let driver = Driver::new(store.clone(), self.owner)
+            .with_registry(registry.clone())
+            .with_workflows(workflows.clone());
         // 常驻推进器。重启后未终结的事务会被它自动捞起继续推 —— 崩溃恢复就靠这个
         let task = tokio::spawn(driver.clone().run_forever(self.tick));
         Ok(Embedded {
             store,
             registry,
+            workflows,
             task: Some(task),
         })
     }
@@ -95,6 +116,7 @@ impl EmbeddedBuilder {
 pub struct Embedded {
     store: Store,
     registry: Arc<Registry>,
+    workflows: Arc<WorkflowRegistry>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -104,6 +126,7 @@ impl Embedded {
             db: db.to_string(),
             owner: format!("embedded-{}", std::process::id()),
             registry: Registry::new(),
+            workflows: WorkflowRegistry::new(),
             tick: Duration::from_millis(200),
         }
     }
@@ -114,6 +137,29 @@ impl Embedded {
             gid: gid.to_string(),
             steps: Vec::new(),
         }
+    }
+
+    /// 提交一个 workflow 事务。
+    ///
+    /// `name` 必须是 [`EmbeddedBuilder::workflow`] 注册过的名字 ——
+    /// 这里就检查，宁可提交报错，也别等推到一半才发现函数不存在。
+    ///
+    /// `input` 原样透传给函数（`WorkflowCtx::input`）。gid 本身通常就是业务单号，
+    /// 简单场景可以传空串。
+    pub async fn submit_workflow(&self, gid: &str, name: &str, input: &str) -> anyhow::Result<()> {
+        if !self.workflows.contains(name) {
+            anyhow::bail!(
+                "workflow「{name}」没注册。已注册的: {:?}",
+                self.workflows.names()
+            );
+        }
+        let mut g = crate::tcc_rows(gid);
+        g.trans_type = TransType::Workflow;
+        g.status = GlobalStatus::Submitted;
+        g.payload = crate::workflow::encode_payload(name, input);
+        // 重复提交同一个 gid 是幂等的（INSERT OR IGNORE），跟 saga 一致
+        self.store.create_global(&g, &[]).await?;
+        Ok(())
     }
 
     pub async fn status(&self, gid: &str) -> anyhow::Result<Option<GlobalStatus>> {

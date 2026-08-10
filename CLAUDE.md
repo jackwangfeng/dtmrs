@@ -5,7 +5,8 @@
 ## 这是什么
 
 dtmrs：Rust 写的分布式事务管理器（对标 Go 的 [DTM](https://github.com/dtm-labs/dtm)）。
-支持 SAGA / TCC / 二阶段消息 / XA 四种模式，存储可跑 sqlite / postgres / mysql。
+支持 SAGA / TCC / 二阶段消息 / XA / workflow 五种模式，存储可跑 sqlite / postgres / mysql。
+对外有 HTTP 和 gRPC 两套等价接口。
 除了独立部署的 TC 二进制，还有 DTM 没有的**嵌入式形态**：TC 当库链进宿主进程，
 分支可以是进程内函数；再往外通过 C ABI 给任何语言用。
 
@@ -15,8 +16,9 @@ Apache-2.0。只实现 DTM 的协议，不抄它的代码。
 
 ```bash
 cargo build --release                 # 二进制在 target/release/dtmrs
-cargo test --workspace                # 105 个测试（真库那部分会被跳过，见下）
+cargo test --workspace                # 126 个测试（真库那部分会被跳过，见下）
 cargo run --example embedded -p dtmrs-server   # 嵌入式模式的可运行示例
+cargo run --example workflow -p dtmrs-server   # workflow 模式（重放/断点续跑）
 
 # 起 TC（HTTP 和 gRPC 各占一个端口）
 DTMRS_DB=sqlite:dtmrs.db DTMRS_ADDR=127.0.0.1:36789 ./target/release/dtmrs
@@ -77,8 +79,10 @@ Postgres 的 2PC 默认关着，跑 XA 测试要 `postgres -c max_prepared_trans
 crates/
   dtmrs-core/     状态机 + 类型，纯逻辑无 I/O。dialect.rs 是 SQL 方言渲染
   dtmrs-store/    存储 + 租约抢占（sqlx::Any，一套 SQL 跑三种库）
-  dtmrs-server/   TC：main.rs(axum HTTP) / driver.rs(推进器) /
-                  registry.rs(进程内分支表) / embedded.rs(嵌入式门面)
+  dtmrs-server/   TC：api.rs(协议无关的操作层，HTTP 与 gRPC 共用)
+                  main.rs(axum HTTP) / grpc/(tonic，调分支 + 提供 API)
+                  driver.rs(推进器) / registry.rs(进程内分支表)
+                  workflow.rs(workflow 模式) / embedded.rs(嵌入式门面)
   dtmrs-barrier/  客户端子事务屏障
   dtmrs-xa/       业务方(RM)的 XA 助手，pg / mysql 两套语法
   dtmrs-ffi/      C ABI（cdylib + staticlib，产物名 libdtmrs）
@@ -86,10 +90,12 @@ crates/
 
 **两条结构约束，都别破坏：**
 
-1. `dtmrs-core` 里的 `saga_advance` / `tcc_advance` / `msg_advance` / `xa_advance`
-   决定「下一步做什么」，`driver.rs` 只负责把决策落成网络调用和状态更新。
-   **状态迁移逻辑不要往 driver 里写** —— 放在 core 才能穷举单测，
+1. `dtmrs-core` 里的 `saga_advance` / `tcc_advance` / `msg_advance` / `xa_advance` /
+   `workflow_advance` 决定「下一步做什么」，`driver.rs` 只负责把决策落成网络调用
+   和状态更新。**状态迁移逻辑不要往 driver 里写** —— 放在 core 才能穷举单测，
    分布式事务的 bug 绝大多数就在状态迁移上。
+   （workflow 是唯一的例外，而且是**受控的例外**：正向走向由用户函数决定，
+   core 仍然拥有「何时跑函数、何时补偿、按什么顺序补」，见 `workflow_advance` 的文档。）
 2. HTTP（`main.rs`）和 gRPC（`grpc/server.rs`）都只做协议转换，业务判断只在
    `api.rs`。**别在任一协议层里加判断** —— 两边漂移的后果是「同一个请求走 HTTP
    被拒、走 gRPC 却受理了」。
@@ -155,6 +161,10 @@ crates/
   Node 必须用拉取式不是因为跨线程回调不行（实测可以），而是因为 C ABI 的回调
   必须同步返回 int，而 Node 的业务代码全是 async。改这块前先读
   `bindings/node/dtmrs.js` 的文件头。
+- **workflow 模式靠重放**：函数会被从头跑多次，已成功的分支走记忆化。改
+  `workflow.rs` 时记住两条不变量：补偿必须**先于**正向动作登记（否则动作超时
+  或崩溃会漏掉补偿）；分岔检测发现名字对不上时**既不能成功也不能回滚**，
+  只能停下等人。
 - gRPC 分支调用用自定义 `BytesCodec` 做动态转发，**不需要业务方的 proto**。
   改 `grpc/client.rs` 时注意：请求体发空字节是刻意的（空 protobuf 消息对任何
   message 类型都合法），分支身份走 metadata。

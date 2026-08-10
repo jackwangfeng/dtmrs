@@ -237,10 +237,11 @@ restart you must register a handler under the same name.
 | **Two-phase messaging (replaces transactional MQ)** | ✅ |
 | **XA (native two-phase commit on Postgres + MySQL)** | ✅ |
 | **gRPC (branch calls + TC server API)** | ✅ |
+| **workflow mode (write the flow as a function, resume after a crash)** | ✅ |
 
-**105 tests, all green**: 27 state-machine/dialect unit tests + 7 storage + 10 barrier
-+ 6 XA helper + 8 C ABI + 9 server unit + 6 SAGA e2e + 12 TCC/msg + 5 embedded
-+ 6 XA e2e + 8 gRPC e2e.
+**126 tests, all green**: 33 state-machine/dialect unit tests + 7 storage + 10 barrier
++ 6 XA helper + 8 C ABI + 13 server unit + 6 SAGA e2e + 12 TCC/msg + 5 embedded
++ 6 XA e2e + 8 gRPC e2e + 12 workflow e2e.
 The 17 storage and barrier tests each run against **sqlite, real Postgres and real MySQL**;
 the 6 XA tests require a real Postgres or MySQL (both configured → both run).
 The Python, Node, Java and C examples all actually run.
@@ -571,6 +572,107 @@ Submitted phase never returns `Finish(Aborting)`, so "not found" can only mean i
 already committed, never that it was rolled back. The check uses SQLSTATE rather than
 error-message matching — messages change across versions and locales.
 (Test: `错误码按方言区分`)
+
+## workflow mode: write the flow as an ordinary function
+
+The other four modes require the steps to be **declared up front**. Real business logic
+often isn't like that: whether step three runs depends on what step two returned, and there
+are `if`s and loops in between.
+
+workflow mode lets you just write it:
+
+```rust
+let tc = Embedded::builder("sqlite:app.db")
+    .handler("refund", |_| async { BranchResult::Success })
+    .workflow("place_order", |mut wf| async move {
+        // the return value is memoized and handed back verbatim on replay
+        let oid = wf.branch("create_order").on_rollback("local://cancel_order")
+            .run_with(|| async { (BranchResult::Success, new_order_id()) }).await?;
+
+        wf.branch("deduct").on_rollback("local://refund")
+            .run(|| async { deduct(&oid).await }).await?;
+
+        // real control flow
+        if need_ship(&oid) {
+            wf.branch("ship").on_rollback("local://unship")
+                .run(|| async { ship(&oid).await }).await?;
+        }
+        Ok(())
+    })
+    .start().await?;
+
+tc.submit_workflow("order-1001", "place_order", r#"{"amount":100}"#).await?;
+```
+
+### Crash recovery via replay plus result memoization
+
+After a crash and restart, the TC runs the function **again from the top**. Branches that
+already succeeded are not re-executed — their stored return value is handed back — so the
+function follows the same path to where it stopped and then continues:
+
+```text
+first run:   create_order(real, stores oid) → deduct(real) → crash
+after restart: create_order(memoized, returns oid) → deduct(memoized) → ship(real) → done
+                     ↑ side effects are not repeated
+```
+
+Actual output of `cargo run --example workflow -p dtmrs-server`:
+
+```
+② crash and restart → completed steps are not redone
+  --- process A ---
+  [deduct] actually executed (1 time total)
+  [credit] timed out, result unknown → retry only, no rollback
+  status: Some(Submitted)  (process A killed here)
+  --- process B (same database, brand new TC, client did not resubmit) ---
+  [credit] succeeded
+  result: Succeed   deduct executed 1 time total ← the restart did not redo it
+```
+
+### ⚠ Your function must be deterministic
+
+Replay re-runs from the top, so the code between branches executes multiple times. Given
+the same branch return values it must take the same path:
+
+- ❌ `if rand() > 0.5`, `if now().hour() < 12`, reading mutable global state
+- ❌ writing to the database **outside** a branch — that is not memoized and will be
+  repeated on replay
+- ✅ put every side effect inside `branch(...).run(...)`
+
+What happens if you get it wrong? It is **detected immediately and stops**, rather than
+silently compensating the wrong thing:
+
+```
+replay diverged: branch 02 was recorded as "deduct" but is now "ship".
+The function must be deterministic; put side effects inside branch().run()
+```
+
+At that point it neither succeeds nor rolls back — the real progress is no longer known,
+and forcing a rollback would be more dangerous. It stops and waits for a human to restore
+deterministic code; a restart then resumes it.
+(Test: `重放走岔了会被当场发现`)
+
+### Only branches that were actually reached get compensated
+
+This looks different from SAGA's "compensate every branch", but it is the same rule: a
+branch that was never reached was never registered, so it has no side effect to clean up.
+
+The key is that **the compensation is registered before the forward action runs** — so even
+if the action times out, or the process dies right there, the compensation is already in the
+database and cannot be missed. Same lesson as TCC's "register the branch before calling try".
+
+A branch without `on_rollback` is never compensated; only use that for steps with no side
+effects (a pure query, say).
+
+### Why this mode is embedded-only
+
+Because a "step" is **code**, and code cannot be represented as a URL stored in a database.
+DTM has the same constraint: the workflow body lives in the client process and the TC only
+stores state. Since we put the TC in that same process, this becomes natural rather than
+awkward.
+
+Submitting `trans_type=workflow` over HTTP or gRPC is explicitly rejected rather than
+silently accepted.
 
 ## Running it
 

@@ -7,6 +7,7 @@ pub mod embedded;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 pub mod registry;
+pub mod workflow;
 
 use dtmrs_core::{BranchOp, BranchStatus, GlobalStatus, SagaStep, TransType};
 use dtmrs_store::{BranchRow, GlobalRow};

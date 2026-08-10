@@ -140,6 +140,12 @@ impl Api {
             TransType::Tcc | TransType::Msg | TransType::Xa => {
                 Err(ApiError::BadRequest("tcc/xa/msg 要先调 prepare".into()))
             }
+            // workflow 的「步骤」是**代码**，没法表示成 URL 存进库里，
+            // 所以只能在嵌入式形态下提交（Embedded::workflow + submit_workflow）。
+            // 这不是暂未实现，是这个模式的本质决定的
+            TransType::Workflow => Err(ApiError::BadRequest(
+                "workflow 模式只能在嵌入式形态下提交（步骤是进程内的函数，不是 URL）".into(),
+            )),
         }
     }
 

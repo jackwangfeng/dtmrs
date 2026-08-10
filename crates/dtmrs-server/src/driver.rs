@@ -25,6 +25,8 @@ pub struct Driver {
     /// gRPC 分支调用器（带 channel 缓存）
     #[cfg(feature = "grpc")]
     pub grpc: crate::grpc::client::GrpcCaller,
+    /// workflow 函数注册表。跟 registry 一样，纯 HTTP 部署时是空表
+    pub workflows: Arc<crate::workflow::WorkflowRegistry>,
 }
 
 impl Driver {
@@ -40,12 +42,19 @@ impl Driver {
             registry: Arc::new(Registry::new()),
             #[cfg(feature = "grpc")]
             grpc: crate::grpc::client::GrpcCaller::new(Duration::from_secs(10)),
+            workflows: Arc::new(crate::workflow::WorkflowRegistry::new()),
         }
     }
 
     /// 挂上进程内分支注册表 —— 嵌入式模式的入口
     pub fn with_registry(mut self, r: Arc<Registry>) -> Self {
         self.registry = r;
+        self
+    }
+
+    /// 挂上 workflow 函数注册表
+    pub fn with_workflows(mut self, w: Arc<crate::workflow::WorkflowRegistry>) -> Self {
+        self.workflows = w;
         self
     }
 
@@ -76,6 +85,106 @@ impl Driver {
             TransType::Tcc => self.process_tcc(g).await,
             TransType::Msg => self.process_msg(g).await,
             TransType::Xa => self.process_xa(g).await,
+            TransType::Workflow => self.process_workflow(g).await,
+        }
+    }
+
+    // ---------------- workflow ----------------
+
+    /// 跑用户的 workflow 函数，失败则逆序补偿它**已经登记过**的分支。
+    ///
+    /// 跟另外四种模式的差别见 [`dtmrs_core::workflow_advance`]：正向走向由
+    /// 用户函数决定，状态机只管「什么时候跑、什么时候补、按什么顺序补」。
+    async fn process_workflow(&self, g: &GlobalRow) -> anyhow::Result<()> {
+        let (name, input) = crate::workflow::decode_payload(&g.payload);
+        let mut status = g.status;
+
+        loop {
+            let rows = self.store.list_branches(&g.gid).await?;
+            let compensates = compensate_states(&rows);
+
+            match dtmrs_core::workflow_advance(status, &compensates) {
+                Advance::Finish(s) => {
+                    info!(gid = %g.gid, status = s.as_str(), "workflow 事务终结");
+                    self.store.set_global_status(&g.gid, s, "").await?;
+                    return Ok(());
+                }
+                Advance::Wait => return Ok(()),
+
+                Advance::RunWorkflow => {
+                    let Some(f) = self.workflows.get(&name) else {
+                        // 漏注册（新版本删了 workflow / 换了名字）。
+                        // **按结果未知处理** —— 这是部署问题，改回来重试就好，
+                        // 判失败会白白触发回滚
+                        warn!(gid = %g.gid, workflow = %name,
+                              "workflow 未注册，按结果未知处理（会重试，不回滚）");
+                        self.retry_later(g).await?;
+                        return Ok(());
+                    };
+                    let ctx =
+                        crate::workflow::WorkflowCtx::new(&g.gid, &input, self.store.clone(), rows);
+                    match f(ctx).await {
+                        Ok(()) => {
+                            info!(gid = %g.gid, workflow = %name, "workflow 跑完");
+                            self.store
+                                .set_global_status(&g.gid, GlobalStatus::Succeed, "")
+                                .await?;
+                            return Ok(());
+                        }
+                        Err(crate::workflow::WorkflowError::Rollback(reason)) => {
+                            info!(gid = %g.gid, workflow = %name, %reason, "workflow 要求回滚");
+                            self.store
+                                .set_global_status(&g.gid, GlobalStatus::Aborting, &reason)
+                                .await?;
+                            status = GlobalStatus::Aborting;
+                            continue;
+                        }
+                        Err(crate::workflow::WorkflowError::Diverged {
+                            branch_id: bid,
+                            recorded,
+                            got,
+                        }) => {
+                            // **绝不能继续**：按位置记忆化会张冠李戴，回滚也会补错对象。
+                            // 也不回滚 —— 我们已经不知道真实进度了，硬回滚更危险。
+                            // 停在这里等人：改回确定性的代码，重启就能接着推。
+                            warn!(gid = %g.gid, workflow = %name, branch = %bid,
+                                  %recorded, %got,
+                                  "workflow 重放走岔了，已停止推进，需要人工介入");
+                            self.retry_later(g).await?;
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            // Retry / Internal：只重试，绝不回滚
+                            warn!(gid = %g.gid, workflow = %name, error = %e, "workflow 需要重试");
+                            self.retry_later(g).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+
+                Advance::Call { index, op } => {
+                    let bid = branch_id(index);
+                    let Some(url) = url_of(&rows, &bid, op) else {
+                        // 补偿行不见了，不该发生
+                        warn!(gid = %g.gid, branch = %bid, "workflow 补偿地址缺失");
+                        self.retry_later(g).await?;
+                        return Ok(());
+                    };
+                    match self.call_branch(g, &bid, op, &url).await {
+                        BranchResult::Success => {
+                            self.store
+                                .set_branch_status(&g.gid, &bid, op, BranchStatus::Succeed)
+                                .await?;
+                        }
+                        // 补偿失败只能不停重试 —— 漏掉就是真的漏了副作用
+                        _ => {
+                            warn!(gid = %g.gid, branch = %bid, "workflow 补偿未成功，会重试");
+                            self.retry_later(g).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -108,6 +217,12 @@ impl Driver {
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
+                // 只有 workflow 模式会出现，别的模式走到这里说明状态机接错了。
+                // **不 panic** —— 推进器是常驻的，崩了整个 TC 就停了
+                Advance::RunWorkflow => {
+                    warn!(gid = %g.gid, "非 workflow 事务收到 RunWorkflow 决策，跳过");
+                    return Ok(());
+                }
                 Advance::Call { index, op } => {
                     let branch_id = branch_id(index);
                     let url = match op {
@@ -221,6 +336,12 @@ impl Driver {
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
+                // 只有 workflow 模式会出现，别的模式走到这里说明状态机接错了。
+                // **不 panic** —— 推进器是常驻的，崩了整个 TC 就停了
+                Advance::RunWorkflow => {
+                    warn!(gid = %g.gid, "非 workflow 事务收到 RunWorkflow 决策，跳过");
+                    return Ok(());
+                }
                 Advance::Call { index, op } => {
                     let bid = branch_id(index);
                     let Some(url) = url_of(&rows, &bid, op) else {
@@ -323,6 +444,12 @@ impl Driver {
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
+                // 只有 workflow 模式会出现，别的模式走到这里说明状态机接错了。
+                // **不 panic** —— 推进器是常驻的，崩了整个 TC 就停了
+                Advance::RunWorkflow => {
+                    warn!(gid = %g.gid, "非 workflow 事务收到 RunWorkflow 决策，跳过");
+                    return Ok(());
+                }
                 Advance::Call { index, op } => {
                     let bid = branch_id(index);
                     match self.call_branch(g, &bid, op, &steps[index].action).await {
@@ -507,6 +634,31 @@ fn split_by_op(
         }
     }
     (a, b)
+}
+
+/// 按分支序取出各 compensate 行的状态，用于 workflow 的逆序补偿。
+///
+/// 跟 `split_by_op` 的区别：workflow 的分支数是**运行时长出来的**，
+/// 提交时并不知道有几个，所以长度得从已登记的行里推出来。
+fn compensate_states(rows: &[dtmrs_store::BranchRow]) -> Vec<BranchStatus> {
+    let n = rows
+        .iter()
+        .filter(|r| r.op == BranchOp::Compensate)
+        .filter_map(|r| index_of(&r.branch_id))
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+    // 没登记补偿的分支（比如纯查询步骤）留成 Succeed，逆序扫描时会跳过它 ——
+    // 本来就没有副作用要收拾
+    let mut v = vec![BranchStatus::Succeed; n];
+    for r in rows.iter().filter(|r| r.op == BranchOp::Compensate) {
+        if let Some(i) = index_of(&r.branch_id) {
+            if i < n {
+                v[i] = r.status;
+            }
+        }
+    }
+    v
 }
 
 fn url_of(rows: &[dtmrs_store::BranchRow], branch_id: &str, op: BranchOp) -> Option<String> {

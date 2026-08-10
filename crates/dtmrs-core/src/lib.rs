@@ -91,6 +91,9 @@ pub enum TransType {
     Tcc,
     Msg,
     Xa,
+    /// 步骤由**用户函数在运行时决定**，靠重放 + 结果记忆化做崩溃恢复。
+    /// 见 [`workflow_advance`]
+    Workflow,
 }
 
 impl fmt::Display for TransType {
@@ -100,6 +103,7 @@ impl fmt::Display for TransType {
             Self::Tcc => "tcc",
             Self::Msg => "msg",
             Self::Xa => "xa",
+            Self::Workflow => "workflow",
         };
         f.write_str(s)
     }
@@ -112,6 +116,7 @@ impl TransType {
             "tcc" => Some(Self::Tcc),
             "msg" => Some(Self::Msg),
             "xa" => Some(Self::Xa),
+            "workflow" => Some(Self::Workflow),
             _ => None,
         }
     }
@@ -257,6 +262,11 @@ pub enum Advance {
     Finish(GlobalStatus),
     /// 有分支 Ongoing/Unknown，本轮到此为止，等下次 cron
     Wait,
+    /// 跑一遍用户的 workflow 函数（只有 [`TransType::Workflow`] 会出现）。
+    ///
+    /// 单独一个变体而不是复用 `Call`：workflow 的正向走向是**用户函数**决定的，
+    /// 不是状态机决定的。混进 `Call` 会让人以为这里也能算出「下一个分支是谁」。
+    RunWorkflow,
 }
 
 /// SAGA 推进决策。**不碰 I/O，所以可以穷举测试。**
@@ -743,6 +753,128 @@ pub fn xa_advance(
             Advance::Finish(GlobalStatus::Failed)
         }
         s => Advance::Finish(s),
+    }
+}
+
+/// workflow 推进决策。
+///
+/// # 这个模式跟前四种的结构性差别
+///
+/// SAGA / TCC / msg / XA 的步骤都是**提前声明**的，所以状态机能算出「下一步调谁」。
+/// workflow 反过来：步骤是**用户函数在运行时决定**的 —— 可以有 `if`、有循环、
+/// 有依赖前一步返回值的分叉。这是它存在的全部理由，也是它没法被本函数算出来的原因。
+///
+/// 所以这里只拥有三件事（这三件仍然可以穷举测试）：
+///
+/// 1. 什么时候该跑那个函数（Submitted → [`Advance::RunWorkflow`]）
+/// 2. 什么时候该补偿、按什么顺序（Aborting → 逆序）
+/// 3. 什么时候落终态
+///
+/// 「下一步调谁」交给用户函数，靠**重放 + 结果记忆化**保证崩溃后不重做。
+///
+/// # 补偿为什么能复用逆序那套
+///
+/// 用户函数每跑到一个分支就**动态登记**它的补偿（跟 TCC 的 `registerBranch`
+/// 一个形状），登记的行落在 `trans_branch_op` 里。所以回滚阶段跟 SAGA 完全一样：
+/// 逆序扫补偿行。区别只是这些行是运行时长出来的，不是提交时一次性写好的。
+///
+/// # 只补偿「登记过」的分支
+///
+/// 跟 SAGA「补偿所有分支」看着不同，其实是同一条规则：没跑到的分支压根没登记，
+/// 也就没有副作用要收拾。**关键在于补偿必须先于正向动作登记** ——
+/// 这样即使正向动作超时或进程当场崩了，补偿也已经在库里了，不会漏。
+/// 这跟 TCC「必须先 registerBranch 再调 try」是同一条教训。
+pub fn workflow_advance(status: GlobalStatus, compensates: &[BranchStatus]) -> Advance {
+    match status {
+        // workflow 没有 prepare 阶段，出现就是数据有问题，别乱动
+        GlobalStatus::Prepared => Advance::Wait,
+        GlobalStatus::Submitted => Advance::RunWorkflow,
+        GlobalStatus::Aborting => {
+            // 逆序补偿。失败的也要重试 —— 补偿没跑成就是真的漏了副作用
+            for i in (0..compensates.len()).rev() {
+                if compensates[i] != BranchStatus::Succeed {
+                    return Advance::Call {
+                        index: i,
+                        op: BranchOp::Compensate,
+                    };
+                }
+            }
+            Advance::Finish(GlobalStatus::Failed)
+        }
+        s => Advance::Finish(s),
+    }
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+    use BranchStatus::{Failed, Prepared, Succeed};
+
+    #[test]
+    fn submitted就是去跑函数() {
+        assert_eq!(
+            workflow_advance(GlobalStatus::Submitted, &[]),
+            Advance::RunWorkflow
+        );
+        // 已经登记了几个分支也一样 —— 该不该跑下一步是函数自己的事，
+        // 重放时靠记忆化跳过已完成的
+        assert_eq!(
+            workflow_advance(GlobalStatus::Submitted, &[Succeed, Prepared]),
+            Advance::RunWorkflow
+        );
+    }
+
+    #[test]
+    fn 回滚时逆序补偿() {
+        assert_eq!(
+            workflow_advance(GlobalStatus::Aborting, &[Prepared, Prepared]),
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Compensate
+            },
+            "后执行的先回滚"
+        );
+        assert_eq!(
+            workflow_advance(GlobalStatus::Aborting, &[Prepared, Succeed]),
+            Advance::Call {
+                index: 0,
+                op: BranchOp::Compensate
+            }
+        );
+        assert_eq!(
+            workflow_advance(GlobalStatus::Aborting, &[Succeed, Succeed]),
+            Advance::Finish(GlobalStatus::Failed)
+        );
+        // 补偿失败要接着重试，不能就这么算了 —— 那是真的漏了副作用
+        assert_eq!(
+            workflow_advance(GlobalStatus::Aborting, &[Succeed, Failed]),
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Compensate
+            }
+        );
+    }
+
+    #[test]
+    fn 一个分支都没登记就回滚是直接失败() {
+        // 函数第一步就要求回滚，还没来得及登记任何补偿 —— 没有副作用要收拾
+        assert_eq!(
+            workflow_advance(GlobalStatus::Aborting, &[]),
+            Advance::Finish(GlobalStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn 终态不再推进() {
+        for s in [GlobalStatus::Succeed, GlobalStatus::Failed] {
+            assert_eq!(workflow_advance(s, &[]), Advance::Finish(s));
+        }
+    }
+
+    #[test]
+    fn workflow是一种事务类型() {
+        assert_eq!(TransType::parse("workflow"), Some(TransType::Workflow));
+        assert_eq!(TransType::Workflow.to_string(), "workflow");
     }
 }
 
