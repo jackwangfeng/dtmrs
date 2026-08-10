@@ -9,11 +9,63 @@ Rust 写的分布式事务管理器，对标 [DTM](https://github.com/dtm-labs/d
 
 dtmrs 是 **Apache-2.0**，商用闭源接入没有障碍。
 
+## 差异化：嵌入式 TC（DTM 做不到的形态）
+
+TC 当库链进你自己的进程，**不需要单独部署服务**：
+
+```text
+DTM:    你的服务 ──HTTP──► 独立部署的 TC 进程 ──► DB
+                           （要运维、要高可用、要监控）
+dtmrs:  你的服务（TC 就在进程里）──► DB
+```
+
+分支不用是 HTTP URL，可以直接是进程内的函数 —— 没有网络、没有序列化：
+
+```rust
+let tc = Embedded::builder("sqlite:app.db")
+    .handler("扣款",     |ctx| async move { /* 业务逻辑 */ BranchResult::Success })
+    .handler("扣款撤销", |ctx| async move { BranchResult::Success })
+    .start().await?;
+
+tc.saga("order-1001")
+    .step("local://扣款", "local://扣款撤销")
+    .step("http://shipment/create", "http://shipment/cancel")   // 可跟远端混用
+    .submit().await?;
+```
+
+`cargo run --example embedded` 的实际输出：
+
+```
+② 库存不足（第 2 步要求回滚，应逆序补偿）
+  [扣款]      gid=order-2 branch=01
+  [库存不足]  gid=order-2 → 明确要求回滚
+  [发货撤销]  gid=order-2 ← 补偿
+  [扣款撤销]  gid=order-2 ← 补偿
+  结果: Failed
+```
+
+**Go 做不到这个形态**：`c-shared` 会把整个运行时拖进宿主进程，还有 GC 和信号
+处理的冲突，实际没人这么用。所以 DTM 结构上必须独立部署。
+
+### 嵌入式没有牺牲持久性
+
+TC 在进程里，但状态在 DB 里。进程死了事务不丢 —— 新进程启动后自动接着推，
+**不需要客户端重新提交，也不会重做已完成的步骤**。
+（测试：`跨进程重启_事务不丢且已完成的步骤不重做`）
+
+### 一个必须知道的约束
+
+`local://` 分支存的是**名字**，因为闭包没法持久化。重启后必须注册同名 handler。
+
+- 漏注册 → 按「结果未知」处理，**只重试不回滚**（这是部署问题，不是业务失败）
+- `submit()` 时就检查名字是否都注册了 —— 宁可提交报错，也别等副作用落地才发现
+
 ## 现在能用什么
 
 | 能力 | 状态 |
 |---|---|
 | SAGA（正向提交 + 逆序补偿） | ✅ 可用 |
+| **嵌入式 TC（进程内分支 + 无需部署）** | ✅ 可用 |
 | 子事务屏障（幂等 / 空回滚 / 悬挂） | ✅ 可用 |
 | 崩溃恢复（未终结事务自动续推） | ✅ 可用 |
 | 多 TC 实例（DB 租约防重复推进） | ✅ 可用 |
@@ -24,7 +76,7 @@ dtmrs 是 **Apache-2.0**，商用闭源接入没有障碍。
 | TCC / 二阶段消息 / XA | ⬜ 未做（`submit` 会明确报错，不假装支持） |
 | gRPC | ⬜ 未做 |
 
-**28 个测试全绿**，包含 6 个走真实 HTTP 的端到端用例。
+**37 个测试全绿**：6 个走真实 HTTP 的端到端 + 5 个嵌入式（含跨进程重启恢复）。
 
 ## 跑起来
 
@@ -112,7 +164,7 @@ tx.commit().await?;   // 原子性的来源：屏障记录与业务变更同生�
 crates/
   dtmrs-core/     状态机，纯逻辑无 I/O —— 状态迁移的 bug 全在这层测
   dtmrs-store/    存储（sqlite）+ 租约抢占
-  dtmrs-server/   TC：axum HTTP + 常驻推进器
+  dtmrs-server/   TC：axum HTTP + 常驻推进器 + 嵌入式门面（registry / embedded）
   dtmrs-barrier/  客户端子事务屏障
 ```
 

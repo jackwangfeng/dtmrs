@@ -2,6 +2,8 @@
 //! bin crate 是不能被 tests/ import 的。
 
 pub mod driver;
+pub mod embedded;
+pub mod registry;
 
 use dtmrs_core::{BranchOp, BranchStatus, GlobalStatus, SagaStep, TransType};
 use dtmrs_store::{BranchRow, GlobalRow};

@@ -3,8 +3,10 @@
 //! 这里是**唯一**会修改全局事务状态的地方，决策全部来自 `dtmrs_core::saga_advance`，
 //! 本文件只负责 I/O。这样状态迁移的正确性可以在 core 里纯单测覆盖。
 
+use crate::registry::{parse_target, BranchCtx, Registry, Target};
 use dtmrs_core::{saga_advance, Advance, BranchOp, BranchResult, BranchStatus, GlobalStatus, SagaStep};
 use dtmrs_store::{GlobalRow, Store};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -15,6 +17,8 @@ pub struct Driver {
     pub owner: String,
     /// 租约时长（秒）。持租约的实例崩了，这么久之后别的实例接手
     pub lease: i64,
+    /// 进程内分支注册表。嵌入式模式用，纯 HTTP 部署时是空表
+    pub registry: Arc<Registry>,
 }
 
 impl Driver {
@@ -27,7 +31,14 @@ impl Driver {
                 .expect("build http client"),
             owner,
             lease: 30,
+            registry: Arc::new(Registry::new()),
         }
+    }
+
+    /// 挂上进程内分支注册表 —— 嵌入式模式的入口
+    pub fn with_registry(mut self, r: Arc<Registry>) -> Self {
+        self.registry = r;
+        self
     }
 
     /// 常驻循环：抢一个到期事务推一下，没活就睡
@@ -151,8 +162,49 @@ impl Driver {
         Ok((actions, compensates))
     }
 
-    /// 调一个分支。查询参数跟 DTM 保持一致，这样客户端屏障库可以直接复用。
+    /// 调一个分支。`local://名字` 走进程内函数，其它走 HTTP。
     async fn call_branch(
+        &self,
+        g: &GlobalRow,
+        branch_id: &str,
+        op: BranchOp,
+        url: &str,
+    ) -> BranchResult {
+        match parse_target(url) {
+            Target::Local(name) => self.call_local(g, branch_id, op, &name).await,
+            Target::Http(u) => self.call_http(g, branch_id, op, &u).await,
+        }
+    }
+
+    /// 进程内调用：没有网络、没有序列化，一次函数调用。
+    async fn call_local(
+        &self,
+        g: &GlobalRow,
+        branch_id: &str,
+        op: BranchOp,
+        name: &str,
+    ) -> BranchResult {
+        let Some(h) = self.registry.get(name) else {
+            // 漏注册（比如新版本删了 handler）。**必须当 Unknown 而不是 Failure**：
+            // 判失败会触发回滚，而这其实是部署问题，改回来重试才对。
+            warn!(gid = %g.gid, branch = %branch_id, handler = name,
+                  "本地分支未注册，按结果未知处理（会重试，不回滚）");
+            return BranchResult::Unknown;
+        };
+        let ctx = BranchCtx {
+            gid: g.gid.clone(),
+            branch_id: branch_id.to_string(),
+            op,
+            trans_type: g.trans_type.to_string(),
+        };
+        let r = h(ctx).await;
+        info!(gid = %g.gid, branch = %branch_id, op = op.as_str(),
+              handler = name, result = ?r, "本地分支返回");
+        r
+    }
+
+    /// 远端调用。查询参数跟 DTM 保持一致，客户端屏障库可以直接复用。
+    async fn call_http(
         &self,
         g: &GlobalRow,
         branch_id: &str,
