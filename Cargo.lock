@@ -339,6 +339,7 @@ dependencies = [
 name = "dtmrs-xa"
 version = "0.1.0"
 dependencies = [
+ "dtmrs-core",
  "sqlx",
  "thiserror",
  "tokio",
@@ -1662,6 +1663,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx-core",
+ "sqlx-mysql",
  "sqlx-postgres",
  "sqlx-sqlite",
  "syn 2.0.119",
@@ -1700,6 +1702,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.8.7",
  "rsa",
+ "serde",
  "sha1",
  "sha2",
  "smallvec",

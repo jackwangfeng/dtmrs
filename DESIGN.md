@@ -158,11 +158,13 @@ TC 崩溃后重启，所有未终结事务会被 cron 重新捞起继续推进�
 | SQLite 存储（零依赖起步） | ✅ 第一版 |
 | cron 重试 + owner 租约 | ✅ 第一版 |
 | 崩溃恢复集成测试 | ✅ 第一版 |
-| Postgres 存储 | 第二版 |
-| TCC | 第二版 |
-| 二阶段消息 + query_prepared | 第二版 |
-| gRPC 协议 | 第三版 |
-| XA | 第三版 |
+| Postgres 存储 | ✅ 第二版 |
+| TCC | ✅ 第二版 |
+| 二阶段消息 + query_prepared | ✅ 第二版 |
+| 嵌入式 TC + C ABI / Python 绑定 | ✅ 第二版（DTM 没有的形态） |
+| XA（Postgres） | ✅ 第三版 |
+| **MySQL 存储 + MySQL XA** | ✅ 第三版 |
+| gRPC 协议 | ⬜ 未做 |
 | workflow 模式 | 待定（DTM 里最复杂，收益待评估） |
 
 ## 七、工程结构
@@ -170,11 +172,14 @@ TC 崩溃后重启，所有未终结事务会被 cron 重新捞起继续推进�
 ```
 dtmrs/
   crates/
-    dtmrs-core/      类型 + 状态机（纯逻辑，无 I/O，好测）
-    dtmrs-store/     存储层，目前是具体的 sqlite 实现（sqlx）。
-                     等 Postgres 真落地时再抽 trait —— 现在抽是过早抽象
-    dtmrs-server/    axum HTTP + cron 调度器
+    dtmrs-core/      类型 + 状态机（纯逻辑，无 I/O，好测）+ SQL 方言层
+    dtmrs-store/     存储层（sqlx::Any + 方言渲染，一套 SQL 跑
+                     sqlite / postgres / mysql）。**没有抽 Store trait** ——
+                     三种库的差异小到一层模板就能吸收，抽 trait 是过早抽象
+    dtmrs-server/    axum HTTP + cron 调度器 + 嵌入式门面
     dtmrs-barrier/   客户端子事务屏障库
+    dtmrs-xa/        业务方 XA 助手（pg / mysql 两套语法）
+    dtmrs-ffi/       C ABI（cdylib + staticlib）
   tests/             端到端：正常提交 / 分支失败补偿 / 崩溃恢复 / 幂等
 ```
 

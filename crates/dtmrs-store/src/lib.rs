@@ -1,30 +1,45 @@
 //! 存储层。TC 本身无状态，所有状态都在这里 —— 所以 TC 可以多实例、可以随时重启。
 //!
-//! # 一套 SQL 同时跑 sqlite 和 postgres
+//! # 一套 SQL 同时跑 sqlite / postgres / mysql
 //!
-//! 用 `sqlx::Any` 而不是抽 `Store` trait 写两份实现。实测过的边界（`sqlx 0.8`）：
+//! 用 `sqlx::Any` + [`dtmrs_core::dialect`] 的模板渲染，而不是抽 `Store` trait
+//! 写三份实现。方言差异（占位符、冲突忽略、列类型、索引写法）全在 dialect 那层，
+//! 各家实测出来的坑也记在那个文件头，这里只遵守它的两条写法约定：
 //!
-//! | | sqlite | postgres |
-//! |---|---|---|
-//! | `$1` 占位符 | ✅ | ✅ |
-//! | `?` 占位符 | ✅ | ❌ 语法错误 |
-//! | `ON CONFLICT DO NOTHING` | ✅ | ✅ |
-//! | 冲突时 `rows_affected` | 1 → 0 | 1 → 0（一致） |
+//! 1. **模板里统一写 `?`**，由 [`Backend::q`] 渲染成各后端能吃的语句
+//!    （非 MySQL 转成 `$1..$n`，MySQL 原样保留）
+//! 2. **模板的字符串字面量里不能出现 `?`** —— 会被当成占位符
 //!
-//! 所以两条硬规矩：
-//! 1. **只用 `$N` 占位符**，永远不用 `?`
-//! 2. **同一个 `$N` 不复用**（sqlite 把 `$4` 当命名参数，复用会让位置绑定错位）
+//! 顺带一条只有 sqlite 有的老坑：它把 `$4` 当命名参数，所以同一个 `$N` 不能
+//! 复用。`q()` 逐个 `?` 顺序编号，天然不会复用。
 //!
 //! 时间统一用 **unix 秒（i64）** 存，不用数据库的 datetime 类型 ——
 //! 跨库的时间类型映射是反复踩坑的地方，整数没有这个问题。
 //! 列类型用 `BIGINT`：postgres 的 `INTEGER` 只有 4 字节，装不下时间戳。
 
+pub use dtmrs_core::Backend;
+
+use dtmrs_core::dialect::check_len;
 use dtmrs_core::{BranchOp, BranchStatus, GlobalStatus, TransType};
 use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::{AnyPool, Row};
 use std::sync::Once;
 
 pub type Result<T> = std::result::Result<T, sqlx::Error>;
+
+/// payload 列的字符上限（`trans_global.payload`）
+pub const BIG: usize = 8192;
+/// url / reason 一类中等长度列的字符上限
+pub const MID: usize = 1024;
+
+/// 把超长字段变成错误。
+///
+/// **不能省**：MySQL 的 `INSERT IGNORE` 遇到超长值会静默截断而不是报错，
+/// 详见 [`dtmrs_core::dialect::check_len`]。宁可提交时报错，也不能让一笔
+/// 内容被悄悄改过的事务落库。
+fn len_ok(col: &'static str, val: &str, max: usize) -> Result<()> {
+    check_len(col, val, max).map_err(|e| sqlx::Error::Encode(Box::new(e)))
+}
 
 pub fn now() -> i64 {
     std::time::SystemTime::now()
@@ -63,6 +78,7 @@ pub struct BranchRow {
 #[derive(Clone)]
 pub struct Store {
     pool: AnyPool,
+    be: Backend,
 }
 
 static DRIVERS: Once = Once::new();
@@ -82,8 +98,9 @@ impl Store {
         }
         // 内存库必须单连接，否则每条连接看到的是各自独立的库
         let max = if url.contains(":memory:") { 1 } else { 8 };
+        let be = Backend::from_url(&url);
         let pool = AnyPoolOptions::new().max_connections(max).connect(&url).await?;
-        let s = Self { pool };
+        let s = Self { pool, be };
         s.migrate_racy().await?;
         Ok(s)
     }
@@ -114,50 +131,63 @@ impl Store {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS trans_global (
-              gid                TEXT PRIMARY KEY,
-              trans_type         TEXT   NOT NULL,
-              status             TEXT   NOT NULL,
-              payload            TEXT   NOT NULL DEFAULT '',
+        let idt = self.be.id_text();
+        let ids = self.be.id_short();
+        // payload 要装下所有步骤的 URL；MySQL 上是 VARCHAR，有长度上限。
+        // 上限同时是写库前的校验依据（BIG/MID），改这里就得改那里 —— 所以是常量
+        let big = self.be.text(BIG);
+        let mid = self.be.text(MID);
+        // 索引二选一：MySQL 只能建表时内联，其它后端用独立的
+        // CREATE INDEX IF NOT EXISTS（MySQL 那个语法直接 1064）
+        let inline = self.be.inline_index("idx_status_cron", "status, next_cron_time");
+
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS trans_global (
+              gid                {idt} NOT NULL,
+              trans_type         {ids} NOT NULL,
+              status             {ids} NOT NULL,
+              payload            {big} NOT NULL,
               next_cron_time     BIGINT NOT NULL DEFAULT 0,
               next_cron_interval BIGINT NOT NULL DEFAULT 0,
-              owner              TEXT   NOT NULL DEFAULT '',
-              rollback_reason    TEXT   NOT NULL DEFAULT '',
-              query_prepared     TEXT   NOT NULL DEFAULT '',
+              owner              {idt} NOT NULL,
+              rollback_reason    {mid} NOT NULL,
+              query_prepared     {mid} NOT NULL,
               create_time        BIGINT NOT NULL,
               update_time        BIGINT NOT NULL,
-              finish_time        BIGINT
-            )"#,
-        )
+              finish_time        BIGINT,
+              PRIMARY KEY (gid){inline}
+            )"
+        ))
         .execute(&self.pool)
         .await?;
         // cron 靠这个索引扫待办，没它到量之后会全表扫
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_status_cron
-             ON trans_global(status, next_cron_time)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS trans_branch_op (
-              gid         TEXT   NOT NULL,
-              branch_id   TEXT   NOT NULL,
-              op          TEXT   NOT NULL,
-              url         TEXT   NOT NULL,
-              payload     TEXT   NOT NULL DEFAULT '',
-              status      TEXT   NOT NULL,
+        if let Some(sql) = self
+            .be
+            .create_index("idx_status_cron", "trans_global", "status, next_cron_time")
+        {
+            sqlx::query(&sql).execute(&self.pool).await?;
+        }
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS trans_branch_op (
+              gid         {idt} NOT NULL,
+              branch_id   {idt} NOT NULL,
+              op          {ids} NOT NULL,
+              url         {mid} NOT NULL,
+              payload     {mid} NOT NULL,
+              status      {ids} NOT NULL,
               create_time BIGINT NOT NULL,
               update_time BIGINT NOT NULL,
               finish_time BIGINT,
               PRIMARY KEY (gid, branch_id, op)
-            )"#,
-        )
+            )"
+        ))
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub fn backend(&self) -> Backend {
+        self.be
     }
 
     pub fn pool(&self) -> &AnyPool {
@@ -169,15 +199,22 @@ impl Store {
     /// 返回 `false` 表示 gid 已存在 —— 这是**幂等提交**，不是错误：
     /// 客户端重试提交时必须拿到"已受理"而不是报错。
     pub async fn create_global(&self, g: &GlobalRow, branches: &[BranchRow]) -> Result<bool> {
+        // 先校验再落库：超长的值在 MySQL 上会被 INSERT IGNORE 静默截断
+        len_ok("gid", &g.gid, Backend::ID_MAX)?;
+        len_ok("payload", &g.payload, BIG)?;
+        len_ok("query_prepared", &g.query_prepared, MID)?;
+        for b in branches {
+            len_ok("branch_id", &b.branch_id, Backend::ID_MAX)?;
+            len_ok("url", &b.url, MID)?;
+            len_ok("payload", &b.payload, MID)?;
+        }
         let mut tx = self.pool.begin().await?;
         let t = now();
-        let n = sqlx::query(
-            "INSERT INTO trans_global
+        let n = sqlx::query(&self.be.q("{INS} trans_global
              (gid,trans_type,status,payload,next_cron_time,next_cron_interval,
               owner,rollback_reason,query_prepared,create_time,update_time)
-             VALUES ($1,$2,$3,$4,$5,$6,'','',$7,$8,$9)
-             ON CONFLICT DO NOTHING",
-        )
+             VALUES (?,?,?,?,?,?,'','',?,?,?)
+             {NOCONFLICT}"))
         .bind(&g.gid)
         .bind(g.trans_type.to_string())
         .bind(g.status.as_str())
@@ -195,12 +232,10 @@ impl Store {
             return Ok(false);
         }
         for b in branches {
-            sqlx::query(
-                "INSERT INTO trans_branch_op
+            sqlx::query(&self.be.q("{INS} trans_branch_op
                  (gid,branch_id,op,url,payload,status,create_time,update_time)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                 ON CONFLICT DO NOTHING",
-            )
+                 VALUES (?,?,?,?,?,?,?,?)
+                 {NOCONFLICT}"))
             .bind(&b.gid)
             .bind(&b.branch_id)
             .bind(b.op.as_str())
@@ -217,7 +252,7 @@ impl Store {
     }
 
     pub async fn get_global(&self, gid: &str) -> Result<Option<GlobalRow>> {
-        let row = sqlx::query(&format!("{SELECT_GLOBAL} WHERE gid=$1"))
+        let row = sqlx::query(&self.be.q(&format!("{SELECT_GLOBAL} WHERE gid=?")))
             .bind(gid)
             .fetch_optional(&self.pool)
             .await?;
@@ -225,10 +260,8 @@ impl Store {
     }
 
     pub async fn list_branches(&self, gid: &str) -> Result<Vec<BranchRow>> {
-        let rows = sqlx::query(
-            "SELECT gid,branch_id,op,url,payload,status FROM trans_branch_op
-             WHERE gid=$1 ORDER BY branch_id, op",
-        )
+        let rows = sqlx::query(&self.be.q("SELECT gid,branch_id,op,url,payload,status FROM trans_branch_op
+             WHERE gid=? ORDER BY branch_id, op"))
         .bind(gid)
         .fetch_all(&self.pool)
         .await?;
@@ -254,12 +287,15 @@ impl Store {
     ) -> Result<()> {
         let t = now();
         let fin = if status.is_final() { Some(t) } else { None };
+        // reason 是诊断信息，**截断而不是报错**：这条 UPDATE 是状态机的收尾，
+        // 让它因为一句话太长而失败，事务就永远推不到终态了（MySQL strict mode
+        // 下超长 UPDATE 直接报 1406，不像 INSERT IGNORE 那样只是截断）。
+        let reason: String = reason.chars().take(MID).collect();
+        let reason = reason.as_str();
         // 注意 $4/$5 都绑 reason —— 不能复用同一个 $N，见文件头注释
-        sqlx::query(
-            "UPDATE trans_global SET status=$1, update_time=$2, finish_time=$3,
-             rollback_reason = CASE WHEN $4 <> '' THEN $5 ELSE rollback_reason END
-             WHERE gid=$6",
-        )
+        sqlx::query(&self.be.q("UPDATE trans_global SET status=?, update_time=?, finish_time=?,
+             rollback_reason = CASE WHEN ? <> '' THEN ? ELSE rollback_reason END
+             WHERE gid=?"))
         .bind(status.as_str())
         .bind(t)
         .bind(fin)
@@ -279,11 +315,9 @@ impl Store {
         status: BranchStatus,
     ) -> Result<()> {
         let t = now();
-        sqlx::query(
-            "UPDATE trans_branch_op SET status=$1, update_time=$2,
-             finish_time = CASE WHEN $3 <> 'prepared' THEN $4 ELSE finish_time END
-             WHERE gid=$5 AND branch_id=$6 AND op=$7",
-        )
+        sqlx::query(&self.be.q("UPDATE trans_branch_op SET status=?, update_time=?,
+             finish_time = CASE WHEN ? <> 'prepared' THEN ? ELSE finish_time END
+             WHERE gid=? AND branch_id=? AND op=?"))
         .bind(status.as_str())
         .bind(t)
         .bind(status.as_str())
@@ -303,16 +337,11 @@ impl Store {
     pub async fn lock_one_due(&self, owner: &str, lease: i64) -> Result<Option<GlobalRow>> {
         let mut tx = self.pool.begin().await?;
         let t = now();
-        let gid: Option<String> = sqlx::query_scalar(
-            // prepared 的 msg 也要捞：客户端可能在 prepare 之后就崩了，
-            // 得靠 TC 回查 query_prepared 决定这单是提交还是作废。
-            // 其它类型的 prepared 不碰 —— TCC 的 try 阶段由客户端驱动。
-            "SELECT gid FROM trans_global
+        let gid: Option<String> = sqlx::query_scalar(&self.be.q("SELECT gid FROM trans_global
              WHERE (status IN ('submitted','aborting')
                     OR (status = 'prepared' AND trans_type = 'msg'))
-               AND next_cron_time <= $1
-             ORDER BY next_cron_time LIMIT 1",
-        )
+               AND next_cron_time <= ?
+             ORDER BY next_cron_time LIMIT 1"))
         .bind(t)
         .fetch_optional(&mut *tx)
         .await?;
@@ -321,10 +350,8 @@ impl Store {
             return Ok(None);
         };
         // 立刻把 next_cron_time 推到租约之后，等于占坑
-        let n = sqlx::query(
-            "UPDATE trans_global SET owner=$1, next_cron_time=$2, update_time=$3
-             WHERE gid=$4 AND next_cron_time <= $5",
-        )
+        let n = sqlx::query(&self.be.q("UPDATE trans_global SET owner=?, next_cron_time=?, update_time=?
+             WHERE gid=? AND next_cron_time <= ?"))
         .bind(owner)
         .bind(t + lease)
         .bind(t)
@@ -337,7 +364,7 @@ impl Store {
             tx.rollback().await?;
             return Ok(None); // 被别人抢走了
         }
-        let row = sqlx::query(&format!("{SELECT_GLOBAL} WHERE gid=$1"))
+        let row = sqlx::query(&self.be.q(&format!("{SELECT_GLOBAL} WHERE gid=?")))
             .bind(&gid)
             .fetch_one(&mut *tx)
             .await?;
@@ -348,10 +375,8 @@ impl Store {
     /// 推进失败后设置下次重试时间（指数退避）
     pub async fn schedule_retry(&self, gid: &str, interval: i64) -> Result<()> {
         let t = now();
-        sqlx::query(
-            "UPDATE trans_global SET next_cron_interval=$1, next_cron_time=$2, update_time=$3
-             WHERE gid=$4",
-        )
+        sqlx::query(&self.be.q("UPDATE trans_global SET next_cron_interval=?, next_cron_time=?, update_time=?
+             WHERE gid=?"))
         .bind(interval)
         .bind(t + interval)
         .bind(t)
@@ -363,9 +388,7 @@ impl Store {
 
     /// 让某个事务立刻可被调度（提交/中止之后叫一下，不用等 cron 周期）
     pub async fn schedule_now(&self, gid: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE trans_global SET next_cron_time=$1, next_cron_interval=0 WHERE gid=$2",
-        )
+        sqlx::query(&self.be.q("UPDATE trans_global SET next_cron_time=?, next_cron_interval=0 WHERE gid=?"))
         .bind(now())
         .bind(gid)
         .execute(&self.pool)
@@ -385,15 +408,18 @@ impl Store {
         branch_id: &str,
         ops: &[(BranchOp, String)],
     ) -> Result<()> {
+        len_ok("gid", gid, Backend::ID_MAX)?;
+        len_ok("branch_id", branch_id, Backend::ID_MAX)?;
+        for (_, url) in ops {
+            len_ok("url", url, MID)?;
+        }
         let mut tx = self.pool.begin().await?;
         let t = now();
         for (op, url) in ops {
-            sqlx::query(
-                "INSERT INTO trans_branch_op
+            sqlx::query(&self.be.q("{INS} trans_branch_op
                  (gid,branch_id,op,url,payload,status,create_time,update_time)
-                 VALUES ($1,$2,$3,$4,'',$5,$6,$7)
-                 ON CONFLICT DO NOTHING",
-            )
+                 VALUES (?,?,?,?,'',?,?,?)
+                 {NOCONFLICT}"))
             .bind(gid)
             .bind(branch_id)
             .bind(op.as_str())
@@ -409,9 +435,9 @@ impl Store {
     }
 
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<GlobalRow>> {
-        let rows = sqlx::query(&format!(
-            "{SELECT_GLOBAL} ORDER BY create_time DESC LIMIT $1"
-        ))
+        let rows = sqlx::query(&self.be.q(&format!(
+            "{SELECT_GLOBAL} ORDER BY create_time DESC LIMIT ?"
+        )))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -463,15 +489,18 @@ mod tests {
     async fn backends() -> (tokio::sync::MutexGuard<'static, ()>, Vec<(&'static str, Store)>) {
         let guard = PG_LOCK.lock().await;
         let mut v = vec![("sqlite", Store::open("sqlite::memory:").await.unwrap())];
-        if let Ok(url) = std::env::var("DTMRS_TEST_PG") {
-            let s = Store::open(&url).await.expect("连不上 DTMRS_TEST_PG");
-            for t in ["trans_branch_op", "trans_global"] {
-                sqlx::query(&format!("DELETE FROM {t}"))
-                    .execute(s.pool())
-                    .await
-                    .expect("清表");
+        // 每种真数据库都配一个环境变量。**没配就是没测**，不是"通过"。
+        for (name, env) in [("postgres", "DTMRS_TEST_PG"), ("mysql", "DTMRS_TEST_MYSQL")] {
+            if let Ok(url) = std::env::var(env) {
+                let s = Store::open(&url).await.unwrap_or_else(|e| panic!("连不上 {env}: {e}"));
+                for t in ["trans_branch_op", "trans_global"] {
+                    sqlx::query(&format!("DELETE FROM {t}"))
+                        .execute(s.pool())
+                        .await
+                        .expect("清表");
+                }
+                v.push((name, s));
             }
-            v.push(("postgres", s));
         }
         (guard, v)
     }

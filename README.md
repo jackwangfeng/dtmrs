@@ -142,35 +142,76 @@ TC 在进程里，但状态在 DB 里。进程死了事务不丢 —— 新进�
 | HTTP API（路径与 DTM 对齐） | ✅ 可用 |
 | SQLite 存储 | ✅ 可用 |
 | **Postgres 存储（多实例生产部署）** | ✅ 可用 |
+| **MySQL 存储** | ✅ 可用 |
 | **TCC（try/confirm/cancel）** | ✅ 可用 |
 | **二阶段消息（取代 MQ 事务消息）** | ✅ 可用 |
-| **XA（Postgres 两阶段提交）** | ✅ 可用 |
+| **XA（Postgres + MySQL 两阶段提交）** | ✅ 可用 |
 | gRPC | ⬜ 未做 |
 
-**66 个测试全绿**：18 个状态机单测 + 7 个存储 + 10 个屏障 + 3 个 XA 工具
-+ 4 个 C ABI + 6 个 SAGA 端到端 + 12 个 TCC/msg + 5 个嵌入式 + **6 个 XA 端到端**。
-存储和屏障的 17 个会在 sqlite 和真 Postgres 上各跑一遍；XA 那 6 个必须有真 Postgres。
+**85 个测试全绿**：25 个状态机/方言单测 + 7 个存储 + 10 个屏障 + 6 个 XA 工具
++ 4 个 C ABI + 4 个服务端单元 + 6 个 SAGA 端到端 + 12 个 TCC/msg + 5 个嵌入式
++ **6 个 XA 端到端**。
+存储和屏障的 17 个会在 sqlite / 真 Postgres / 真 MySQL 上**各跑一遍**；
+XA 那 6 个必须有真 Postgres 或真 MySQL（两个都配就都跑）。
 Python 和 C 的示例都实际跑通。
 
-## Postgres：多实例生产部署
+真库测试靠环境变量开关，**没配就是没跑，不是通过**：
+
+```bash
+DTMRS_TEST_PG='postgres://postgres:pw@127.0.0.1:5432/dtmrs' \
+DTMRS_TEST_MYSQL='mysql://root:pw@127.0.0.1:3306/dtmrs' \
+DTMRS_TEST_XA_PG='postgres://postgres:pw@127.0.0.1:5432/dtmrs' \
+DTMRS_TEST_XA_MYSQL='mysql://root:pw@127.0.0.1:3306/dtmrs' \
+cargo test --workspace
+```
+
+## 存储：sqlite / Postgres / MySQL 一套 SQL
 
 ```bash
 DTMRS_DB='postgres://user:pass@host:5432/dtm' ./dtmrs
+DTMRS_DB='mysql://user:pass@host:3306/dtm'    ./dtmrs
+DTMRS_DB='sqlite:dtmrs.db'                    ./dtmrs
 ```
 
-**一套 SQL 跑两种库**，没有抽 `Store` trait、没有两份实现。靠的是 `sqlx::Any`，
-但有两条实测出来的硬规矩（写在 `dtmrs-store` 文件头）：
+**三种库一份实现**，没有抽 `Store` trait、没有三份 SQL。靠 `sqlx::Any` 加一层
+薄薄的方言渲染（`dtmrs-core/src/dialect.rs`）。
 
-| | sqlite | postgres |
-|---|---|---|
-| `$1` 占位符 | ✅ | ✅ |
-| `?` 占位符 | ✅ | ❌ 语法错误 |
-| `ON CONFLICT DO NOTHING` | ✅ | ✅ |
-| 冲突时 `rows_affected` | 1 → 0 | 1 → 0（一致） |
+只有两种后端的时候 `sqlx::Any` 配 `$N` 就够了，**MySQL 一进来同时打破三条**，
+才不得不有这一层。全部实测（sqlx 0.8 / pg16 / mysql 8.0.44）：
 
-1. **只用 `$N`**，永不用 `?`
-2. **同一个 `$N` 不复用** —— sqlite 把 `$4` 当命名参数，复用会让位置绑定错位
-3. 整数列用 `BIGINT` —— postgres 的 `INTEGER` 只有 4 字节，装不下时间戳
+| | sqlite | postgres | mysql |
+|---|---|---|---|
+| `$1` 占位符 | ✅ | ✅ | ❌ `Unknown column '$1'` |
+| `?` 占位符 | ✅ | ❌ 语法错误 | ✅ |
+| `ON CONFLICT DO NOTHING` | ✅ | ✅ | ❌ 1064 语法错误 |
+| `INSERT IGNORE` | ❌ | ❌ | ✅ |
+| `TEXT PRIMARY KEY` | ✅ | ✅ | ❌ 1170 要 key length |
+| `CREATE INDEX IF NOT EXISTS` | ✅ | ✅ | ❌ 1064 语法错误 |
+
+所以模板统一写 `?`（跟 MySQL 一致），非 MySQL 后端由 `Backend::q` 转成 `$1..$n`。
+代价是**模板的字符串字面量里不能出现 `?`**，否则会被当成占位符。
+
+### MySQL 上三个必须知道的坑
+
+**1. `ON DUPLICATE KEY UPDATE` 重复时 `rows_affected` 返回 1，不是 0。**
+拿它做幂等判断会把"已存在"误判成"刚插入"。所以 MySQL 必须用 `INSERT IGNORE`
+（重复时返回 0，跟另外两家一致）。
+
+**2. 经 `sqlx::Any` 读 MySQL 的 `TEXT` 一律报类型不匹配。**
+
+```
+mismatched types; Rust type String is not compatible with SQL type BLOB
+```
+
+`LONGTEXT`、`MEDIUMTEXT`、显式 `CHARACTER SET utf8mb4` 都一样，
+五种写法里只有 `VARCHAR` 能解成 String。所以自由文本列在 MySQL 上是
+`VARCHAR(n)`，n 要够装最长的内容（单行还有 65535 字节总限制，utf8mb4 每字符 4 字节）。
+
+**3. 索引写法是二选一的。**
+MySQL 没有 `CREATE INDEX IF NOT EXISTS`，只能建表时内联 `KEY`；
+另外两家反过来。dialect 层用 `create_index()` / `inline_index()` 一对返回空值来切。
+
+整数列一律 `BIGINT` —— postgres 的 `INTEGER` 只有 4 字节，装不下时间戳。
 
 ### 实测：两个实例并发，没有重复推进
 
@@ -250,20 +291,39 @@ msg 没有补偿分支，只保证最终送达，所以分支必须幂等 + 可�
 
 ## XA：数据库原生两阶段提交
 
-不靠补偿，靠 `PREPARE TRANSACTION`。分支的业务 SQL 跑完就 prepare，
+不靠补偿，靠数据库原生的两阶段提交。分支的业务 SQL 跑完就 prepare，
 改动**已持久化但对外不可见**，等 TC 统一决定 commit 还是 rollback。
 好处是强一致（没有中间态可见），代价是**全程持锁**。
 
+**Postgres 和 MySQL 都支持**（各跑同一套 6 个端到端测试）：
+
 ```rust
 // 业务方（RM）的一阶段
-let mut br = XaBranch::begin(&pool, gid, "01").await?;
-sqlx::query("UPDATE acct SET bal = bal - $1 WHERE id = $2")
+let xa = Xa::from_url(&db_url)?;           // 认库，两种语法自动分流
+let mut br = xa.begin(&pool, gid, "01").await?;
+sqlx::query("UPDATE acct SET bal = bal - ? WHERE id = ?")   // 占位符按你的库来
     .bind(100i64).bind(1i32).execute(br.conn()).await?;
-br.prepare().await?;                       // PREPARE TRANSACTION
-// 然后把 commit/rollback 回调地址登记给 TC
+let xid = br.prepare().await?;             // 一阶段完成
+// 然后把 (xid, commit/rollback 回调地址) 登记给 TC
 ```
 
-实测（真 Postgres，两个分支模拟跨库转账）：
+### 两种库的语法完全不同（都实测过）
+
+| | Postgres 16 | MySQL 8.0 |
+|---|---|---|
+| 开始 | `BEGIN` | `XA START 'xid'` |
+| 一阶段 | `PREPARE TRANSACTION 'xid'` | `XA END 'xid'` + `XA PREPARE 'xid'` |
+| 提交 | `COMMIT PREPARED 'xid'` | `XA COMMIT 'xid'` |
+| 回滚 | `ROLLBACK PREPARED 'xid'` | `XA ROLLBACK 'xid'` |
+| 列出悬挂的 | `pg_prepared_xacts` | `XA RECOVER` |
+| 重复解决的错误码 | `42704` | `XAE04` |
+| 默认是否开启 | ❌ `max_prepared_transactions=0` | ✅ 开着 |
+| 能看到 prepare 时长 | ✅ | ❌ `XA RECOVER` 不给时间 |
+| xid 长度上限 | 200 字节 | gtrid **64 字节** |
+
+SQLite 根本没有两阶段提交，`Xa::from_url` 直接拒掉。
+
+实测（真 Postgres，两个分支模拟跨库转账；MySQL 上同一套测试同样绿）：
 
 ```
 prepare 后余额: [1000, 0]        ← 改动已持久化但不可见
@@ -275,39 +335,62 @@ submit → COMMIT PREPARED
 
 ### ⚠ XA 的三条硬约束（都是实测撞出来的，各有测试钉着）
 
-**1. 没解决的 prepared 事务会永久持锁，还阻塞 VACUUM。**
+**1. 没解决的 prepared 事务会永久持锁**（Postgres 里还阻塞 VACUUM）。
 写这套测试时，一个测试中途失败留下一个 prepared 事务，**后面完全不相关的
 UPDATE 就无限期阻塞了**，整个测试进程卡死两分钟。生产上这会放大成整库不可写。
-所以 [`list_prepared`] 必须上监控，`dtmrs-xa` 也提供了这个查询。
-（测试：`xa_没解决的prepared事务会阻塞无关写入`）
+两种库都一样：`Xa::list_prepared` 必须上监控。
+（测试：`xa_没解决的prepared事务会阻塞无关写入`，pg / mysql 各跑一遍）
+
+⚠ **MySQL 上 `age_secs` 恒为 0** —— `XA RECOVER` 不提供 prepare 时间，
+所以"挂了多久"这个指标在 MySQL 上拿不到，只能靠"这个 xid 还在不在"报警。
 
 **2. XA 的分支必须操作不相交的数据。**
 第一版把两个分支写成改同几行，分支 02 直接被锁死（`55P03 lock timeout`）——
 分支 01 已经 prepare，行锁一直持着。这不是 bug，是 XA 的本质：
 **一个分支对应一个资源管理器**，真实场景里天然分布在不同库。
+（MySQL 上对应 `innodb_lock_wait_timeout`，测试里设 5 秒把"卡住"变成"报错"）
 
-**3. Postgres 默认关着 2PC。**
-`max_prepared_transactions` 默认 **0**。`ensure_enabled()` 在启动时就检查，
+**3. 两种库的可用性检查不是一回事，但都得在启动时做。**
+`ensure_enabled()` 分流：
+
+| | 检查什么 | 不合格的后果 |
+|---|---|---|
+| Postgres | `max_prepared_transactions` > 0 | 默认就是 **0**，XA 完全用不了 |
+| MySQL | 版本 ≥ **5.7.7** | XA 能用，但 prepared 的事务**重启后会丢** —— 等于没有持久性 |
+
 别等第一笔事务才发现（那时可能已经有别的分支 prepare 成功了）。
 
 ```bash
-postgres -c max_prepared_transactions=32
+postgres -c max_prepared_transactions=32     # MySQL 8.0 默认就行，不用配
 ```
+
+### MySQL 特有的两个坑
+
+**1. XA 语句不能走预处理协议。**
+
+```
+1295 This command is not supported in the prepared statement protocol yet
+```
+
+`sqlx::query()` 默认走预处理，所以两阶段相关的语句一律改用 `sqlx::raw_sql`
+（文本协议）。**连带后果**：xid 没法当参数绑定，只能拼进 SQL 字面量 ——
+注入防护全靠 `xid_for()` 里的字符白名单（只留字母数字和 `_-`）。
+
+**2. xid 只有 64 字节，比 Postgres 的 200 严得多。**
+gid 稍微长一点就超。直接截断是**灾难性的** —— 两个不相关的长 gid 会撞成同一个
+xid，然后互相提交对方的事务。所以超长时截断 + 拼 16 位 FNV-1a 摘要。
+（测试：`mysql的xid上限更严且截断不撞车`）
 
 ### 二阶段幂等靠状态机保证
 
-`COMMIT PREPARED` 重复执行会报 `42704 undefined_object`。TC 一定会重试，
-所以这个错误被当成 `AlreadyResolved`（成功）。
+重复解决同一个 xid 会报错：Postgres `42704 undefined_object`，
+MySQL `XAE04 XAER_NOTA`。TC 一定会重试，所以这两个错误都被当成
+`AlreadyResolved`（成功）。
 
 **这个"找不到就算成功"之所以安全**，靠的是 `xa_advance` 的保证：
 Submitted 阶段永远不返回 `Finish(Aborting)`，所以"找不到"只可能是之前已经
 commit 过，不可能是被 rollback 了。用 SQLSTATE 判断而不是匹配错误文本 ——
-文本会随版本和语言变。
-
-### 只支持 Postgres
-
-MySQL 的 `XA START/END/PREPARE/COMMIT` 是另一套语法，**没实现也没测** ——
-手上没 MySQL，不写没验过的代码。SQLite 根本没有两阶段提交，用不了 XA。
+文本会随版本和语言变。（测试：`错误码按方言区分`）
 
 ## 跑起来
 
@@ -346,9 +429,13 @@ curl 'localhost:36789/api/dtmsvr/query?gid=order-1001'
 
 ```rust
 use dtmrs_barrier::{BranchBarrier, Decision};
+use dtmrs_core::Backend;
+
+let be = Backend::from_url(&db_url);        // 屏障表的 DDL 和 SQL 都按它渲染
+BranchBarrier::migrate(&pool, be).await?;   // 启动时建表一次
 
 // gid / branch_id / op / trans_type 由 TC 通过 query 参数传进来
-let mut bb = BranchBarrier::new(trans_type, gid, branch_id, op)?;
+let mut bb = BranchBarrier::new(be, trans_type, gid, branch_id, op)?;
 let mut tx = pool.begin().await?;
 
 if bb.decide(&mut tx).await? == Decision::Execute {
@@ -394,9 +481,11 @@ tx.commit().await?;   // 原子性的来源：屏障记录与业务变更同生�
 ```
 crates/
   dtmrs-core/     状态机，纯逻辑无 I/O —— 状态迁移的 bug 全在这层测
-  dtmrs-store/    存储（sqlite）+ 租约抢占
+                  dialect.rs：sqlite / postgres / mysql 的 SQL 方言渲染
+  dtmrs-store/    存储（三种库一套 SQL）+ 租约抢占
   dtmrs-server/   TC：axum HTTP + 常驻推进器 + 嵌入式门面（registry / embedded）
   dtmrs-barrier/  客户端子事务屏障
+  dtmrs-xa/       业务方（RM）的 XA 助手：pg 的 PREPARE TRANSACTION / mysql 的 XA
   dtmrs-ffi/      C ABI（cdylib + staticlib）
 include/dtmrs.h            C 头文件
 bindings/python/dtmrs.py   Python 绑定（纯 ctypes）

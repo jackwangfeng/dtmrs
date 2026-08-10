@@ -3,7 +3,7 @@ name = "dtmrs-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "dtmrs 存储层：一套 SQL 跑 sqlite 与 postgres（sqlx::Any）"
+description = "dtmrs 存储层：一套 SQL 跑 sqlite / postgres / mysql（sqlx::Any）"
 
 [dependencies]
 dtmrs-core = { path = "../dtmrs-core" }

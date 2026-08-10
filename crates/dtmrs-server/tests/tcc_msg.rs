@@ -10,7 +10,6 @@ use dtmrs_server::{msg_rows, tcc_rows};
 use dtmrs_store::Store;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 /// 假业务服务。`mode` 决定各路径的返回，计数器记录被调次数。
 #[derive(Default)]

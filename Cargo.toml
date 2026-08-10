@@ -22,7 +22,7 @@ thiserror = "2"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", default-features = false, features = [
-    "runtime-tokio", "any", "sqlite", "postgres", "macros",
+    "runtime-tokio", "any", "sqlite", "postgres", "mysql", "macros",
 ] }
 chrono = { version = "0.4", features = ["serde"] }
 axum = "0.8"

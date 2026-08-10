@@ -3,6 +3,10 @@
 //! 分布式事务的 bug 绝大多数在状态迁移上，所以把这层从存储和网络里隔离出来，
 //! 可以纯单元测试覆盖。
 
+pub mod dialect;
+
+pub use dialect::Backend;
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
