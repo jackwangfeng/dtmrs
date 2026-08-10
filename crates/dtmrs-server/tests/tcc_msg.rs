@@ -350,20 +350,49 @@ async fn msg_没给回查地址时不瞎猜() {
 }
 
 #[tokio::test]
-async fn xa_未实现时不能假装成功() {
-    // 宁可让事务挂在库里，也不能错误地标成 succeed
+async fn xa_空事务直接落终态() {
+    // XA 已经实现了（见 tests/xa.rs 的真 Postgres 端到端）。
+    // 这里只覆盖不需要数据库的边界：一个分支都没登记就 submit。
     let s = store().await;
     let d = Driver::new(s.clone(), "tc".into());
-    let mut g = tcc_rows("xa-1");
+    let mut g = tcc_rows("xa-empty");
     g.trans_type = dtmrs_core::TransType::Xa;
     g.status = GlobalStatus::Submitted;
     s.create_global(&g, &[]).await.unwrap();
-    let g = s.get_global("xa-1").await.unwrap().unwrap();
+    let g = s.get_global("xa-empty").await.unwrap().unwrap();
     d.process(&g).await.unwrap();
     assert_eq!(
-        s.get_global("xa-1").await.unwrap().unwrap().status,
-        GlobalStatus::Submitted,
-        "未实现的模式不能被标成终态"
+        s.get_global("xa-empty").await.unwrap().unwrap().status,
+        GlobalStatus::Succeed,
+        "没有分支要提交，空事务直接成功"
     );
-    let _ = Duration::from_secs(0);
+}
+
+#[tokio::test]
+async fn xa_分支不可达时只重试不改方向() {
+    // 二阶段调不通是"结果未知"。XA 里方向一旦定了就不能改 ——
+    // 别的分支可能已经 COMMIT PREPARED 了。
+    let s = store().await;
+    let d = Driver::new(s.clone(), "tc".into());
+    let mut g = tcc_rows("xa-unreach");
+    g.trans_type = dtmrs_core::TransType::Xa;
+    s.create_global(&g, &[]).await.unwrap();
+    s.register_branch(
+        "xa-unreach",
+        "01",
+        &[
+            (BranchOp::Commit, "http://127.0.0.1:1/commit".to_string()),
+            (BranchOp::Rollback, "http://127.0.0.1:1/rollback".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    s.set_global_status("xa-unreach", GlobalStatus::Submitted, "").await.unwrap();
+
+    let g = s.get_global("xa-unreach").await.unwrap().unwrap();
+    d.process(&g).await.unwrap();
+
+    let got = s.get_global("xa-unreach").await.unwrap().unwrap();
+    assert_eq!(got.status, GlobalStatus::Submitted, "调不通只能重试，不能转回滚");
+    assert!(got.next_cron_interval > 0, "要设置退避间隔");
 }

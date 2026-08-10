@@ -144,11 +144,12 @@ TC 在进程里，但状态在 DB 里。进程死了事务不丢 —— 新进�
 | **Postgres 存储（多实例生产部署）** | ✅ 可用 |
 | **TCC（try/confirm/cancel）** | ✅ 可用 |
 | **二阶段消息（取代 MQ 事务消息）** | ✅ 可用 |
-| XA | ⬜ 未做（`submit` 明确报错，推进器也不假装成功） |
+| **XA（Postgres 两阶段提交）** | ✅ 可用 |
 | gRPC | ⬜ 未做 |
 
-**58 个测试全绿**（存储层和屏障的 17 个会在 sqlite 和真 Postgres 上各跑一遍）：6 个 SAGA 端到端 + 11 个 TCC/msg + 5 个嵌入式（含跨进程重启恢复）
-+ 4 个 C ABI（含空指针/坏参数不崩）+ 10 个屏障 + 13 个状态机单测。
+**66 个测试全绿**：18 个状态机单测 + 7 个存储 + 10 个屏障 + 3 个 XA 工具
++ 4 个 C ABI + 6 个 SAGA 端到端 + 12 个 TCC/msg + 5 个嵌入式 + **6 个 XA 端到端**。
+存储和屏障的 17 个会在 sqlite 和真 Postgres 上各跑一遍；XA 那 6 个必须有真 Postgres。
 Python 和 C 的示例都实际跑通。
 
 ## Postgres：多实例生产部署
@@ -212,52 +213,6 @@ curl -XPOST :36789/api/dtmsvr/submit -d '{"gid":"tcc-A","trans_type":"tcc"}'
 **必须先登记再调 try**。反过来的话 try 成功但登记失败，TC 不知道有这个分支，
 回滚时不会 cancel 它 —— 预留的资源永久泄漏。
 
-### Postgres：多实例生产部署
-
-```bash
-DTMRS_DB='postgres://user:pass@host:5432/dtm' ./dtmrs
-```
-
-**一套 SQL 跑两种库**，没有抽 `Store` trait、没有两份实现。靠的是 `sqlx::Any`，
-但有两条实测出来的硬规矩（写在 `dtmrs-store` 文件头）：
-
-| | sqlite | postgres |
-|---|---|---|
-| `$1` 占位符 | ✅ | ✅ |
-| `?` 占位符 | ✅ | ❌ 语法错误 |
-| `ON CONFLICT DO NOTHING` | ✅ | ✅ |
-| 冲突时 `rows_affected` | 1 → 0 | 1 → 0（一致） |
-
-1. **只用 `$N`**，永不用 `?`
-2. **同一个 `$N` 不复用** —— sqlite 把 `$4` 当命名参数，复用会让位置绑定错位
-3. 整数列用 `BIGINT` —— postgres 的 `INTEGER` 只有 4 字节，装不下时间戳
-
-### 实测：两个实例并发，没有重复推进
-
-Postgres 的意义就在这儿（sqlite 撑不住多实例写）。20 笔事务、两个实例、
-业务端故意每次 sleep 50ms 制造撞车窗口：
-
-```
-被调用的分支数: 40 （20 笔 × 2 步）
-调用次数分布: {1: 40}          ← 每个分支正好 1 次
-重复调用: 无 ✓
-
-事务归属:  succeed|tc-1|10
-          succeed|tc-2|10     ← 两个实例各推了一半
-```
-
-### 踩到的坑：Postgres 的 CREATE TABLE IF NOT EXISTS 不是并发安全的
-
-两个实例同时启动，实例 1 直接崩了：
-
-```
-duplicate key value violates unique constraint "pg_type_typname_nsp_index"
-```
-
-`CREATE TABLE IF NOT EXISTS` 在 Postgres 里会在系统目录上撞唯一键 ——
-sqlite 单写永远不会暴露这个问题，**只有真起两个实例才能撞出来**。
-现在建表带重试（输的那个重试时表已经建好，`IF NOT EXISTS` 正常跳过）。
-
 ## TCC 跟 SAGA 的关键语义差别
 
 SAGA 的 action 返回 FAILURE → 逆序补偿。
@@ -292,6 +247,67 @@ prepare → SUCCESS
 就没人能决断这单，猜"已提交"会重复扣款，猜"没提交"会丢单。
 
 msg 没有补偿分支，只保证最终送达，所以分支必须幂等 + 可无限重试。
+
+## XA：数据库原生两阶段提交
+
+不靠补偿，靠 `PREPARE TRANSACTION`。分支的业务 SQL 跑完就 prepare，
+改动**已持久化但对外不可见**，等 TC 统一决定 commit 还是 rollback。
+好处是强一致（没有中间态可见），代价是**全程持锁**。
+
+```rust
+// 业务方（RM）的一阶段
+let mut br = XaBranch::begin(&pool, gid, "01").await?;
+sqlx::query("UPDATE acct SET bal = bal - $1 WHERE id = $2")
+    .bind(100i64).bind(1i32).execute(br.conn()).await?;
+br.prepare().await?;                       // PREPARE TRANSACTION
+// 然后把 commit/rollback 回调地址登记给 TC
+```
+
+实测（真 Postgres，两个分支模拟跨库转账）：
+
+```
+prepare 后余额: [1000, 0]        ← 改动已持久化但不可见
+挂着的 prepared 事务: 2
+submit → COMMIT PREPARED
+提交后余额: [900, 100]           ← 两个分支的改动一起生效
+挂着的 prepared 事务: 0
+```
+
+### ⚠ XA 的三条硬约束（都是实测撞出来的，各有测试钉着）
+
+**1. 没解决的 prepared 事务会永久持锁，还阻塞 VACUUM。**
+写这套测试时，一个测试中途失败留下一个 prepared 事务，**后面完全不相关的
+UPDATE 就无限期阻塞了**，整个测试进程卡死两分钟。生产上这会放大成整库不可写。
+所以 [`list_prepared`] 必须上监控，`dtmrs-xa` 也提供了这个查询。
+（测试：`xa_没解决的prepared事务会阻塞无关写入`）
+
+**2. XA 的分支必须操作不相交的数据。**
+第一版把两个分支写成改同几行，分支 02 直接被锁死（`55P03 lock timeout`）——
+分支 01 已经 prepare，行锁一直持着。这不是 bug，是 XA 的本质：
+**一个分支对应一个资源管理器**，真实场景里天然分布在不同库。
+
+**3. Postgres 默认关着 2PC。**
+`max_prepared_transactions` 默认 **0**。`ensure_enabled()` 在启动时就检查，
+别等第一笔事务才发现（那时可能已经有别的分支 prepare 成功了）。
+
+```bash
+postgres -c max_prepared_transactions=32
+```
+
+### 二阶段幂等靠状态机保证
+
+`COMMIT PREPARED` 重复执行会报 `42704 undefined_object`。TC 一定会重试，
+所以这个错误被当成 `AlreadyResolved`（成功）。
+
+**这个"找不到就算成功"之所以安全**，靠的是 `xa_advance` 的保证：
+Submitted 阶段永远不返回 `Finish(Aborting)`，所以"找不到"只可能是之前已经
+commit 过，不可能是被 rollback 了。用 SQLSTATE 判断而不是匹配错误文本 ——
+文本会随版本和语言变。
+
+### 只支持 Postgres
+
+MySQL 的 `XA START/END/PREPARE/COMMIT` 是另一套语法，**没实现也没测** ——
+手上没 MySQL，不写没验过的代码。SQLite 根本没有两阶段提交，用不了 XA。
 
 ## 跑起来
 

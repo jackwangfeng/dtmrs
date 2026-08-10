@@ -6,6 +6,7 @@ members = [
     "crates/dtmrs-server",
     "crates/dtmrs-barrier",
     "crates/dtmrs-ffi",
+    "crates/dtmrs-xa",
 ]
 
 [workspace.package]

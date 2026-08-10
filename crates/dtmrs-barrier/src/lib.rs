@@ -183,6 +183,8 @@ mod tests {
     use super::*;
     use sqlx::any::AnyPoolOptions;
 
+    static RESET: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
     /// 屏障也要在两种后端上验 —— 业务库是 pg 的话，屏障表就在 pg 里。
     /// 配了 DTMRS_TEST_PG 就多跑一遍真 postgres。
     async fn pools() -> Vec<(&'static str, AnyPool)> {
@@ -196,8 +198,14 @@ mod tests {
         let mut v = vec![("sqlite", mem)];
         if let Ok(url) = std::env::var("DTMRS_TEST_PG") {
             let p = AnyPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
-            sqlx::query("DROP TABLE IF EXISTS barrier").execute(&p).await.unwrap();
-            BranchBarrier::migrate(&p).await.unwrap();
+            // 建表 + 清表只做一次：每个测试各自 DROP+CREATE 会撞上
+            // Postgres 的 DDL 并发竞态。各测试的 gid 本来就不重叠。
+            RESET
+                .get_or_init(|| async {
+                    BranchBarrier::migrate(&p).await.expect("建表");
+                    sqlx::query("DELETE FROM barrier").execute(&p).await.expect("清表");
+                })
+                .await;
             v.push(("postgres", p));
         }
         v

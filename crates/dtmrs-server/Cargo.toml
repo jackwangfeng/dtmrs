@@ -28,3 +28,5 @@ path = "src/lib.rs"
 [dev-dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
+dtmrs-xa = { path = "../dtmrs-xa" }
+sqlx = { workspace = true }

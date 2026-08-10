@@ -451,23 +451,29 @@ mod tests {
     /// postgres 靠环境变量开启（`DTMRS_TEST_PG=postgres://...`）——
     /// 没配就只跑 sqlite，这样没数据库的机器也能 `cargo test`。
     /// 但**别把这当成"postgres 也过了"** —— 没配就是没测。
-    async fn backends() -> Vec<(&'static str, Store)> {
+    /// Postgres 测试必须串行 —— `lock_one_due` 和 `list_recent` 是**全局查询**，
+    /// 并行跑会互相看见对方的事务，断言就没意义了。
+    /// （光给各测试不同的 gid 不够：捞待办是不按 gid 过滤的。）
+    static PG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// 返回 (串行锁, 各后端)。锁要持到测试结束，所以由调用方接着。
+    ///
+    /// 每次进来把 Postgres 的表清空（只 DELETE 不 DDL —— 并发 DDL 会撞上
+    /// Postgres 的 `pg_type` 竞态，见 `migrate_racy`）。
+    async fn backends() -> (tokio::sync::MutexGuard<'static, ()>, Vec<(&'static str, Store)>) {
+        let guard = PG_LOCK.lock().await;
         let mut v = vec![("sqlite", Store::open("sqlite::memory:").await.unwrap())];
         if let Ok(url) = std::env::var("DTMRS_TEST_PG") {
             let s = Store::open(&url).await.expect("连不上 DTMRS_TEST_PG");
-            // 同一个库反复跑测试，先清干净
-            sqlx::query("DROP TABLE IF EXISTS trans_branch_op")
-                .execute(s.pool())
-                .await
-                .unwrap();
-            sqlx::query("DROP TABLE IF EXISTS trans_global")
-                .execute(s.pool())
-                .await
-                .unwrap();
-            s.migrate().await.unwrap();
+            for t in ["trans_branch_op", "trans_global"] {
+                sqlx::query(&format!("DELETE FROM {t}"))
+                    .execute(s.pool())
+                    .await
+                    .expect("清表");
+            }
             v.push(("postgres", s));
         }
-        v
+        (guard, v)
     }
 
     fn g(gid: &str) -> GlobalRow {
@@ -488,7 +494,8 @@ mod tests {
 
     #[tokio::test]
     async fn 重复提交同一个gid是幂等的() {
-        for (name, s) in backends().await {
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
             assert!(s.create_global(&g("t1"), &[]).await.unwrap(), "{name}");
             // 第二次返回 false 而不是报错 —— 客户端重试不该失败
             assert!(!s.create_global(&g("t1"), &[]).await.unwrap(), "{name}");
@@ -498,7 +505,8 @@ mod tests {
 
     #[tokio::test]
     async fn 租约只能被抢到一次() {
-        for (name, s) in backends().await {
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
             s.create_global(&g("t2"), &[]).await.unwrap();
             let a = s.lock_one_due("worker-a", 60).await.unwrap();
             assert!(a.is_some(), "{name}: 第一个实例应该抢到");
@@ -510,7 +518,8 @@ mod tests {
 
     #[tokio::test]
     async fn 终态不再被调度() {
-        for (name, s) in backends().await {
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
             s.create_global(&g("t3"), &[]).await.unwrap();
             s.set_global_status("t3", GlobalStatus::Succeed, "").await.unwrap();
             assert!(s.lock_one_due("w", 60).await.unwrap().is_none(), "{name}");
@@ -522,7 +531,8 @@ mod tests {
 
     #[tokio::test]
     async fn 分支状态可更新() {
-        for (name, s) in backends().await {
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
             let b = BranchRow {
                 gid: "t4".into(),
                 branch_id: "01".into(),
@@ -544,7 +554,8 @@ mod tests {
     #[tokio::test]
     async fn 回滚原因和回查地址能存取() {
         // 这两列是后加的，跨库的字符串/空值处理最容易在这儿出问题
-        for (name, s) in backends().await {
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
             let mut row = g("t5");
             row.query_prepared = "http://busi/query".into();
             s.create_global(&row, &[]).await.unwrap();
@@ -565,7 +576,8 @@ mod tests {
 
     #[tokio::test]
     async fn msg的prepared会被捞tcc的不会() {
-        for (name, s) in backends().await {
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
             let mut m = g("m1");
             m.trans_type = TransType::Msg;
             m.status = GlobalStatus::Prepared;
@@ -584,7 +596,8 @@ mod tests {
 
     #[tokio::test]
     async fn 分支登记是幂等的() {
-        for (name, s) in backends().await {
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
             let mut t = g("c2");
             t.trans_type = TransType::Tcc;
             s.create_global(&t, &[]).await.unwrap();

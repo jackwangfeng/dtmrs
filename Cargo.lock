@@ -316,9 +316,11 @@ dependencies = [
  "axum",
  "dtmrs-core",
  "dtmrs-store",
+ "dtmrs-xa",
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -330,6 +332,15 @@ version = "0.1.0"
 dependencies = [
  "dtmrs-core",
  "sqlx",
+ "tokio",
+]
+
+[[package]]
+name = "dtmrs-xa"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
+ "thiserror",
  "tokio",
 ]
 

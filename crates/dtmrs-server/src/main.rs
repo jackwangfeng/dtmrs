@@ -48,16 +48,28 @@ struct PrepareReq {
     grace_secs: Option<i64>,
 }
 
-/// TCC 的 try 阶段：客户端**先登记再调 try**
+/// 分支登记。TCC 用 confirm/cancel，XA 用 commit/rollback。
+///
+/// 两种模式都是**先登记再做一阶段**：反过来的话一阶段成功了但 TC 不知道
+/// 有这个分支，回滚时漏掉它 —— TCC 是预留资源泄漏，XA 更糟，
+/// 会留下一个永久持锁的 prepared 事务。
 #[derive(Deserialize)]
 struct RegisterBranchReq {
     gid: String,
     branch_id: String,
+    /// TCC
+    #[serde(default)]
     confirm: String,
+    #[serde(default)]
     cancel: String,
-    /// 可选，只为可观测性存一份
+    /// TCC 的 try，可选，只为可观测性存一份
     #[serde(default)]
     r#try: String,
+    /// XA
+    #[serde(default)]
+    commit: String,
+    #[serde(default)]
+    rollback: String,
 }
 
 fn default_trans_type() -> String {
@@ -186,13 +198,9 @@ async fn submit(
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Reply::err(e.to_string())),
             }
         }
-        TransType::Tcc | TransType::Msg => (
+        TransType::Tcc | TransType::Msg | TransType::Xa => (
             StatusCode::BAD_REQUEST,
-            Reply::err("tcc/msg 要先调 /api/dtmsvr/prepare"),
-        ),
-        TransType::Xa => (
-            StatusCode::BAD_REQUEST,
-            Reply::err("xa 模式尚未实现"),
+            Reply::err("tcc/xa/msg 要先调 /api/dtmsvr/prepare"),
         ),
     }
 }
@@ -228,8 +236,10 @@ async fn prepare(
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Reply::err(e.to_string())),
             }
         }
-        Some(TransType::Tcc) => {
-            let g = tcc_rows(&req.gid);
+        Some(tt @ (TransType::Tcc | TransType::Xa)) => {
+            // 两者都是"先建空的 prepared 事务，分支随后登记"
+            let mut g = tcc_rows(&req.gid);
+            g.trans_type = tt;
             match app.store.create_global(&g, &[]).await {
                 Ok(_) => (StatusCode::OK, Reply::ok()),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Reply::err(e.to_string())),
@@ -237,7 +247,7 @@ async fn prepare(
         }
         _ => (
             StatusCode::BAD_REQUEST,
-            Reply::err("prepare 只支持 tcc 和 msg；saga 直接 submit"),
+            Reply::err("prepare 支持 tcc / xa / msg；saga 直接 submit"),
         ),
     }
 }
@@ -252,25 +262,46 @@ async fn register_branch(
     if req.gid.is_empty() || req.branch_id.is_empty() {
         return (StatusCode::BAD_REQUEST, Reply::err("gid / branch_id 不能为空"));
     }
-    if req.confirm.is_empty() || req.cancel.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Reply::err("confirm 和 cancel 都必须提供"),
-        );
-    }
-    match app.store.get_global(&req.gid).await {
-        Ok(Some(g)) if g.trans_type == TransType::Tcc => {}
-        Ok(Some(_)) => return (StatusCode::BAD_REQUEST, Reply::err("只有 tcc 需要登记分支")),
+    let tt = match app.store.get_global(&req.gid).await {
+        Ok(Some(g)) => g.trans_type,
         Ok(None) => return (StatusCode::NOT_FOUND, Reply::err("gid 不存在，先 prepare")),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Reply::err(e.to_string())),
+    };
+
+    let mut ops = Vec::new();
+    match tt {
+        TransType::Tcc => {
+            if req.confirm.is_empty() || req.cancel.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Reply::err("tcc 分支必须提供 confirm 和 cancel"),
+                );
+            }
+            ops.push((BranchOp::Confirm, req.confirm.clone()));
+            ops.push((BranchOp::Cancel, req.cancel.clone()));
+            if !req.r#try.is_empty() {
+                ops.push((BranchOp::Try, req.r#try.clone()));
+            }
+        }
+        TransType::Xa => {
+            if req.commit.is_empty() || req.rollback.is_empty() {
+                // XA 缺了任一个都可能留下永久持锁的 prepared 事务，必须拒绝
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Reply::err("xa 分支必须提供 commit 和 rollback"),
+                );
+            }
+            ops.push((BranchOp::Commit, req.commit.clone()));
+            ops.push((BranchOp::Rollback, req.rollback.clone()));
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Reply::err("只有 tcc 和 xa 需要登记分支"),
+            )
+        }
     }
-    let mut ops = vec![
-        (BranchOp::Confirm, req.confirm.clone()),
-        (BranchOp::Cancel, req.cancel.clone()),
-    ];
-    if !req.r#try.is_empty() {
-        ops.push((BranchOp::Try, req.r#try.clone()));
-    }
+
     match app.store.register_branch(&req.gid, &req.branch_id, &ops).await {
         Ok(()) => (StatusCode::OK, Reply::ok()),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Reply::err(e.to_string())),

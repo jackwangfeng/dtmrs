@@ -5,8 +5,8 @@
 
 use crate::registry::{parse_target, BranchCtx, Registry, Target};
 use dtmrs_core::{
-    msg_advance, saga_advance, tcc_advance, Advance, BranchOp, BranchResult, BranchStatus,
-    GlobalStatus, SagaStep, TransType,
+    msg_advance, saga_advance, tcc_advance, xa_advance, Advance, BranchOp, BranchResult,
+    BranchStatus, GlobalStatus, SagaStep, TransType,
 };
 use dtmrs_store::{GlobalRow, Store};
 use std::sync::Arc;
@@ -70,12 +70,7 @@ impl Driver {
             TransType::Saga => self.process_saga(g).await,
             TransType::Tcc => self.process_tcc(g).await,
             TransType::Msg => self.process_msg(g).await,
-            TransType::Xa => {
-                // XA 要数据库原生 XA 支持，还没实现。**不假装成功** ——
-                // 留在库里比错误地标成 succeed 安全得多
-                warn!(gid = %g.gid, "xa 模式尚未实现，跳过不处理");
-                Ok(())
-            }
+            TransType::Xa => self.process_xa(g).await,
         }
     }
 
@@ -155,6 +150,34 @@ impl Driver {
     /// TC 只负责 confirm / cancel。所以分支的 URL 来自 `trans_branch_op` 表，
     /// 不是全局 payload。
     async fn process_tcc(&self, g: &GlobalRow) -> anyhow::Result<()> {
+        self.drive_two_phase(g, BranchOp::Confirm, BranchOp::Cancel, "TCC")
+            .await
+    }
+
+    // ---------------- XA ----------------
+
+    /// XA 的一阶段（业务 SQL + `PREPARE TRANSACTION`）由**客户端**做，
+    /// TC 只负责统一决定 `COMMIT PREPARED` 还是 `ROLLBACK PREPARED`。
+    ///
+    /// 形状跟 TCC 一样，只是 op 换成 commit/rollback。语义上那条铁律也一样：
+    /// **commit 失败绝不能转 rollback** —— 别的分支可能已经提交了。
+    ///
+    /// XA 独有的严重性：没解决的 prepared 事务会**永久持锁**，在 Postgres 里
+    /// 还阻塞 VACUUM。所以这里的重试比 SAGA 的补偿重试要紧得多。
+    async fn process_xa(&self, g: &GlobalRow) -> anyhow::Result<()> {
+        self.drive_two_phase(g, BranchOp::Commit, BranchOp::Rollback, "XA")
+            .await
+    }
+
+    /// TCC 和 XA 共用的二阶段推进：正向 op 全做完就成功，反向 op 全做完就失败，
+    /// **任一方向的失败都只重试，绝不改变方向**。
+    async fn drive_two_phase(
+        &self,
+        g: &GlobalRow,
+        fwd: BranchOp,
+        bwd: BranchOp,
+        label: &str,
+    ) -> anyhow::Result<()> {
         let rows = self.store.list_branches(&g.gid).await?;
         let n = rows
             .iter()
@@ -176,10 +199,15 @@ impl Driver {
         let status = g.status;
         loop {
             let rows = self.store.list_branches(&g.gid).await?;
-            let (confirms, cancels) = split_by_op(&rows, n, BranchOp::Confirm, BranchOp::Cancel);
-            match tcc_advance(status, &confirms, &cancels) {
+            let (f, b) = split_by_op(&rows, n, fwd, bwd);
+            let adv = if fwd == BranchOp::Commit {
+                xa_advance(status, &f, &b)
+            } else {
+                tcc_advance(status, &f, &b)
+            };
+            match adv {
                 Advance::Finish(s) => {
-                    info!(gid = %g.gid, status = s.as_str(), "TCC 事务终结");
+                    info!(gid = %g.gid, status = s.as_str(), mode = label, "事务终结");
                     self.store.set_global_status(&g.gid, s, "").await?;
                     return Ok(());
                 }
@@ -187,8 +215,7 @@ impl Driver {
                 Advance::Call { index, op } => {
                     let bid = branch_id(index);
                     let Some(url) = url_of(&rows, &bid, op) else {
-                        // 登记时漏了这个 op 的 URL。当未知处理，等人修
-                        warn!(gid = %g.gid, branch = %bid, op = op.as_str(),
+                        warn!(gid = %g.gid, branch = %bid, op = op.as_str(), mode = label,
                               "分支没登记这个操作的 URL，无法调用");
                         self.retry_later(g).await?;
                         return Ok(());
@@ -199,15 +226,15 @@ impl Driver {
                                 .set_branch_status(&g.gid, &bid, op, BranchStatus::Succeed)
                                 .await?;
                         }
-                        // confirm/cancel 失败**绝不改变全局方向**：
-                        // try 已经成功、方向已经定了，反向操作会造成不一致。
+                        // 二阶段失败**绝不改变全局方向**：一阶段已经成功、
+                        // 方向已经定了，反向操作会造成一半提交一半回滚。
                         // 唯一正确处理是无限重试 + 报警。
                         BranchResult::Failure => {
                             self.store
                                 .set_branch_status(&g.gid, &bid, op, BranchStatus::Failed)
                                 .await?;
-                            warn!(gid = %g.gid, branch = %bid, op = op.as_str(),
-                                  "TCC 二阶段失败，会持续重试，需要人工介入");
+                            warn!(gid = %g.gid, branch = %bid, op = op.as_str(), mode = label,
+                                  "二阶段失败，会持续重试，需要人工介入");
                             self.retry_later(g).await?;
                             return Ok(());
                         }

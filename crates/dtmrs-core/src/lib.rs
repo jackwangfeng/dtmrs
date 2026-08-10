@@ -152,6 +152,8 @@ pub enum BranchOp {
     Try,
     Confirm,
     Cancel,
+    /// XA 的二阶段提交
+    Commit,
     Rollback,
 }
 
@@ -163,6 +165,7 @@ impl BranchOp {
             Self::Try => "try",
             Self::Confirm => "confirm",
             Self::Cancel => "cancel",
+            Self::Commit => "commit",
             Self::Rollback => "rollback",
         }
     }
@@ -174,6 +177,7 @@ impl BranchOp {
             "try" => Some(Self::Try),
             "confirm" => Some(Self::Confirm),
             "cancel" => Some(Self::Cancel),
+            "commit" => Some(Self::Commit),
             "rollback" => Some(Self::Rollback),
             _ => None,
         }
@@ -536,5 +540,127 @@ mod tcc_msg_tests {
             msg_advance(GlobalStatus::Aborting, &[Succeed]),
             Advance::Finish(GlobalStatus::Failed)
         );
+    }
+}
+
+/// XA 推进决策。
+///
+/// # 跟 TCC 同一条铁律
+///
+/// 分支一旦 `PREPARE TRANSACTION` 成功、全局又决定了提交，**commit 失败绝不能
+/// 转成 rollback** —— 别的分支可能已经 COMMIT PREPARED 了，这时候回滚就是
+/// 一半提交一半回滚。只能无限重试 + 报警。
+///
+/// 所以跟 `tcc_advance` 一样，Submitted 阶段永远不返回 `Finish(Aborting)`。
+///
+/// # XA 独有的危险
+///
+/// 已 prepare 未解决的事务会**一直持有锁**，在 Postgres 里还会阻塞 VACUUM
+/// 导致事务 ID 回卷风险。所以 XA 的 commit/rollback 必须最终送达 ——
+/// 这比 SAGA/TCC 的"补偿没跑成"严重得多。运维上要监控 `pg_prepared_xacts`。
+pub fn xa_advance(
+    status: GlobalStatus,
+    commits: &[BranchStatus],
+    rollbacks: &[BranchStatus],
+) -> Advance {
+    debug_assert_eq!(commits.len(), rollbacks.len());
+    match status {
+        // 客户端还在各分支上跑业务 SQL + PREPARE，TC 不插手
+        GlobalStatus::Prepared => Advance::Wait,
+        GlobalStatus::Submitted => {
+            for (i, st) in commits.iter().enumerate() {
+                if *st != BranchStatus::Succeed {
+                    return Advance::Call { index: i, op: BranchOp::Commit };
+                }
+            }
+            Advance::Finish(GlobalStatus::Succeed)
+        }
+        GlobalStatus::Aborting => {
+            for i in (0..rollbacks.len()).rev() {
+                if rollbacks[i] != BranchStatus::Succeed {
+                    return Advance::Call { index: i, op: BranchOp::Rollback };
+                }
+            }
+            Advance::Finish(GlobalStatus::Failed)
+        }
+        s => Advance::Finish(s),
+    }
+}
+
+#[cfg(test)]
+mod xa_tests {
+    use super::*;
+    use BranchStatus::{Failed, Prepared, Succeed};
+
+    #[test]
+    fn xa的prepare阶段tc不插手() {
+        // 各分支的业务 SQL + PREPARE TRANSACTION 都是客户端自己做的
+        assert_eq!(
+            xa_advance(GlobalStatus::Prepared, &[Prepared], &[Prepared]),
+            Advance::Wait
+        );
+    }
+
+    #[test]
+    fn xa按序commit() {
+        let r = [Prepared, Prepared];
+        assert_eq!(
+            xa_advance(GlobalStatus::Submitted, &[Prepared, Prepared], &r),
+            Advance::Call { index: 0, op: BranchOp::Commit }
+        );
+        assert_eq!(
+            xa_advance(GlobalStatus::Submitted, &[Succeed, Prepared], &r),
+            Advance::Call { index: 1, op: BranchOp::Commit }
+        );
+        assert_eq!(
+            xa_advance(GlobalStatus::Submitted, &[Succeed, Succeed], &r),
+            Advance::Finish(GlobalStatus::Succeed)
+        );
+    }
+
+    #[test]
+    fn commit失败绝不能转rollback() {
+        // 别的分支可能已经 COMMIT PREPARED 了，这时候回滚就是一半提交一半回滚
+        let r = [Prepared, Prepared];
+        assert_eq!(
+            xa_advance(GlobalStatus::Submitted, &[Succeed, Failed], &r),
+            Advance::Call { index: 1, op: BranchOp::Commit },
+            "commit 失败要继续重试 commit"
+        );
+        // 穷举：Submitted 阶段永远不会走向回滚或失败
+        for a in [Prepared, Succeed, Failed] {
+            for b in [Prepared, Succeed, Failed] {
+                let got = xa_advance(GlobalStatus::Submitted, &[a, b], &r);
+                assert_ne!(got, Advance::Finish(GlobalStatus::Aborting));
+                assert_ne!(got, Advance::Finish(GlobalStatus::Failed));
+            }
+        }
+    }
+
+    #[test]
+    fn xa逆序rollback且失败也要重试() {
+        let c = [Prepared, Prepared];
+        assert_eq!(
+            xa_advance(GlobalStatus::Aborting, &c, &[Prepared, Prepared]),
+            Advance::Call { index: 1, op: BranchOp::Rollback }
+        );
+        assert_eq!(
+            xa_advance(GlobalStatus::Aborting, &c, &[Succeed, Succeed]),
+            Advance::Finish(GlobalStatus::Failed)
+        );
+        // rollback 失败也不能就这么算了 —— 那会留下永久持锁的 prepared 事务
+        assert_eq!(
+            xa_advance(GlobalStatus::Aborting, &c, &[Succeed, Failed]),
+            Advance::Call { index: 1, op: BranchOp::Rollback }
+        );
+    }
+
+    #[test]
+    fn commit操作没有反向映射() {
+        // XA 的 commit 不是补偿类操作，屏障不该给它做空回滚判定
+        assert_eq!(BranchOp::Commit.origin_op(), None);
+        assert!(!BranchOp::Commit.is_compensating());
+        assert_eq!(BranchOp::parse("commit"), Some(BranchOp::Commit));
+        assert_eq!(BranchOp::Commit.as_str(), "commit");
     }
 }

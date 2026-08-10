@@ -1,0 +1,14 @@
+[package]
+name = "dtmrs-xa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "XA 两阶段提交的业务方助手（Postgres）"
+
+[dependencies]
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
