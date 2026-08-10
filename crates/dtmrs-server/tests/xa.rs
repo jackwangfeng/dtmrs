@@ -89,15 +89,36 @@ async fn open(url: &str, be: Backend) -> AnyPool {
         .unwrap()
 }
 
+/// 建业务表，**带重试**。
+///
+/// Postgres 的 `CREATE TABLE IF NOT EXISTS` 不是并发安全的：多个测试同时建
+/// 同一张表会在系统目录上撞唯一键（`23505 pg_type_typname_nsp_index`），
+/// 而不是老老实实跳过。这跟 `dtmrs-store::migrate_racy` 处理的是同一个问题。
+///
+/// 这条一度只在 CI 上炸、本地全绿 —— 因为本地的库里表早就建好了，
+/// `IF NOT EXISTS` 直接短路，压根没进到会竞态的那条路径。**全新的库才撞得出来。**
+async fn create_acct_racy(pool: &AnyPool) {
+    const SQL: &str = "CREATE TABLE IF NOT EXISTS xa_acct(id INT PRIMARY KEY, bal BIGINT)";
+    let mut last = None;
+    for _ in 0..5 {
+        match sqlx::query(SQL).execute(pool).await {
+            Ok(_) => return,
+            Err(e) => {
+                // 输的那个重试时表已经建好了，IF NOT EXISTS 正常跳过
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            }
+        }
+    }
+    panic!("建 xa_acct 失败: {}", last.unwrap());
+}
+
 async fn reset(pool: &AnyPool, be: Backend, xa: &Xa, ids: &[(i32, i64)]) {
     // 残留的 prepared 事务会锁住行，先全清掉
     for x in xa.list_prepared(pool).await.unwrap() {
         let _ = xa.rollback_prepared(pool, &x.xid).await;
     }
-    sqlx::query("CREATE TABLE IF NOT EXISTS xa_acct(id INT PRIMARY KEY, bal BIGINT)")
-        .execute(pool)
-        .await
-        .unwrap();
+    create_acct_racy(pool).await;
     for (id, bal) in ids {
         // 三种库的"插入或覆盖"写法不同，这里只有两种，手写更清楚
         let sql = match be {
