@@ -3,3 +3,9 @@
 *.db-shm
 *.db-wal
 examples/c/demo
+
+# 绑定的构建产物 / 依赖
+bindings/node/node_modules/
+bindings/java/out/
+bindings/java/lib/*.jar
+bindings/python/__pycache__/

@@ -58,6 +58,43 @@ int dtmrs_start(DtmrsTc *tc);
  * 若有 local:// 名字没注册，这里就会失败（而不是等推到一半才发现）。 */
 int dtmrs_submit_saga(DtmrsTc *tc, const char *gid, const char *steps_json);
 
+/* ---- 拉取式分支分发 ----------------------------------------------------
+ *
+ * dtmrs_register 是「推」：库回调你。简单，但回调必须**同步返回**一个 int。
+ * 对 Python / Java 够用；对 Node 这类宿主是硬伤 —— 它们的业务代码几乎全是
+ * 异步的（数据库客户端都返回 Promise），同步回调里没法 await。
+ *
+ * 拉取式是「拉」：你自己在事件循环里取任务、爱怎么异步怎么异步、完事回填。
+ * 两种可以在同一进程混用，各管各的分支名。
+ *
+ * 典型用法（事件循环型宿主）：
+ *   dtmrs_register_pull(tc, "deduct");
+ *   dtmrs_start(tc);
+ *   // 在你的定时器里，每次 tick：
+ *   while (dtmrs_next_task(tc, 0, buf, sizeof buf) == 1) {
+ *       // 解析 buf 里的 JSON，异步干活，完事后 dtmrs_reply(tc, task_id, ...)
+ *   }
+ */
+
+/* 把一个分支名登记成拉取式。必须在 dtmrs_start 之前。 */
+int dtmrs_register_pull(DtmrsTc *tc, const char *name);
+
+/* 取一个待办分支，JSON 写入 out：
+ *   {"task_id":7,"name":"deduct","gid":"order-1","branch_id":"01","op":"action"}
+ * 返回 1=取到, 0=没有, DTMRS_ERR=出错。
+ *
+ * timeout_ms 传 0 表示**不阻塞**，立刻返回。事件循环型宿主必须传 0 ——
+ * 阻塞会卡死循环，那样连回填结果都做不到。
+ *
+ * 取到之后必须 dtmrs_reply，否则该分支会挂到超时（按结果未知处理，会重试）。 */
+int dtmrs_next_task(DtmrsTc *tc, int timeout_ms, char *out, size_t out_len);
+
+/* 回填结果。result 取 DTMRS_SUCCESS/FAILURE/ONGOING/UNKNOWN。
+ * 宿主自己抛异常时回 UNKNOWN，别回 FAILURE —— 不知道业务做没做就别回滚。 */
+int dtmrs_reply(DtmrsTc *tc, unsigned long long task_id, int result);
+
+/* ---- 查询 -------------------------------------------------------------- */
+
 /* 查状态，写入 out（prepared|submitted|aborting|succeed|failed）。 */
 int dtmrs_status(DtmrsTc *tc, const char *gid, char *out, size_t out_len);
 

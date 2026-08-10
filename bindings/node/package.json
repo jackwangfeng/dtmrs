@@ -1,0 +1,10 @@
+{
+  "name": "dtmrs",
+  "version": "0.1.0",
+  "description": "Embedded distributed transaction coordinator (Rust core, via C ABI)",
+  "main": "dtmrs.js",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "koffi": "^2.9.0"
+  }
+}

@@ -30,8 +30,12 @@ use dtmrs_core::{BranchResult, SagaStep};
 use dtmrs_server::embedded::Embedded;
 use dtmrs_server::registry::BranchCtx;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::oneshot;
 
 pub const DTMRS_OK: c_int = 0;
 pub const DTMRS_ERR: c_int = -1;
@@ -91,8 +95,88 @@ pub struct DtmrsTc {
     rt: tokio::runtime::Runtime,
     /// start 之前收集 handler，start 之后置 None
     pending: Option<Vec<(String, HandlerPtr)>>,
+    /// start 之前收集走拉取式的分支名
+    pending_pull: Option<Vec<String>>,
     db: String,
     tc: Option<Embedded>,
+    pull: Arc<PullQueue>,
+}
+
+// ---------------- 拉取式分支分发 ----------------
+
+/// 宿主没回结果的等待上限。到点按「结果未知」处理 —— 只重试不回滚，
+/// 因为宿主可能已经把活干完了只是没来得及回话。
+const PULL_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 一个等着宿主处理的分支
+#[derive(Debug, Clone)]
+struct PullTask {
+    task_id: u64,
+    name: String,
+    gid: String,
+    branch_id: String,
+    op: String,
+}
+
+/// 拉取式分发的队列。
+///
+/// # 为什么要有这个东西（回调式不够用吗）
+///
+/// C ABI 的回调必须**同步返回一个 int**。这对 Python/Java 没问题，但对
+/// Node 这类宿主是硬伤：它们的业务代码几乎全是异步的（数据库客户端都返回
+/// Promise），而同步回调里没法 await。
+///
+/// 拉取式把控制权交给宿主：宿主在自己的事件循环里取任务、爱怎么异步怎么异步、
+/// 完事了再回填结果。**不是回调式的替代品，是另一种接法** ——
+/// 同一个进程里两种可以混用，各自负责各自的分支名。
+struct PullQueue {
+    tx: std::sync::mpsc::Sender<PullTask>,
+    rx: Mutex<std::sync::mpsc::Receiver<PullTask>>,
+    /// 已发给宿主、还等着回话的任务
+    waiting: Mutex<HashMap<u64, oneshot::Sender<BranchResult>>>,
+    next_id: AtomicU64,
+}
+
+impl PullQueue {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            tx,
+            rx: Mutex::new(rx),
+            waiting: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    /// 推进器这边：把分支挂进队列，等宿主回话
+    async fn dispatch(&self, name: &str, ctx: &BranchCtx) -> BranchResult {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.waiting.lock().unwrap().insert(id, tx);
+
+        let task = PullTask {
+            task_id: id,
+            name: name.to_string(),
+            gid: ctx.gid.clone(),
+            branch_id: ctx.branch_id.clone(),
+            op: ctx.op.as_str().to_string(),
+        };
+        if self.tx.send(task).is_err() {
+            self.waiting.lock().unwrap().remove(&id);
+            return BranchResult::Unknown;
+        }
+
+        match tokio::time::timeout(PULL_REPLY_TIMEOUT, rx).await {
+            Ok(Ok(r)) => r,
+            // 超时，或者宿主把句柄丢了。**按未知处理** ——
+            // 宿主可能已经执行了业务逻辑，只是没回话
+            _ => {
+                self.waiting.lock().unwrap().remove(&id);
+                eprintln!("[dtmrs] 宿主未在 {PULL_REPLY_TIMEOUT:?} 内回填结果，按结果未知处理");
+                BranchResult::Unknown
+            }
+        }
+    }
 }
 
 unsafe fn cstr<'a>(p: *const c_char, what: &str) -> Option<&'a str> {
@@ -150,8 +234,10 @@ pub extern "C" fn dtmrs_open(db_url: *const c_char) -> *mut DtmrsTc {
     Box::into_raw(Box::new(DtmrsTc {
         rt,
         pending: Some(Vec::new()),
+        pending_pull: Some(Vec::new()),
         db: db.to_string(),
         tc: None,
+        pull: Arc::new(PullQueue::new()),
     }))
 }
 
@@ -190,6 +276,115 @@ pub extern "C" fn dtmrs_register(
     }
 }
 
+/// 把一个分支名登记成**拉取式**。必须在 `dtmrs_start` 之前调。
+///
+/// 登记之后，这个名字的分支不会回调宿主，而是进队列等 [`dtmrs_next_task`] 来取。
+/// 适合两类宿主：
+///
+/// - **事件循环型**（Node）：同步回调里没法 await，只能用拉取式
+/// - 想用自己的线程池 / 想控制并发度的
+///
+/// 跟 [`dtmrs_register`] 可以在同一个进程里混用，各管各的名字。
+#[no_mangle]
+pub extern "C" fn dtmrs_register_pull(tc: *mut DtmrsTc, name: *const c_char) -> c_int {
+    clear_err();
+    let Some(h) = (unsafe { tc.as_mut() }) else {
+        set_err("句柄是空指针");
+        return DTMRS_ERR;
+    };
+    let Some(name) = (unsafe { cstr(name, "name") }) else {
+        return DTMRS_ERR;
+    };
+    match h.pending_pull.as_mut() {
+        Some(v) => {
+            v.push(name.to_string());
+            DTMRS_OK
+        }
+        None => {
+            set_err("已经 start 了，不能再注册分支");
+            DTMRS_ERR
+        }
+    }
+}
+
+/// 取一个待办分支，JSON 写进 `out`：
+///
+/// ```json
+/// {"task_id":7,"name":"deduct","gid":"order-1","branch_id":"01","op":"action"}
+/// ```
+///
+/// 返回 `1` = 取到任务，`0` = 这段时间没任务，`DTMRS_ERR` = 出错。
+///
+/// `timeout_ms` 传 **0 表示不阻塞**（立刻返回）。事件循环型宿主应该传 0 并靠
+/// 自己的定时器轮询 —— 阻塞会卡住整个循环，那样连回填结果都做不到。
+///
+/// 取到任务后**必须**用 [`dtmrs_reply`] 回填，否则这个分支会一直挂到超时
+/// （按结果未知处理，会重试）。
+#[no_mangle]
+pub extern "C" fn dtmrs_next_task(
+    tc: *mut DtmrsTc,
+    timeout_ms: c_int,
+    out: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    clear_err();
+    let Some(h) = (unsafe { tc.as_ref() }) else {
+        set_err("句柄是空指针");
+        return DTMRS_ERR;
+    };
+    let rx = h.pull.rx.lock().unwrap();
+    let got = if timeout_ms <= 0 {
+        rx.try_recv().ok()
+    } else {
+        rx.recv_timeout(Duration::from_millis(timeout_ms as u64)).ok()
+    };
+    drop(rx);
+
+    let Some(task) = got else { return 0 };
+    let json = serde_json::json!({
+        "task_id": task.task_id,
+        "name": task.name,
+        "gid": task.gid,
+        "branch_id": task.branch_id,
+        "op": task.op,
+    })
+    .to_string();
+    if write_out(&json, out, out_len) != DTMRS_OK {
+        // 缓冲区太小 —— 任务已经出队了，直接回未知让它重试，
+        // 否则这个分支会一直挂到超时
+        let _ = reply_inner(h, task.task_id, DTMRS_UNKNOWN);
+        return DTMRS_ERR;
+    }
+    1
+}
+
+/// 回填一个拉取到的分支的结果。
+///
+/// `result` 取 `DTMRS_SUCCESS` / `DTMRS_FAILURE` / `DTMRS_ONGOING` / `DTMRS_UNKNOWN`，
+/// **不认识的值一律按 UNKNOWN 处理** —— 宁可重试，不可误回滚。
+///
+/// 宿主自己抛异常时应该回 `DTMRS_UNKNOWN` 而不是 `DTMRS_FAILURE`：
+/// 异常意味着不知道业务到底做没做，回滚可能造成不一致。
+#[no_mangle]
+pub extern "C" fn dtmrs_reply(tc: *mut DtmrsTc, task_id: u64, result: c_int) -> c_int {
+    clear_err();
+    let Some(h) = (unsafe { tc.as_ref() }) else {
+        set_err("句柄是空指针");
+        return DTMRS_ERR;
+    };
+    reply_inner(h, task_id, result)
+}
+
+fn reply_inner(h: &DtmrsTc, task_id: u64, result: c_int) -> c_int {
+    let Some(tx) = h.pull.waiting.lock().unwrap().remove(&task_id) else {
+        // 回晚了（已经超时了），或者 task_id 是编的
+        set_err(format!("task_id {task_id} 不存在或已超时"));
+        return DTMRS_ERR;
+    };
+    let _ = tx.send(to_branch_result(result));
+    DTMRS_OK
+}
+
 /// 启动推进器。之后事务就会被自动推进（包括进程上次留下的未终结事务）。
 #[no_mangle]
 pub extern "C" fn dtmrs_start(tc: *mut DtmrsTc) -> c_int {
@@ -202,8 +397,21 @@ pub extern "C" fn dtmrs_start(tc: *mut DtmrsTc) -> c_int {
         set_err("已经 start 过了");
         return DTMRS_ERR;
     };
+    let pending_pull = h.pending_pull.take().unwrap_or_default();
 
     let mut b = Embedded::builder(&h.db).tick(Duration::from_millis(50));
+
+    // 拉取式的分支：handler 只负责挂进队列然后等宿主回话
+    for name in pending_pull {
+        let q = h.pull.clone();
+        let n = name.clone();
+        b = b.handler(&name, move |ctx: BranchCtx| {
+            let q = q.clone();
+            let n = n.clone();
+            async move { q.dispatch(&n, &ctx).await }
+        });
+    }
+
     for (name, hp) in pending {
         b = b.handler(&name, move |ctx: BranchCtx| async move {
             // 宿主回调是同步的、可能阻塞几十毫秒、还可能要抢 GIL。
@@ -239,11 +447,18 @@ fn call_host(hp: HandlerPtr, ctx: &BranchCtx) -> BranchResult {
     let op = CString::new(ctx.op.as_str()).unwrap_or_default();
     // 三个 CString 在本函数栈上活着，回调返回前不会被释放
     let code = (hp.f)(gid.as_ptr(), bid.as_ptr(), op.as_ptr(), hp.ud);
+    to_branch_result(code)
+}
+
+/// 宿主给的返回码 → 内部结论。回调式和拉取式共用，两条路必须一致。
+///
+/// **不认识的值一律按 Unknown**：宁可重试，不可误回滚。
+fn to_branch_result(code: c_int) -> BranchResult {
     match code {
         DTMRS_SUCCESS => BranchResult::Success,
         DTMRS_FAILURE => BranchResult::Failure,
         DTMRS_ONGOING => BranchResult::Ongoing,
-        // 包括 DTMRS_UNKNOWN 和任何不认识的值。宁可重试不可误回滚。
+        // 包括 DTMRS_UNKNOWN 和任何不认识的值
         _ => BranchResult::Unknown,
     }
 }
@@ -374,6 +589,103 @@ pub extern "C" fn dtmrs_close(tc: *mut DtmrsTc) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 拉取式：宿主自己取任务、自己回结果。
+    ///
+    /// 这条路存在的理由是 Node 那类宿主 —— 同步回调里没法 await。
+    /// 这里用一个后台线程模拟宿主的事件循环。
+    #[test]
+    fn 拉取式能跑完一笔事务() {
+        let db = format!("sqlite:/tmp/dtmrs_pull_{}.db", std::process::id());
+        let _ = std::fs::remove_file(db.trim_start_matches("sqlite:"));
+        let tc = dtmrs_open(cs(&db).as_ptr());
+        assert!(!tc.is_null());
+
+        assert_eq!(dtmrs_register_pull(tc, cs("act").as_ptr()), DTMRS_OK);
+        assert_eq!(dtmrs_register_pull(tc, cs("undo").as_ptr()), DTMRS_OK);
+        assert_eq!(dtmrs_start(tc), DTMRS_OK);
+
+        // 模拟宿主的事件循环：非阻塞轮询 + 回填
+        let addr = tc as usize;
+        let worker = std::thread::spawn(move || {
+            let tc = addr as *mut DtmrsTc;
+            let mut buf = vec![0u8; 512];
+            let mut done = 0;
+            for _ in 0..600 {
+                let r = dtmrs_next_task(tc, 0, buf.as_mut_ptr() as *mut c_char, buf.len());
+                if r == 1 {
+                    let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+                    let id = v["task_id"].as_u64().unwrap();
+                    assert_eq!(v["name"], "act");
+                    assert_eq!(v["op"], "action");
+                    assert_eq!(v["branch_id"], "01");
+                    assert_eq!(dtmrs_reply(tc, id, DTMRS_SUCCESS), DTMRS_OK);
+                    done += 1;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            done
+        });
+
+        let steps = cs(r#"[{"action":"local://act","compensate":"local://undo"}]"#);
+        assert_eq!(dtmrs_submit_saga(tc, cs("pull-1").as_ptr(), steps.as_ptr()), DTMRS_OK);
+
+        let mut out = vec![0u8; 64];
+        assert_eq!(
+            dtmrs_wait_final(tc, cs("pull-1").as_ptr(), 8000, out.as_mut_ptr() as *mut c_char, 64),
+            DTMRS_OK
+        );
+        let st = unsafe { CStr::from_ptr(out.as_ptr() as *const c_char) }.to_str().unwrap();
+        assert_eq!(st, "succeed");
+        assert_eq!(worker.join().unwrap(), 1, "宿主应该正好取到 1 个任务");
+        dtmrs_close(tc);
+    }
+
+    #[test]
+    fn 没任务时立刻返回0而不是阻塞() {
+        // 事件循环型宿主靠这个：传 0 必须马上回来，否则整个循环就卡住了
+        let db = format!("sqlite:/tmp/dtmrs_pull_empty_{}.db", std::process::id());
+        let _ = std::fs::remove_file(db.trim_start_matches("sqlite:"));
+        let tc = dtmrs_open(cs(&db).as_ptr());
+        assert_eq!(dtmrs_register_pull(tc, cs("a").as_ptr()), DTMRS_OK);
+        assert_eq!(dtmrs_start(tc), DTMRS_OK);
+
+        let mut buf = vec![0u8; 256];
+        let t0 = std::time::Instant::now();
+        let r = dtmrs_next_task(tc, 0, buf.as_mut_ptr() as *mut c_char, buf.len());
+        assert_eq!(r, 0, "没任务应该返回 0");
+        assert!(t0.elapsed() < Duration::from_millis(200), "不该阻塞");
+        dtmrs_close(tc);
+    }
+
+    #[test]
+    fn 回填不认识的码按未知处理() {
+        // 宿主传了野值 —— 宁可重试，不可误回滚
+        assert_eq!(to_branch_result(DTMRS_SUCCESS), BranchResult::Success);
+        assert_eq!(to_branch_result(DTMRS_FAILURE), BranchResult::Failure);
+        assert_eq!(to_branch_result(DTMRS_ONGOING), BranchResult::Ongoing);
+        assert_eq!(to_branch_result(DTMRS_UNKNOWN), BranchResult::Unknown);
+        assert_eq!(to_branch_result(42), BranchResult::Unknown);
+        assert_eq!(to_branch_result(-7), BranchResult::Unknown);
+    }
+
+    #[test]
+    fn 回填不存在的task_id会报错() {
+        let db = format!("sqlite:/tmp/dtmrs_pull_bad_{}.db", std::process::id());
+        let _ = std::fs::remove_file(db.trim_start_matches("sqlite:"));
+        let tc = dtmrs_open(cs(&db).as_ptr());
+        assert_eq!(dtmrs_start(tc), DTMRS_OK);
+        // 编的 id / 已超时的 id 都该被拒，而不是静默吞掉
+        assert_eq!(dtmrs_reply(tc, 999, DTMRS_SUCCESS), DTMRS_ERR);
+        assert_eq!(dtmrs_reply(std::ptr::null_mut(), 1, DTMRS_SUCCESS), DTMRS_ERR);
+        assert_eq!(dtmrs_register_pull(std::ptr::null_mut(), cs("x").as_ptr()), DTMRS_ERR);
+        dtmrs_close(tc);
+    }
 
     extern "C" fn ok_handler(
         _g: *const c_char,
