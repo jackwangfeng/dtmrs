@@ -14,6 +14,13 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/jackwangfeng/dtmrs"
+homepage = "https://github.com/jackwangfeng/dtmrs"
+authors = ["jackwangfeng"]
+# 1.82：workspace 继承 + let-else + 2021 edition 都稳了。
+# 不写死太高的版本，发布出去的库要照顾还没跟上的用户
+rust-version = "1.82"
+keywords = ["distributed", "transaction", "saga", "tcc", "microservices"]
+categories = ["database", "asynchronous", "network-programming"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +38,7 @@ tonic = "0.14"
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
 prost = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

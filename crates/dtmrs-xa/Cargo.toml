@@ -3,10 +3,18 @@ name = "dtmrs-xa"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "XA 两阶段提交的业务方助手（Postgres / MySQL）"
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "XA two-phase commit helper for the resource-manager side (Postgres / MySQL)"
+
+readme = "README.md"
 
 [dependencies]
-dtmrs-core = { path = "../dtmrs-core" }
+dtmrs-core = { path = "../dtmrs-core", version = "0.1.0" }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -3,7 +3,15 @@ name = "dtmrs-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "分布式事务状态机（纯逻辑，无 I/O）"
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Distributed transaction state machines (pure logic, no I/O) and SQL dialect rendering"
+
+readme = "README.md"
 
 [dependencies]
 serde = { workspace = true }

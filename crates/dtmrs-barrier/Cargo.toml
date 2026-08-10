@@ -3,10 +3,18 @@ name = "dtmrs-barrier"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "子事务屏障：一张表同时解决幂等、空回滚、悬挂"
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Sub-transaction barrier: one table solving idempotence, empty rollback and suspension"
+
+readme = "README.md"
 
 [dependencies]
-dtmrs-core = { path = "../dtmrs-core" }
+dtmrs-core = { path = "../dtmrs-core", version = "0.1.0" }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 

@@ -20,8 +20,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: 装 protoc（编 gRPC 的 proto 要用）
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # 刻意**不装** protoc：build.rs 在系统没有时会退回自带的那份，
+      # 这条路径是发布到 crates.io 的关键（不能要求每个下游用户先装 protoc）。
+      # 不装 = CI 每次都在验它还好使
+      - name: 确认机器上确实没有 protoc（否则兜底路径没被测到）
+        run: |
+          if command -v protoc; then
+            echo "::warning::runner 自带 protoc，本次没有验到 vendored 兜底"
+          else
+            echo "没有系统 protoc —— 走 vendored 兜底 ✓"
+          fi
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -35,7 +43,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       # 不用 services: 因为 Postgres 的两阶段提交默认是关的
       # （max_prepared_transactions=0），必须自己带参数起，XA 才跑得了

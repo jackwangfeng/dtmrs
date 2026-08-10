@@ -3,10 +3,18 @@ name = "dtmrs-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "dtmrs 存储层：一套 SQL 跑 sqlite / postgres / mysql（sqlx::Any）"
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Storage layer for dtmrs: one set of SQL across sqlite / postgres / mysql via sqlx::Any"
+
+readme = "README.md"
 
 [dependencies]
-dtmrs-core = { path = "../dtmrs-core" }
+dtmrs-core = { path = "../dtmrs-core", version = "0.1.0" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 
