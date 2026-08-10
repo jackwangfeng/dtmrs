@@ -28,7 +28,7 @@
 //! 这不是实现限制，是这个方案成立的根本条件。
 
 use dtmrs_core::BranchOp;
-use sqlx::{Sqlite, Transaction};
+use sqlx::{Any, AnyPool, Transaction};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -90,19 +90,23 @@ impl BranchBarrier {
         format!("{:02}", self.counter)
     }
 
-    pub async fn migrate(pool: &sqlx::SqlitePool) -> Result<()> {
+    /// 建屏障表。sqlite 和 postgres 通用。
+    ///
+    /// 跟 DTM 的表比少了自增 `id` 列 —— 那是唯一的方言不可移植点
+    /// （`AUTOINCREMENT` vs `BIGSERIAL`），而算法只依赖那个唯一约束，用不到 id。
+    /// 干掉它换来一套 DDL 跑两种库。
+    pub async fn migrate(pool: &AnyPool) -> Result<()> {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS barrier (
-              id          INTEGER PRIMARY KEY AUTOINCREMENT,
-              trans_type  TEXT NOT NULL DEFAULT '',
-              gid         TEXT NOT NULL DEFAULT '',
-              branch_id   TEXT NOT NULL DEFAULT '',
-              op          TEXT NOT NULL DEFAULT '',
-              barrier_id  TEXT NOT NULL DEFAULT '',
-              reason      TEXT NOT NULL DEFAULT '',
-              create_time INTEGER NOT NULL,
-              UNIQUE (gid, branch_id, op, barrier_id)
+              trans_type  TEXT   NOT NULL DEFAULT '',
+              gid         TEXT   NOT NULL DEFAULT '',
+              branch_id   TEXT   NOT NULL DEFAULT '',
+              op          TEXT   NOT NULL DEFAULT '',
+              barrier_id  TEXT   NOT NULL DEFAULT '',
+              reason      TEXT   NOT NULL DEFAULT '',
+              create_time BIGINT NOT NULL,
+              PRIMARY KEY (gid, branch_id, op, barrier_id)
             )"#,
         )
         .execute(pool)
@@ -113,7 +117,7 @@ impl BranchBarrier {
     /// 判定这次调用该不该执行业务逻辑。
     ///
     /// 必须传入**业务自己的**数据库事务 —— 屏障记录和业务 SQL 要一起提交。
-    pub async fn decide(&mut self, tx: &mut Transaction<'_, Sqlite>) -> Result<Decision> {
+    pub async fn decide(&mut self, tx: &mut Transaction<'_, Any>) -> Result<Decision> {
         let bid = self.next_barrier_id();
         let op = self.op;
 
@@ -140,13 +144,16 @@ impl BranchBarrier {
 
     async fn insert(
         &self,
-        tx: &mut Transaction<'_, Sqlite>,
+        tx: &mut Transaction<'_, Any>,
         op: &str,
         bid: &str,
     ) -> Result<u64> {
+        // 只用 $N 占位符：postgres 不认 `?`（实测语法错误）。
+        // ON CONFLICT DO NOTHING 两种库都支持，且冲突时 rows_affected 都是 0 ——
+        // 整个屏障算法就靠这个返回值判空回滚和重复请求。
         let sql = format!(
-            "INSERT OR IGNORE INTO {} (trans_type,gid,branch_id,op,barrier_id,reason,create_time)
-             VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO {} (trans_type,gid,branch_id,op,barrier_id,reason,create_time)
+             VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
             self.table
         );
         let n = sqlx::query(&sql)
@@ -174,21 +181,30 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
-    use sqlx::SqlitePool;
+    use sqlx::any::AnyPoolOptions;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePoolOptions::new()
+    /// 屏障也要在两种后端上验 —— 业务库是 pg 的话，屏障表就在 pg 里。
+    /// 配了 DTMRS_TEST_PG 就多跑一遍真 postgres。
+    async fn pools() -> Vec<(&'static str, AnyPool)> {
+        sqlx::any::install_default_drivers();
+        let mem = AnyPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        BranchBarrier::migrate(&p).await.unwrap();
-        p
+        BranchBarrier::migrate(&mem).await.unwrap();
+        let mut v = vec![("sqlite", mem)];
+        if let Ok(url) = std::env::var("DTMRS_TEST_PG") {
+            let p = AnyPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+            sqlx::query("DROP TABLE IF EXISTS barrier").execute(&p).await.unwrap();
+            BranchBarrier::migrate(&p).await.unwrap();
+            v.push(("postgres", p));
+        }
+        v
     }
 
     /// 走一次完整判定并提交，返回结论
-    async fn once(p: &SqlitePool, gid: &str, branch: &str, op: &str) -> Decision {
+    async fn once(p: &AnyPool, gid: &str, branch: &str, op: &str) -> Decision {
         let mut bb = BranchBarrier::new("saga", gid, branch, op).unwrap();
         let mut tx = p.begin().await.unwrap();
         let d = bb.decide(&mut tx).await.unwrap();
@@ -198,97 +214,127 @@ mod tests {
 
     #[tokio::test]
     async fn 幂等_同一个action调两次只执行一次() {
-        let p = pool().await;
-        assert_eq!(once(&p, "g1", "01", "action").await, Decision::Execute);
-        // TC 重试 —— 必须被挡住
-        assert_eq!(once(&p, "g1", "01", "action").await, Decision::Duplicated);
+        for (be, p) in pools().await {
+            let _ = be;
+        
+            assert_eq!(once(&p, "g1", "01", "action").await, Decision::Execute, "{be}");
+            // TC 重试 —— 必须被挡住
+            assert_eq!(once(&p, "g1", "01", "action").await, Decision::Duplicated, "{be}");
+        }
     }
 
     #[tokio::test]
     async fn 空回滚_action没跑过时补偿要空转() {
-        let p = pool().await;
-        // action 从没来过，直接来 compensate
-        assert_eq!(
-            once(&p, "g2", "01", "compensate").await,
-            Decision::NullCompensation
-        );
+        for (be, p) in pools().await {
+            let _ = be;
+        
+            // action 从没来过，直接来 compensate
+            assert_eq!(
+                once(&p, "g2", "01", "compensate").await,
+                Decision::NullCompensation, "{be}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn 正常补偿_action跑过之后补偿要执行() {
-        let p = pool().await;
-        assert_eq!(once(&p, "g3", "01", "action").await, Decision::Execute);
-        assert_eq!(once(&p, "g3", "01", "compensate").await, Decision::Execute);
+        for (be, p) in pools().await {
+            let _ = be;
+        
+            assert_eq!(once(&p, "g3", "01", "action").await, Decision::Execute, "{be}");
+            assert_eq!(once(&p, "g3", "01", "compensate").await, Decision::Execute, "{be}");
+        }
     }
 
     #[tokio::test]
     async fn 悬挂_补偿先到则晚到的action必须被丢弃() {
-        let p = pool().await;
-        // 补偿先到（网络乱序），空回滚
-        assert_eq!(
-            once(&p, "g4", "01", "compensate").await,
-            Decision::NullCompensation
-        );
-        // 晚到的 action 如果执行了，钱就扣出去再也回不来了 —— 必须丢弃
-        assert_eq!(once(&p, "g4", "01", "action").await, Decision::Duplicated);
+        for (be, p) in pools().await {
+            let _ = be;
+        
+            // 补偿先到（网络乱序），空回滚
+            assert_eq!(
+                once(&p, "g4", "01", "compensate").await,
+                Decision::NullCompensation, "{be}"
+            );
+            // 晚到的 action 如果执行了，钱就扣出去再也回不来了 —— 必须丢弃
+            assert_eq!(once(&p, "g4", "01", "action").await, Decision::Duplicated, "{be}");
+        }
     }
 
     #[tokio::test]
     async fn 补偿也要幂等() {
-        let p = pool().await;
-        once(&p, "g5", "01", "action").await;
-        assert_eq!(once(&p, "g5", "01", "compensate").await, Decision::Execute);
-        assert_eq!(
-            once(&p, "g5", "01", "compensate").await,
-            Decision::Duplicated
-        );
+        for (be, p) in pools().await {
+            let _ = be;
+        
+            once(&p, "g5", "01", "action").await;
+            assert_eq!(once(&p, "g5", "01", "compensate").await, Decision::Execute, "{be}");
+            assert_eq!(
+                once(&p, "g5", "01", "compensate").await,
+                Decision::Duplicated
+            );
+        }
     }
 
     #[tokio::test]
     async fn 不同分支互不干扰() {
-        let p = pool().await;
-        assert_eq!(once(&p, "g6", "01", "action").await, Decision::Execute);
-        assert_eq!(once(&p, "g6", "02", "action").await, Decision::Execute);
-        // 补 02 不影响 01
-        assert_eq!(once(&p, "g6", "02", "compensate").await, Decision::Execute);
-        assert_eq!(once(&p, "g6", "01", "compensate").await, Decision::Execute);
+        for (be, p) in pools().await {
+            let _ = be;
+        
+            assert_eq!(once(&p, "g6", "01", "action").await, Decision::Execute, "{be}");
+            assert_eq!(once(&p, "g6", "02", "action").await, Decision::Execute, "{be}");
+            // 补 02 不影响 01
+            assert_eq!(once(&p, "g6", "02", "compensate").await, Decision::Execute, "{be}");
+            assert_eq!(once(&p, "g6", "01", "compensate").await, Decision::Execute, "{be}");
+        }
     }
 
     #[tokio::test]
     async fn tcc的cancel对应try() {
-        let p = pool().await;
-        // try 没跑过 → cancel 空回滚
-        assert_eq!(once(&p, "g7", "01", "cancel").await, Decision::NullCompensation);
-        let p2 = pool().await;
-        assert_eq!(once(&p2, "g8", "01", "try").await, Decision::Execute);
-        assert_eq!(once(&p2, "g8", "01", "cancel").await, Decision::Execute);
+        for (be, p) in pools().await {
+            let _ = be;
+        
+            // try 没跑过 → cancel 空回滚
+            assert_eq!(once(&p, "g7", "01", "cancel").await, Decision::NullCompensation);
+            let p2 = pools().await.into_iter().next().unwrap().1;
+            assert_eq!(once(&p2, "g8", "01", "try").await, Decision::Execute, "{be}");
+            assert_eq!(once(&p2, "g8", "01", "cancel").await, Decision::Execute, "{be}");
+        }
     }
 
     #[tokio::test]
     async fn 同一分支多次调用用不同barrier_id() {
-        let p = pool().await;
-        let mut bb = BranchBarrier::new("saga", "g9", "01", "action").unwrap();
-        let mut tx = p.begin().await.unwrap();
-        // 一个分支内连续两次判定，第二次不该被当成重复
-        assert_eq!(bb.decide(&mut tx).await.unwrap(), Decision::Execute);
-        assert_eq!(bb.decide(&mut tx).await.unwrap(), Decision::Execute);
-        tx.commit().await.unwrap();
+        for (be, p) in pools().await {
+            let _ = be;
+        
+            let mut bb = BranchBarrier::new("saga", "g9", "01", "action").unwrap();
+            let mut tx = p.begin().await.unwrap();
+            // 一个分支内连续两次判定，第二次不该被当成重复
+            assert_eq!(bb.decide(&mut tx).await.unwrap(), Decision::Execute, "{be}");
+            assert_eq!(bb.decide(&mut tx).await.unwrap(), Decision::Execute, "{be}");
+            tx.commit().await.unwrap();
+        }
     }
 
     #[tokio::test]
     async fn 回滚的事务不留屏障记录() {
-        let p = pool().await;
-        let mut bb = BranchBarrier::new("saga", "g10", "01", "action").unwrap();
-        let mut tx = p.begin().await.unwrap();
-        assert_eq!(bb.decide(&mut tx).await.unwrap(), Decision::Execute);
-        tx.rollback().await.unwrap(); // 业务 SQL 失败，整个事务回滚
-        // 屏障记录也跟着没了，所以重试还能再执行 —— 这才是正确的
-        assert_eq!(once(&p, "g10", "01", "action").await, Decision::Execute);
+        for (be, p) in pools().await {
+            let _ = be;
+        
+            let mut bb = BranchBarrier::new("saga", "g10", "01", "action").unwrap();
+            let mut tx = p.begin().await.unwrap();
+            assert_eq!(bb.decide(&mut tx).await.unwrap(), Decision::Execute, "{be}");
+            tx.rollback().await.unwrap(); // 业务 SQL 失败，整个事务回滚
+            // 屏障记录也跟着没了，所以重试还能再执行 —— 这才是正确的
+            assert_eq!(once(&p, "g10", "01", "action").await, Decision::Execute, "{be}");
+        }
     }
 
     #[tokio::test]
     async fn 信息不全要报错() {
-        assert!(BranchBarrier::new("saga", "", "01", "action").is_err());
-        assert!(BranchBarrier::new("saga", "g", "01", "bogus").is_err());
+        for (be, p) in pools().await {
+            let _ = be;
+            assert!(BranchBarrier::new("saga", "", "01", "action").is_err());
+            assert!(BranchBarrier::new("saga", "g", "01", "bogus").is_err());
+        }
     }
 }

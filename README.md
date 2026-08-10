@@ -141,15 +141,61 @@ TC 在进程里，但状态在 DB 里。进程死了事务不丢 —— 新进�
 | 指数退避重试 | ✅ 可用 |
 | HTTP API（路径与 DTM 对齐） | ✅ 可用 |
 | SQLite 存储 | ✅ 可用 |
-| Postgres 存储 | ⬜ 未做 |
+| **Postgres 存储（多实例生产部署）** | ✅ 可用 |
 | **TCC（try/confirm/cancel）** | ✅ 可用 |
 | **二阶段消息（取代 MQ 事务消息）** | ✅ 可用 |
 | XA | ⬜ 未做（`submit` 明确报错，推进器也不假装成功） |
 | gRPC | ⬜ 未做 |
 
-**58 个测试全绿**：6 个 SAGA 端到端 + 11 个 TCC/msg + 5 个嵌入式（含跨进程重启恢复）
+**58 个测试全绿**（存储层和屏障的 17 个会在 sqlite 和真 Postgres 上各跑一遍）：6 个 SAGA 端到端 + 11 个 TCC/msg + 5 个嵌入式（含跨进程重启恢复）
 + 4 个 C ABI（含空指针/坏参数不崩）+ 10 个屏障 + 13 个状态机单测。
 Python 和 C 的示例都实际跑通。
+
+## Postgres：多实例生产部署
+
+```bash
+DTMRS_DB='postgres://user:pass@host:5432/dtm' ./dtmrs
+```
+
+**一套 SQL 跑两种库**，没有抽 `Store` trait、没有两份实现。靠的是 `sqlx::Any`，
+但有两条实测出来的硬规矩（写在 `dtmrs-store` 文件头）：
+
+| | sqlite | postgres |
+|---|---|---|
+| `$1` 占位符 | ✅ | ✅ |
+| `?` 占位符 | ✅ | ❌ 语法错误 |
+| `ON CONFLICT DO NOTHING` | ✅ | ✅ |
+| 冲突时 `rows_affected` | 1 → 0 | 1 → 0（一致） |
+
+1. **只用 `$N`**，永不用 `?`
+2. **同一个 `$N` 不复用** —— sqlite 把 `$4` 当命名参数，复用会让位置绑定错位
+3. 整数列用 `BIGINT` —— postgres 的 `INTEGER` 只有 4 字节，装不下时间戳
+
+### 实测：两个实例并发，没有重复推进
+
+Postgres 的意义就在这儿（sqlite 撑不住多实例写）。20 笔事务、两个实例、
+业务端故意每次 sleep 50ms 制造撞车窗口：
+
+```
+被调用的分支数: 40 （20 笔 × 2 步）
+调用次数分布: {1: 40}          ← 每个分支正好 1 次
+重复调用: 无 ✓
+
+事务归属:  succeed|tc-1|10
+          succeed|tc-2|10     ← 两个实例各推了一半
+```
+
+### 踩到的坑：Postgres 的 CREATE TABLE IF NOT EXISTS 不是并发安全的
+
+两个实例同时启动，实例 1 直接崩了：
+
+```
+duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+```
+
+`CREATE TABLE IF NOT EXISTS` 在 Postgres 里会在系统目录上撞唯一键 ——
+sqlite 单写永远不会暴露这个问题，**只有真起两个实例才能撞出来**。
+现在建表带重试（输的那个重试时表已经建好，`IF NOT EXISTS` 正常跳过）。
 
 ## TCC
 
@@ -166,7 +212,53 @@ curl -XPOST :36789/api/dtmsvr/submit -d '{"gid":"tcc-A","trans_type":"tcc"}'
 **必须先登记再调 try**。反过来的话 try 成功但登记失败，TC 不知道有这个分支，
 回滚时不会 cancel 它 —— 预留的资源永久泄漏。
 
-### TCC 跟 SAGA 的关键语义差别
+### Postgres：多实例生产部署
+
+```bash
+DTMRS_DB='postgres://user:pass@host:5432/dtm' ./dtmrs
+```
+
+**一套 SQL 跑两种库**，没有抽 `Store` trait、没有两份实现。靠的是 `sqlx::Any`，
+但有两条实测出来的硬规矩（写在 `dtmrs-store` 文件头）：
+
+| | sqlite | postgres |
+|---|---|---|
+| `$1` 占位符 | ✅ | ✅ |
+| `?` 占位符 | ✅ | ❌ 语法错误 |
+| `ON CONFLICT DO NOTHING` | ✅ | ✅ |
+| 冲突时 `rows_affected` | 1 → 0 | 1 → 0（一致） |
+
+1. **只用 `$N`**，永不用 `?`
+2. **同一个 `$N` 不复用** —— sqlite 把 `$4` 当命名参数，复用会让位置绑定错位
+3. 整数列用 `BIGINT` —— postgres 的 `INTEGER` 只有 4 字节，装不下时间戳
+
+### 实测：两个实例并发，没有重复推进
+
+Postgres 的意义就在这儿（sqlite 撑不住多实例写）。20 笔事务、两个实例、
+业务端故意每次 sleep 50ms 制造撞车窗口：
+
+```
+被调用的分支数: 40 （20 笔 × 2 步）
+调用次数分布: {1: 40}          ← 每个分支正好 1 次
+重复调用: 无 ✓
+
+事务归属:  succeed|tc-1|10
+          succeed|tc-2|10     ← 两个实例各推了一半
+```
+
+### 踩到的坑：Postgres 的 CREATE TABLE IF NOT EXISTS 不是并发安全的
+
+两个实例同时启动，实例 1 直接崩了：
+
+```
+duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+```
+
+`CREATE TABLE IF NOT EXISTS` 在 Postgres 里会在系统目录上撞唯一键 ——
+sqlite 单写永远不会暴露这个问题，**只有真起两个实例才能撞出来**。
+现在建表带重试（输的那个重试时表已经建好，`IF NOT EXISTS` 正常跳过）。
+
+## TCC 跟 SAGA 的关键语义差别
 
 SAGA 的 action 返回 FAILURE → 逆序补偿。
 **TCC 的 confirm 返回 FAILURE 绝不能触发 cancel** —— try 已经成功、资源已预留、

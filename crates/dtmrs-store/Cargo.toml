@@ -3,11 +3,12 @@ name = "dtmrs-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "dtmrs 存储层（sqlite）"
+description = "dtmrs 存储层：一套 SQL 跑 sqlite 与 postgres（sqlx::Any）"
 
 [dependencies]
 dtmrs-core = { path = "../dtmrs-core" }
 sqlx = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
