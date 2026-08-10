@@ -131,12 +131,15 @@ impl Api {
                     return Err(ApiError::BadRequest("saga 的 steps 不能为空".into()));
                 }
                 let (g, branches) = saga_rows(gid, steps);
-                self.store.create_global(&g, &branches).await.map_err(internal)?;
+                self.store
+                    .create_global(&g, &branches)
+                    .await
+                    .map_err(internal)?;
                 Ok(())
             }
-            TransType::Tcc | TransType::Msg | TransType::Xa => Err(ApiError::BadRequest(
-                "tcc/xa/msg 要先调 prepare".into(),
-            )),
+            TransType::Tcc | TransType::Msg | TransType::Xa => {
+                Err(ApiError::BadRequest("tcc/xa/msg 要先调 prepare".into()))
+            }
         }
     }
 

@@ -170,8 +170,12 @@ impl GrpcCaller {
                 Err(_) => {
                     // gid 里有非 ASCII 之类。这些值是我们自己生成/客户端给的，
                     // 塞不进 header 就没法让业务方做幂等 —— 宁可不调
-                    warn!(gid, branch = branch_id, key = k,
-                          "metadata 值不合法（非 ASCII？），无法调用 gRPC 分支");
+                    warn!(
+                        gid,
+                        branch = branch_id,
+                        key = k,
+                        "metadata 值不合法（非 ASCII？），无法调用 gRPC 分支"
+                    );
                     return BranchResult::Unknown;
                 }
             }

@@ -26,6 +26,12 @@
 //! - 所有输出缓冲区：C 侧分配，本库只写入并保证以 `\0` 结尾
 //! - `dtmrs_last_error()` 返回线程局部缓冲区，下次调用本库任何函数即失效
 
+// 这个 crate 存在的意义就是给 C 调：几乎每个导出函数都要解引用宿主传进来的
+// 裸指针。安全契约写在 include/dtmrs.h 和各函数的文档里（非空、存活期、
+// 线程安全），由调用方保证 —— 这是 C ABI 的常态，不是疏忽。
+// 每个函数内部都做了空指针检查，传 NULL 会返回 DTMRS_ERR 而不是崩。
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use dtmrs_core::{BranchResult, SagaStep};
 use dtmrs_server::embedded::Embedded;
 use dtmrs_server::registry::BranchCtx;
@@ -336,7 +342,8 @@ pub extern "C" fn dtmrs_next_task(
     let got = if timeout_ms <= 0 {
         rx.try_recv().ok()
     } else {
-        rx.recv_timeout(Duration::from_millis(timeout_ms as u64)).ok()
+        rx.recv_timeout(Duration::from_millis(timeout_ms as u64))
+            .ok()
     };
     drop(rx);
 
@@ -633,14 +640,25 @@ mod tests {
         });
 
         let steps = cs(r#"[{"action":"local://act","compensate":"local://undo"}]"#);
-        assert_eq!(dtmrs_submit_saga(tc, cs("pull-1").as_ptr(), steps.as_ptr()), DTMRS_OK);
+        assert_eq!(
+            dtmrs_submit_saga(tc, cs("pull-1").as_ptr(), steps.as_ptr()),
+            DTMRS_OK
+        );
 
         let mut out = vec![0u8; 64];
         assert_eq!(
-            dtmrs_wait_final(tc, cs("pull-1").as_ptr(), 8000, out.as_mut_ptr() as *mut c_char, 64),
+            dtmrs_wait_final(
+                tc,
+                cs("pull-1").as_ptr(),
+                8000,
+                out.as_mut_ptr() as *mut c_char,
+                64
+            ),
             DTMRS_OK
         );
-        let st = unsafe { CStr::from_ptr(out.as_ptr() as *const c_char) }.to_str().unwrap();
+        let st = unsafe { CStr::from_ptr(out.as_ptr() as *const c_char) }
+            .to_str()
+            .unwrap();
         assert_eq!(st, "succeed");
         assert_eq!(worker.join().unwrap(), 1, "宿主应该正好取到 1 个任务");
         dtmrs_close(tc);
@@ -682,8 +700,14 @@ mod tests {
         assert_eq!(dtmrs_start(tc), DTMRS_OK);
         // 编的 id / 已超时的 id 都该被拒，而不是静默吞掉
         assert_eq!(dtmrs_reply(tc, 999, DTMRS_SUCCESS), DTMRS_ERR);
-        assert_eq!(dtmrs_reply(std::ptr::null_mut(), 1, DTMRS_SUCCESS), DTMRS_ERR);
-        assert_eq!(dtmrs_register_pull(std::ptr::null_mut(), cs("x").as_ptr()), DTMRS_ERR);
+        assert_eq!(
+            dtmrs_reply(std::ptr::null_mut(), 1, DTMRS_SUCCESS),
+            DTMRS_ERR
+        );
+        assert_eq!(
+            dtmrs_register_pull(std::ptr::null_mut(), cs("x").as_ptr()),
+            DTMRS_ERR
+        );
         dtmrs_close(tc);
     }
 
@@ -738,19 +762,41 @@ mod tests {
         assert!(!tc.is_null());
         let mut calls: c_int = 0;
         let ud = &mut calls as *mut c_int as *mut c_void;
-        assert_eq!(dtmrs_register(tc, cs("a1").as_ptr(), Some(ok_handler), ud), DTMRS_OK);
-        assert_eq!(dtmrs_register(tc, cs("c1").as_ptr(), Some(ok_handler), std::ptr::null_mut()), DTMRS_OK);
+        assert_eq!(
+            dtmrs_register(tc, cs("a1").as_ptr(), Some(ok_handler), ud),
+            DTMRS_OK
+        );
+        assert_eq!(
+            dtmrs_register(
+                tc,
+                cs("c1").as_ptr(),
+                Some(ok_handler),
+                std::ptr::null_mut()
+            ),
+            DTMRS_OK
+        );
         assert_eq!(dtmrs_start(tc), DTMRS_OK);
 
         let steps = cs(r#"[{"action":"local://a1","compensate":"local://c1"}]"#);
-        assert_eq!(dtmrs_submit_saga(tc, cs("ffi-1").as_ptr(), steps.as_ptr()), DTMRS_OK);
+        assert_eq!(
+            dtmrs_submit_saga(tc, cs("ffi-1").as_ptr(), steps.as_ptr()),
+            DTMRS_OK
+        );
 
         let mut buf = [0i8; 32];
         assert_eq!(
-            dtmrs_wait_final(tc, cs("ffi-1").as_ptr(), 5000, buf.as_mut_ptr() as *mut c_char, 32),
+            dtmrs_wait_final(
+                tc,
+                cs("ffi-1").as_ptr(),
+                5000,
+                buf.as_mut_ptr() as *mut c_char,
+                32
+            ),
             DTMRS_OK
         );
-        let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }.to_str().unwrap();
+        let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+            .to_str()
+            .unwrap();
         assert_eq!(s, "succeed");
         assert_eq!(calls, 1, "handler 被调一次");
         dtmrs_close(tc);
@@ -763,15 +809,28 @@ mod tests {
         let tc = dtmrs_open(url.as_ptr());
         let mut comp: c_int = 0;
         let ud = &mut comp as *mut c_int as *mut c_void;
-        dtmrs_register(tc, cs("a1").as_ptr(), Some(fail_handler), std::ptr::null_mut());
+        dtmrs_register(
+            tc,
+            cs("a1").as_ptr(),
+            Some(fail_handler),
+            std::ptr::null_mut(),
+        );
         dtmrs_register(tc, cs("c1").as_ptr(), Some(ok_handler), ud);
         assert_eq!(dtmrs_start(tc), DTMRS_OK);
         let steps = cs(r#"[{"action":"local://a1","compensate":"local://c1"}]"#);
         dtmrs_submit_saga(tc, cs("ffi-2").as_ptr(), steps.as_ptr());
 
         let mut buf = [0i8; 32];
-        dtmrs_wait_final(tc, cs("ffi-2").as_ptr(), 5000, buf.as_mut_ptr() as *mut c_char, 32);
-        let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }.to_str().unwrap();
+        dtmrs_wait_final(
+            tc,
+            cs("ffi-2").as_ptr(),
+            5000,
+            buf.as_mut_ptr() as *mut c_char,
+            32,
+        );
+        let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+            .to_str()
+            .unwrap();
         assert_eq!(s, "failed");
         assert_eq!(comp, 1, "补偿被调一次");
         dtmrs_close(tc);
@@ -786,7 +845,12 @@ mod tests {
         let mut n: c_int = 0;
         let ud = &mut n as *mut c_int as *mut c_void;
         dtmrs_register(tc, cs("a1").as_ptr(), Some(bogus_handler), ud);
-        dtmrs_register(tc, cs("c1").as_ptr(), Some(ok_handler), std::ptr::null_mut());
+        dtmrs_register(
+            tc,
+            cs("c1").as_ptr(),
+            Some(ok_handler),
+            std::ptr::null_mut(),
+        );
         dtmrs_start(tc);
         let steps = cs(r#"[{"action":"local://a1","compensate":"local://c1"}]"#);
         dtmrs_submit_saga(tc, cs("ffi-3").as_ptr(), steps.as_ptr());
@@ -794,10 +858,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
         let mut buf = [0i8; 32];
         assert_eq!(
-            dtmrs_status(tc, cs("ffi-3").as_ptr(), buf.as_mut_ptr() as *mut c_char, 32),
+            dtmrs_status(
+                tc,
+                cs("ffi-3").as_ptr(),
+                buf.as_mut_ptr() as *mut c_char,
+                32
+            ),
             DTMRS_OK
         );
-        let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }.to_str().unwrap();
+        let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+            .to_str()
+            .unwrap();
         assert_eq!(s, "submitted", "野值不能触发回滚，只能重试");
         assert!(n >= 1);
         dtmrs_close(tc);
@@ -808,30 +879,75 @@ mod tests {
     fn 错误路径不会崩() {
         // FFI 最怕的是宿主传错参数直接段错误
         assert!(dtmrs_open(std::ptr::null()).is_null());
-        assert!(!unsafe { CStr::from_ptr(dtmrs_last_error()) }.to_bytes().is_empty());
-        assert_eq!(dtmrs_register(std::ptr::null_mut(), std::ptr::null(), None, std::ptr::null_mut()), DTMRS_ERR);
+        assert!(!unsafe { CStr::from_ptr(dtmrs_last_error()) }
+            .to_bytes()
+            .is_empty());
+        assert_eq!(
+            dtmrs_register(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                None,
+                std::ptr::null_mut()
+            ),
+            DTMRS_ERR
+        );
         assert_eq!(dtmrs_start(std::ptr::null_mut()), DTMRS_ERR);
-        assert_eq!(dtmrs_submit_saga(std::ptr::null_mut(), std::ptr::null(), std::ptr::null()), DTMRS_ERR);
-        assert_eq!(dtmrs_status(std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(), 0), DTMRS_ERR);
+        assert_eq!(
+            dtmrs_submit_saga(std::ptr::null_mut(), std::ptr::null(), std::ptr::null()),
+            DTMRS_ERR
+        );
+        assert_eq!(
+            dtmrs_status(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0
+            ),
+            DTMRS_ERR
+        );
         dtmrs_close(std::ptr::null_mut()); // 不该崩
 
         let (url, path) = db("errs");
         let tc = dtmrs_open(url.as_ptr());
         // start 之前提交
-        assert_eq!(dtmrs_submit_saga(tc, cs("x").as_ptr(), cs("[]").as_ptr()), DTMRS_ERR);
-        dtmrs_register(tc, cs("a1").as_ptr(), Some(ok_handler), std::ptr::null_mut());
+        assert_eq!(
+            dtmrs_submit_saga(tc, cs("x").as_ptr(), cs("[]").as_ptr()),
+            DTMRS_ERR
+        );
+        dtmrs_register(
+            tc,
+            cs("a1").as_ptr(),
+            Some(ok_handler),
+            std::ptr::null_mut(),
+        );
         dtmrs_start(tc);
         // start 之后再注册
-        assert_eq!(dtmrs_register(tc, cs("z").as_ptr(), Some(ok_handler), std::ptr::null_mut()), DTMRS_ERR);
+        assert_eq!(
+            dtmrs_register(tc, cs("z").as_ptr(), Some(ok_handler), std::ptr::null_mut()),
+            DTMRS_ERR
+        );
         // 坏 JSON
-        assert_eq!(dtmrs_submit_saga(tc, cs("y").as_ptr(), cs("{坏}").as_ptr()), DTMRS_ERR);
+        assert_eq!(
+            dtmrs_submit_saga(tc, cs("y").as_ptr(), cs("{坏}").as_ptr()),
+            DTMRS_ERR
+        );
         // 漏注册的 handler，提交就该被拦住
         let steps = cs(r#"[{"action":"local://a1","compensate":"local://没注册"}]"#);
-        assert_eq!(dtmrs_submit_saga(tc, cs("w").as_ptr(), steps.as_ptr()), DTMRS_ERR);
+        assert_eq!(
+            dtmrs_submit_saga(tc, cs("w").as_ptr(), steps.as_ptr()),
+            DTMRS_ERR
+        );
         // 缓冲区太小
         let mut tiny = [0i8; 2];
-        dtmrs_submit_saga(tc, cs("v").as_ptr(), cs(r#"[{"action":"local://a1","compensate":"local://a1"}]"#).as_ptr());
-        assert_eq!(dtmrs_status(tc, cs("v").as_ptr(), tiny.as_mut_ptr() as *mut c_char, 2), DTMRS_ERR);
+        dtmrs_submit_saga(
+            tc,
+            cs("v").as_ptr(),
+            cs(r#"[{"action":"local://a1","compensate":"local://a1"}]"#).as_ptr(),
+        );
+        assert_eq!(
+            dtmrs_status(tc, cs("v").as_ptr(), tiny.as_mut_ptr() as *mut c_char, 2),
+            DTMRS_ERR
+        );
         dtmrs_close(tc);
         let _ = std::fs::remove_file(path);
     }

@@ -50,7 +50,9 @@ async fn targets(ids: &[(i32, i64)]) -> Vec<Target> {
         ("postgres", "DTMRS_TEST_XA_PG"),
         ("mysql", "DTMRS_TEST_XA_MYSQL"),
     ] {
-        let Ok(url) = std::env::var(env) else { continue };
+        let Ok(url) = std::env::var(env) else {
+            continue;
+        };
         let be = Backend::from_url(&url);
         let xa = Xa::from_url(&url).expect("这两种库都支持 XA");
         let pool = open(&url, be).await;
@@ -104,7 +106,12 @@ async fn reset(pool: &AnyPool, be: Backend, xa: &Xa, ids: &[(i32, i64)]) {
             }
             _ => "INSERT INTO xa_acct (id,bal) VALUES ($1,$2) ON CONFLICT (id) DO UPDATE SET bal = EXCLUDED.bal",
         };
-        sqlx::query(sql).bind(id).bind(bal).execute(pool).await.unwrap();
+        sqlx::query(sql)
+            .bind(id)
+            .bind(bal)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 }
 
@@ -233,10 +240,18 @@ async fn xa_提交前改动不可见_提交后一起生效() {
         prepare_branch(&t, &store, &base, gid, "02", 12, 100).await;
 
         // 一阶段完成：改动已持久化，但**对外不可见** —— XA 相对 SAGA 的核心优势
-        assert_eq!(bal(&t, &[11, 12]).await, vec![1000, 0], "{}: prepare 后不该可见", t.name);
+        assert_eq!(
+            bal(&t, &[11, 12]).await,
+            vec![1000, 0],
+            "{}: prepare 后不该可见",
+            t.name
+        );
         assert_eq!(hanging(&t, gid).await.len(), 2, "{}: 应有 2 个挂着", t.name);
 
-        store.set_global_status(gid, GlobalStatus::Submitted, "").await.unwrap();
+        store
+            .set_global_status(gid, GlobalStatus::Submitted, "")
+            .await
+            .unwrap();
         let g = store.get_global(gid).await.unwrap().unwrap();
         d.process(&g).await.unwrap();
 
@@ -252,7 +267,11 @@ async fn xa_提交前改动不可见_提交后一起生效() {
             "{}: 两个分支的改动一起生效",
             t.name
         );
-        assert!(hanging(&t, gid).await.is_empty(), "{}: 必须全部解决", t.name);
+        assert!(
+            hanging(&t, gid).await.is_empty(),
+            "{}: 必须全部解决",
+            t.name
+        );
     }
 }
 
@@ -281,7 +300,12 @@ async fn xa_中止则全部回滚_余额不动() {
             "{}",
             t.name
         );
-        assert_eq!(bal(&t, &[21, 22]).await, vec![1000, 0], "{}: 余额一点没动", t.name);
+        assert_eq!(
+            bal(&t, &[21, 22]).await,
+            vec![1000, 0],
+            "{}: 余额一点没动",
+            t.name
+        );
         assert!(hanging(&t, gid).await.is_empty(), "{}", t.name);
     }
 }
@@ -330,7 +354,11 @@ async fn xa_分支忘了收尾也不会污染连接池() {
         {
             let mut br = t.xa.begin(&t.pool, "xadrop", "01").await.unwrap();
             let sql = t.be.q("UPDATE xa_acct SET bal = ? WHERE id = 41");
-            sqlx::query(&sql).bind(12345i64).execute(br.conn()).await.unwrap();
+            sqlx::query(&sql)
+                .bind(12345i64)
+                .execute(br.conn())
+                .await
+                .unwrap();
             // 既不 prepare 也不 discard，直接丢
         }
         // Drop 里起的回滚任务需要一点时间
@@ -341,7 +369,12 @@ async fn xa_分支忘了收尾也不会污染连接池() {
             "{}: 没 prepare 的分支不该留下 prepared 事务",
             t.name
         );
-        assert_eq!(bal(&t, &[41]).await, vec![1000], "{}: 未收尾的改动必须回滚", t.name);
+        assert_eq!(
+            bal(&t, &[41]).await,
+            vec![1000],
+            "{}: 未收尾的改动必须回滚",
+            t.name
+        );
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM xa_acct")
             .fetch_one(&t.pool)
             .await
@@ -372,12 +405,20 @@ async fn xa_没解决的prepared事务会阻塞无关写入() {
     for t in targets(&[(61, 1000)]).await {
         let mut br = t.xa.begin(&t.pool, "xablock", "01").await.unwrap();
         let sql = t.be.q("UPDATE xa_acct SET bal = bal - ? WHERE id = 61");
-        sqlx::query(&sql).bind(1i64).execute(br.conn()).await.unwrap();
+        sqlx::query(&sql)
+            .bind(1i64)
+            .execute(br.conn())
+            .await
+            .unwrap();
         let x = br.prepare().await.unwrap();
 
         // 监控视角：能看到它挂在那儿
         let h = t.xa.list_prepared(&t.pool).await.unwrap();
-        assert!(h.iter().any(|p| p.xid == x), "{}: list_prepared 要能看到", t.name);
+        assert!(
+            h.iter().any(|p| p.xid == x),
+            "{}: list_prepared 要能看到",
+            t.name
+        );
 
         // 另一个会话改同一行 —— 会被锁住，超时后报错
         let blocked = sqlx::query(&t.be.q("UPDATE xa_acct SET bal = 999 WHERE id = 61"))

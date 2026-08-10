@@ -84,7 +84,9 @@ impl Driver {
     async fn process_saga(&self, g: &GlobalRow) -> anyhow::Result<()> {
         let steps: Vec<SagaStep> = serde_json::from_str(&g.payload).unwrap_or_default();
         if steps.is_empty() {
-            self.store.set_global_status(&g.gid, GlobalStatus::Succeed, "").await?;
+            self.store
+                .set_global_status(&g.gid, GlobalStatus::Succeed, "")
+                .await?;
             return Ok(());
         }
         let mut status = g.status;
@@ -96,7 +98,9 @@ impl Driver {
                     if s == GlobalStatus::Aborting {
                         // 防御性分支：状态机发现有 failed 分支但全局还没转 aborting
                         status = s;
-                        self.store.set_global_status(&g.gid, s, "分支已判失败").await?;
+                        self.store
+                            .set_global_status(&g.gid, s, "分支已判失败")
+                            .await?;
                         continue;
                     }
                     info!(gid = %g.gid, status = s.as_str(), "事务终结");
@@ -305,7 +309,9 @@ impl Driver {
 
         let steps: Vec<SagaStep> = serde_json::from_str(&g.payload).unwrap_or_default();
         if steps.is_empty() {
-            self.store.set_global_status(&g.gid, GlobalStatus::Succeed, "").await?;
+            self.store
+                .set_global_status(&g.gid, GlobalStatus::Succeed, "")
+                .await?;
             return Ok(());
         }
         loop {
@@ -326,9 +332,7 @@ impl Driver {
                                 .await?;
                         }
                         // msg 保证"最终一定送达"，没有补偿一说。失败只能重试。
-                        BranchResult::Failure
-                        | BranchResult::Ongoing
-                        | BranchResult::Unknown => {
+                        BranchResult::Failure | BranchResult::Ongoing | BranchResult::Unknown => {
                             self.retry_later(g).await?;
                             return Ok(());
                         }
@@ -354,7 +358,9 @@ impl Driver {
         let mut actions = vec![BranchStatus::Prepared; n];
         let mut compensates = vec![BranchStatus::Prepared; n];
         for r in rows {
-            let Some(i) = index_of(&r.branch_id) else { continue };
+            let Some(i) = index_of(&r.branch_id) else {
+                continue;
+            };
             if i >= n {
                 continue;
             }
@@ -383,7 +389,13 @@ impl Driver {
             #[cfg(feature = "grpc")]
             Target::Grpc(t) => {
                 self.grpc
-                    .call(&t, &g.gid, &g.trans_type.to_string(), branch_id, op.as_str())
+                    .call(
+                        &t,
+                        &g.gid,
+                        &g.trans_type.to_string(),
+                        branch_id,
+                        op.as_str(),
+                    )
                     .await
             }
             // 编译时关掉了 grpc feature，却遇到 grpc:// 分支。
@@ -466,7 +478,10 @@ pub fn branch_id(index: usize) -> String {
 }
 
 fn index_of(branch_id: &str) -> Option<usize> {
-    branch_id.parse::<usize>().ok().and_then(|v| v.checked_sub(1))
+    branch_id
+        .parse::<usize>()
+        .ok()
+        .and_then(|v| v.checked_sub(1))
 }
 
 /// 按 op 把分支行拆成两列（正向 / 反向），按步序对齐
@@ -479,7 +494,9 @@ fn split_by_op(
     let mut a = vec![BranchStatus::Prepared; n];
     let mut b = vec![BranchStatus::Prepared; n];
     for r in rows {
-        let Some(i) = index_of(&r.branch_id) else { continue };
+        let Some(i) = index_of(&r.branch_id) else {
+            continue;
+        };
         if i >= n {
             continue;
         }

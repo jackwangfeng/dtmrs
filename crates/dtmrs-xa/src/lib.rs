@@ -152,7 +152,10 @@ fn check_xid(flavor: Flavor, x: &str) -> Result<()> {
     if x.is_empty() || x.len() > flavor.xid_limit() {
         return Err(Error::BadXid(format!("长度 {}", x.len())));
     }
-    if !x.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !x
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         // 最后一道防线：xid 要拼进 SQL 字面量
         return Err(Error::BadXid(x.to_string()));
     }
@@ -385,7 +388,9 @@ impl XaBranch {
             }
             Flavor::MySql => {
                 // MySQL 必须先 END 再 PREPARE，少一步会报 XAER_RMFAIL
-                sqlx::raw_sql(&format!("XA END '{x}'")).execute(&mut *conn).await?;
+                sqlx::raw_sql(&format!("XA END '{x}'"))
+                    .execute(&mut *conn)
+                    .await?;
                 sqlx::raw_sql(&format!("XA PREPARE '{x}'"))
                     .execute(&mut *conn)
                     .await?;
@@ -403,7 +408,9 @@ impl XaBranch {
                 sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await?;
             }
             Flavor::MySql => {
-                sqlx::raw_sql(&format!("XA END '{x}'")).execute(&mut *conn).await?;
+                sqlx::raw_sql(&format!("XA END '{x}'"))
+                    .execute(&mut *conn)
+                    .await?;
                 sqlx::raw_sql(&format!("XA ROLLBACK '{x}'"))
                     .execute(&mut *conn)
                     .await?;
@@ -469,7 +476,10 @@ mod tests {
             assert!(!x.contains(' '), "不能留空格: {x}");
             assert!(check_xid(f, &x).is_ok());
         }
-        assert_eq!(xid_for(Flavor::Postgres, "order-1001", "01"), "dtmrs_order-1001_01");
+        assert_eq!(
+            xid_for(Flavor::Postgres, "order-1001", "01"),
+            "dtmrs_order-1001_01"
+        );
     }
 
     #[test]

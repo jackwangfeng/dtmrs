@@ -84,10 +84,16 @@ struct Reply {
 
 impl Reply {
     fn ok() -> Json<Self> {
-        Json(Self { dtm_result: "SUCCESS", message: None })
+        Json(Self {
+            dtm_result: "SUCCESS",
+            message: None,
+        })
     }
     fn err(m: impl Into<String>) -> Json<Self> {
-        Json(Self { dtm_result: "FAILURE", message: Some(m.into()) })
+        Json(Self {
+            dtm_result: "FAILURE",
+            message: Some(m.into()),
+        })
     }
 }
 
@@ -116,18 +122,15 @@ fn http_result(r: Result<(), ApiError>) -> (StatusCode, Json<Reply>) {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
     let db = std::env::var("DTMRS_DB").unwrap_or_else(|_| "sqlite:dtmrs.db".into());
     let addr = std::env::var("DTMRS_ADDR").unwrap_or_else(|_| "0.0.0.0:36789".into());
-    let grpc_addr =
-        std::env::var("DTMRS_GRPC_ADDR").unwrap_or_else(|_| "0.0.0.0:36790".into());
-    let owner = std::env::var("DTMRS_OWNER").unwrap_or_else(|_| {
-        format!("tc-{}", std::process::id())
-    });
+    let grpc_addr = std::env::var("DTMRS_GRPC_ADDR").unwrap_or_else(|_| "0.0.0.0:36790".into());
+    let owner =
+        std::env::var("DTMRS_OWNER").unwrap_or_else(|_| format!("tc-{}", std::process::id()));
 
     let store = Store::open(&db).await?;
     let driver = Driver::new(store.clone(), owner.clone());
@@ -190,17 +193,11 @@ async fn new_gid(State(app): State<App>) -> Json<HashMap<&'static str, String>> 
     Json(HashMap::from([("gid", app.api.new_gid())]))
 }
 
-async fn submit(
-    State(app): State<App>,
-    Json(req): Json<SubmitReq>,
-) -> (StatusCode, Json<Reply>) {
+async fn submit(State(app): State<App>, Json(req): Json<SubmitReq>) -> (StatusCode, Json<Reply>) {
     http_result(app.api.submit(&req.gid, &req.trans_type, &req.steps).await)
 }
 
-async fn prepare(
-    State(app): State<App>,
-    Json(req): Json<PrepareReq>,
-) -> (StatusCode, Json<Reply>) {
+async fn prepare(State(app): State<App>, Json(req): Json<PrepareReq>) -> (StatusCode, Json<Reply>) {
     http_result(
         app.api
             .prepare(

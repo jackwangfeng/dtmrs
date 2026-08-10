@@ -119,7 +119,9 @@ async fn tcc_全部try成功后confirm两个分支() {
     assert_eq!(h.confirm1.load(Ordering::SeqCst), 0);
 
     // 客户端 try 都成功了 → submit
-    s.set_global_status("tcc-1", GlobalStatus::Submitted, "").await.unwrap();
+    s.set_global_status("tcc-1", GlobalStatus::Submitted, "")
+        .await
+        .unwrap();
     let g = s.get_global("tcc-1").await.unwrap().unwrap();
     d.process(&g).await.unwrap();
 
@@ -143,7 +145,9 @@ async fn tcc_confirm失败只重试绝不转cancel() {
 
     s.create_global(&tcc_rows("tcc-2"), &[]).await.unwrap();
     client_try(&s, "tcc-2", &base, 2).await;
-    s.set_global_status("tcc-2", GlobalStatus::Submitted, "").await.unwrap();
+    s.set_global_status("tcc-2", GlobalStatus::Submitted, "")
+        .await
+        .unwrap();
 
     // 推三轮，confirm2 一直失败
     for _ in 0..3 {
@@ -152,8 +156,16 @@ async fn tcc_confirm失败只重试绝不转cancel() {
     }
 
     let g = s.get_global("tcc-2").await.unwrap().unwrap();
-    assert_eq!(g.status, GlobalStatus::Submitted, "必须保持 submitted，绝不能转 aborting/failed");
-    assert_eq!(h.cancel1.load(Ordering::SeqCst), 0, "绝不能 cancel 已确认的分支");
+    assert_eq!(
+        g.status,
+        GlobalStatus::Submitted,
+        "必须保持 submitted，绝不能转 aborting/failed"
+    );
+    assert_eq!(
+        h.cancel1.load(Ordering::SeqCst),
+        0,
+        "绝不能 cancel 已确认的分支"
+    );
     assert_eq!(h.cancel2.load(Ordering::SeqCst), 0);
     assert!(h.confirm2.load(Ordering::SeqCst) >= 2, "confirm 要持续重试");
     assert!(g.next_cron_interval > 0, "要有退避间隔");
@@ -192,7 +204,9 @@ async fn tcc_没登记分支的空事务直接落终态() {
     let s = store().await;
     let d = Driver::new(s.clone(), "tc".into());
     s.create_global(&tcc_rows("tcc-4"), &[]).await.unwrap();
-    s.set_global_status("tcc-4", GlobalStatus::Submitted, "").await.unwrap();
+    s.set_global_status("tcc-4", GlobalStatus::Submitted, "")
+        .await
+        .unwrap();
     let g = s.get_global("tcc-4").await.unwrap().unwrap();
     d.process(&g).await.unwrap();
     assert_eq!(
@@ -219,7 +233,9 @@ async fn msg_正常提交后推进正向分支() {
     s.create_global(&g, &br).await.unwrap();
 
     // 客户端本地事务提交成功 → submit
-    s.set_global_status("msg-1", GlobalStatus::Submitted, "").await.unwrap();
+    s.set_global_status("msg-1", GlobalStatus::Submitted, "")
+        .await
+        .unwrap();
     let g = s.get_global("msg-1").await.unwrap().unwrap();
     d.process(&g).await.unwrap();
 
@@ -283,8 +299,16 @@ async fn msg_回查说没提交则整单作废() {
 
     let got = s.get_global("msg-3").await.unwrap().unwrap();
     assert_eq!(got.status, GlobalStatus::Failed);
-    assert!(got.rollback_reason.contains("未提交"), "要记下原因: {}", got.rollback_reason);
-    assert_eq!(h.action1.load(Ordering::SeqCst), 0, "作废了就不能发正向分支");
+    assert!(
+        got.rollback_reason.contains("未提交"),
+        "要记下原因: {}",
+        got.rollback_reason
+    );
+    assert_eq!(
+        h.action1.load(Ordering::SeqCst),
+        0,
+        "作废了就不能发正向分支"
+    );
 }
 
 #[tokio::test]
@@ -306,7 +330,11 @@ async fn msg_回查本身失败时不能当成没提交() {
     d.process(&g).await.unwrap();
 
     let got = s.get_global("msg-4").await.unwrap().unwrap();
-    assert_eq!(got.status, GlobalStatus::Prepared, "回查没结论就保持 prepared 重试");
+    assert_eq!(
+        got.status,
+        GlobalStatus::Prepared,
+        "回查没结论就保持 prepared 重试"
+    );
     assert!(got.next_cron_interval > 0);
     assert_eq!(h.action1.load(Ordering::SeqCst), 0);
 }
@@ -381,17 +409,26 @@ async fn xa_分支不可达时只重试不改方向() {
         "01",
         &[
             (BranchOp::Commit, "http://127.0.0.1:1/commit".to_string()),
-            (BranchOp::Rollback, "http://127.0.0.1:1/rollback".to_string()),
+            (
+                BranchOp::Rollback,
+                "http://127.0.0.1:1/rollback".to_string(),
+            ),
         ],
     )
     .await
     .unwrap();
-    s.set_global_status("xa-unreach", GlobalStatus::Submitted, "").await.unwrap();
+    s.set_global_status("xa-unreach", GlobalStatus::Submitted, "")
+        .await
+        .unwrap();
 
     let g = s.get_global("xa-unreach").await.unwrap().unwrap();
     d.process(&g).await.unwrap();
 
     let got = s.get_global("xa-unreach").await.unwrap().unwrap();
-    assert_eq!(got.status, GlobalStatus::Submitted, "调不通只能重试，不能转回滚");
+    assert_eq!(
+        got.status,
+        GlobalStatus::Submitted,
+        "调不通只能重试，不能转回滚"
+    );
     assert!(got.next_cron_interval > 0, "要设置退避间隔");
 }

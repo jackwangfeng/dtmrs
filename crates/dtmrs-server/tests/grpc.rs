@@ -163,7 +163,11 @@ async fn grpc分支正向提交() {
 
     let got = st.get_global("grpc-ok").await.unwrap().unwrap();
     assert_eq!(got.status, GlobalStatus::Succeed);
-    assert_eq!(busi.counts(), (1, 0, 1, 0), "两个正向各调一次，补偿不该被调");
+    assert_eq!(
+        busi.counts(),
+        (1, 0, 1, 0),
+        "两个正向各调一次，补偿不该被调"
+    );
 }
 
 #[tokio::test]
@@ -377,7 +381,9 @@ async fn grpc的错误映射到正确的状态码() {
 
     // 查不存在的 gid → NOT_FOUND
     let e = cli
-        .query(pb::QueryRequest { gid: "没这个".into() })
+        .query(pb::QueryRequest {
+            gid: "没这个".into(),
+        })
         .await
         .unwrap_err();
     assert_eq!(e.code(), tonic::Code::NotFound);
@@ -414,7 +420,9 @@ async fn grpc的错误映射到正确的状态码() {
         .await
         .unwrap();
     let e = cli
-        .abort(pb::AbortRequest { gid: "done-1".into() })
+        .abort(pb::AbortRequest {
+            gid: "done-1".into(),
+        })
         .await
         .unwrap_err();
     assert_eq!(e.code(), tonic::Code::FailedPrecondition);

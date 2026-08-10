@@ -94,12 +94,19 @@ impl Store {
         // SqliteConnectOptions 那样设 create_if_missing，只能走 URL 参数。
         let mut url = url.to_string();
         if url.starts_with("sqlite") && !url.contains("mode=") && !url.contains(":memory:") {
-            url.push_str(if url.contains('?') { "&mode=rwc" } else { "?mode=rwc" });
+            url.push_str(if url.contains('?') {
+                "&mode=rwc"
+            } else {
+                "?mode=rwc"
+            });
         }
         // 内存库必须单连接，否则每条连接看到的是各自独立的库
         let max = if url.contains(":memory:") { 1 } else { 8 };
         let be = Backend::from_url(&url);
-        let pool = AnyPoolOptions::new().max_connections(max).connect(&url).await?;
+        let pool = AnyPoolOptions::new()
+            .max_connections(max)
+            .connect(&url)
+            .await?;
         let s = Self { pool, be };
         s.migrate_racy().await?;
         Ok(s)
@@ -122,8 +129,7 @@ impl Store {
                 Err(e) => {
                     last = Some(e);
                     // 让对方把 DDL 事务提交完
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
-                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
                 }
             }
         }
@@ -139,7 +145,9 @@ impl Store {
         let mid = self.be.text(MID);
         // 索引二选一：MySQL 只能建表时内联，其它后端用独立的
         // CREATE INDEX IF NOT EXISTS（MySQL 那个语法直接 1064）
-        let inline = self.be.inline_index("idx_status_cron", "status, next_cron_time");
+        let inline = self
+            .be
+            .inline_index("idx_status_cron", "status, next_cron_time");
 
         sqlx::query(&format!(
             "CREATE TABLE IF NOT EXISTS trans_global (
@@ -161,9 +169,9 @@ impl Store {
         .execute(&self.pool)
         .await?;
         // cron 靠这个索引扫待办，没它到量之后会全表扫
-        if let Some(sql) = self
-            .be
-            .create_index("idx_status_cron", "trans_global", "status, next_cron_time")
+        if let Some(sql) =
+            self.be
+                .create_index("idx_status_cron", "trans_global", "status, next_cron_time")
         {
             sqlx::query(&sql).execute(&self.pool).await?;
         }
@@ -260,8 +268,10 @@ impl Store {
     }
 
     pub async fn list_branches(&self, gid: &str) -> Result<Vec<BranchRow>> {
-        let rows = sqlx::query(&self.be.q("SELECT gid,branch_id,op,url,payload,status FROM trans_branch_op
-             WHERE gid=? ORDER BY branch_id, op"))
+        let rows = sqlx::query(&self.be.q(
+            "SELECT gid,branch_id,op,url,payload,status FROM trans_branch_op
+             WHERE gid=? ORDER BY branch_id, op",
+        ))
         .bind(gid)
         .fetch_all(&self.pool)
         .await?;
@@ -293,9 +303,11 @@ impl Store {
         let reason: String = reason.chars().take(MID).collect();
         let reason = reason.as_str();
         // 注意 $4/$5 都绑 reason —— 不能复用同一个 $N，见文件头注释
-        sqlx::query(&self.be.q("UPDATE trans_global SET status=?, update_time=?, finish_time=?,
+        sqlx::query(&self.be.q(
+            "UPDATE trans_global SET status=?, update_time=?, finish_time=?,
              rollback_reason = CASE WHEN ? <> '' THEN ? ELSE rollback_reason END
-             WHERE gid=?"))
+             WHERE gid=?",
+        ))
         .bind(status.as_str())
         .bind(t)
         .bind(fin)
@@ -315,9 +327,13 @@ impl Store {
         status: BranchStatus,
     ) -> Result<()> {
         let t = now();
-        sqlx::query(&self.be.q("UPDATE trans_branch_op SET status=?, update_time=?,
+        sqlx::query(
+            &self
+                .be
+                .q("UPDATE trans_branch_op SET status=?, update_time=?,
              finish_time = CASE WHEN ? <> 'prepared' THEN ? ELSE finish_time END
-             WHERE gid=? AND branch_id=? AND op=?"))
+             WHERE gid=? AND branch_id=? AND op=?"),
+        )
         .bind(status.as_str())
         .bind(t)
         .bind(status.as_str())
@@ -350,8 +366,10 @@ impl Store {
             return Ok(None);
         };
         // 立刻把 next_cron_time 推到租约之后，等于占坑
-        let n = sqlx::query(&self.be.q("UPDATE trans_global SET owner=?, next_cron_time=?, update_time=?
-             WHERE gid=? AND next_cron_time <= ?"))
+        let n = sqlx::query(&self.be.q(
+            "UPDATE trans_global SET owner=?, next_cron_time=?, update_time=?
+             WHERE gid=? AND next_cron_time <= ?",
+        ))
         .bind(owner)
         .bind(t + lease)
         .bind(t)
@@ -375,8 +393,10 @@ impl Store {
     /// 推进失败后设置下次重试时间（指数退避）
     pub async fn schedule_retry(&self, gid: &str, interval: i64) -> Result<()> {
         let t = now();
-        sqlx::query(&self.be.q("UPDATE trans_global SET next_cron_interval=?, next_cron_time=?, update_time=?
-             WHERE gid=?"))
+        sqlx::query(&self.be.q(
+            "UPDATE trans_global SET next_cron_interval=?, next_cron_time=?, update_time=?
+             WHERE gid=?",
+        ))
         .bind(interval)
         .bind(t + interval)
         .bind(t)
@@ -388,7 +408,11 @@ impl Store {
 
     /// 让某个事务立刻可被调度（提交/中止之后叫一下，不用等 cron 周期）
     pub async fn schedule_now(&self, gid: &str) -> Result<()> {
-        sqlx::query(&self.be.q("UPDATE trans_global SET next_cron_time=?, next_cron_interval=0 WHERE gid=?"))
+        sqlx::query(
+            &self
+                .be
+                .q("UPDATE trans_global SET next_cron_time=?, next_cron_interval=0 WHERE gid=?"),
+        )
         .bind(now())
         .bind(gid)
         .execute(&self.pool)
@@ -486,13 +510,18 @@ mod tests {
     ///
     /// 每次进来把 Postgres 的表清空（只 DELETE 不 DDL —— 并发 DDL 会撞上
     /// Postgres 的 `pg_type` 竞态，见 `migrate_racy`）。
-    async fn backends() -> (tokio::sync::MutexGuard<'static, ()>, Vec<(&'static str, Store)>) {
+    async fn backends() -> (
+        tokio::sync::MutexGuard<'static, ()>,
+        Vec<(&'static str, Store)>,
+    ) {
         let guard = PG_LOCK.lock().await;
         let mut v = vec![("sqlite", Store::open("sqlite::memory:").await.unwrap())];
         // 每种真数据库都配一个环境变量。**没配就是没测**，不是"通过"。
         for (name, env) in [("postgres", "DTMRS_TEST_PG"), ("mysql", "DTMRS_TEST_MYSQL")] {
             if let Ok(url) = std::env::var(env) {
-                let s = Store::open(&url).await.unwrap_or_else(|e| panic!("连不上 {env}: {e}"));
+                let s = Store::open(&url)
+                    .await
+                    .unwrap_or_else(|e| panic!("连不上 {env}: {e}"));
                 for t in ["trans_branch_op", "trans_global"] {
                     sqlx::query(&format!("DELETE FROM {t}"))
                         .execute(s.pool())
@@ -550,7 +579,9 @@ mod tests {
         let (_g, bes) = backends().await;
         for (name, s) in bes {
             s.create_global(&g("t3"), &[]).await.unwrap();
-            s.set_global_status("t3", GlobalStatus::Succeed, "").await.unwrap();
+            s.set_global_status("t3", GlobalStatus::Succeed, "")
+                .await
+                .unwrap();
             assert!(s.lock_one_due("w", 60).await.unwrap().is_none(), "{name}");
             let got = s.get_global("t3").await.unwrap().unwrap();
             assert_eq!(got.status, GlobalStatus::Succeed, "{name}");
@@ -570,7 +601,9 @@ mod tests {
                 payload: "{}".into(),
                 status: BranchStatus::Prepared,
             };
-            s.create_global(&g("t4"), std::slice::from_ref(&b)).await.unwrap();
+            s.create_global(&g("t4"), std::slice::from_ref(&b))
+                .await
+                .unwrap();
             s.set_branch_status("t4", "01", BranchOp::Action, BranchStatus::Succeed)
                 .await
                 .unwrap();
@@ -594,12 +627,20 @@ mod tests {
             let got = s.get_global("t5").await.unwrap().unwrap();
             assert_eq!(got.query_prepared, "http://busi/query", "{name}");
             assert_eq!(got.rollback_reason, "分支 02 返回 FAILURE", "{name}");
-            assert!(got.finish_time.is_none(), "{name}: 非终态不该有 finish_time");
+            assert!(
+                got.finish_time.is_none(),
+                "{name}: 非终态不该有 finish_time"
+            );
 
             // 空 reason 不能把已有的原因冲掉
-            s.set_global_status("t5", GlobalStatus::Failed, "").await.unwrap();
+            s.set_global_status("t5", GlobalStatus::Failed, "")
+                .await
+                .unwrap();
             let got = s.get_global("t5").await.unwrap().unwrap();
-            assert_eq!(got.rollback_reason, "分支 02 返回 FAILURE", "{name}: 空原因不能覆盖");
+            assert_eq!(
+                got.rollback_reason, "分支 02 返回 FAILURE",
+                "{name}: 空原因不能覆盖"
+            );
         }
     }
 
@@ -617,7 +658,11 @@ mod tests {
             s.create_global(&t, &[]).await.unwrap();
 
             let got = s.lock_one_due("w", 60).await.unwrap();
-            assert_eq!(got.map(|x| x.gid), Some("m1".to_string()), "{name}: 只该捞到 msg");
+            assert_eq!(
+                got.map(|x| x.gid),
+                Some("m1".to_string()),
+                "{name}: 只该捞到 msg"
+            );
             // 再捞一次应该没有了（msg 被租约占住，tcc 不该被碰）
             assert!(s.lock_one_due("w2", 60).await.unwrap().is_none(), "{name}");
         }
@@ -636,7 +681,11 @@ mod tests {
             ];
             s.register_branch("c2", "01", &ops).await.unwrap();
             s.register_branch("c2", "01", &ops).await.unwrap(); // 客户端重试
-            assert_eq!(s.list_branches("c2").await.unwrap().len(), 2, "{name}: 不该重复插入");
+            assert_eq!(
+                s.list_branches("c2").await.unwrap().len(),
+                2,
+                "{name}: 不该重复插入"
+            );
         }
     }
 }

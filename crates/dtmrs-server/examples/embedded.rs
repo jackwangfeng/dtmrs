@@ -43,7 +43,10 @@ async fn main() -> anyhow::Result<()> {
         .step("local://发货", "local://发货撤销")
         .submit()
         .await?;
-    println!("  结果: {:?}", tc.wait_final("order-1", Duration::from_secs(5)).await?);
+    println!(
+        "  结果: {:?}",
+        tc.wait_final("order-1", Duration::from_secs(5)).await?
+    );
 
     println!("\n② 库存不足（第 2 步要求回滚，应逆序补偿）");
     tc.saga("order-2")
@@ -51,7 +54,10 @@ async fn main() -> anyhow::Result<()> {
         .step("local://库存不足", "local://发货撤销")
         .submit()
         .await?;
-    println!("  结果: {:?}", tc.wait_final("order-2", Duration::from_secs(5)).await?);
+    println!(
+        "  结果: {:?}",
+        tc.wait_final("order-2", Duration::from_secs(5)).await?
+    );
 
     println!("\n③ 漏注册的 handler 会在提交时就被拦住");
     match tc

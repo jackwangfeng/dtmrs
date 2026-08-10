@@ -275,7 +275,10 @@ pub fn saga_advance(
                 match st {
                     BranchStatus::Succeed => continue,
                     BranchStatus::Prepared => {
-                        return Advance::Call { index: i, op: BranchOp::Action }
+                        return Advance::Call {
+                            index: i,
+                            op: BranchOp::Action,
+                        }
                     }
                     // 有分支被判失败，本该已经转 aborting；防御性处理
                     BranchStatus::Failed => return Advance::Finish(GlobalStatus::Aborting),
@@ -288,7 +291,10 @@ pub fn saga_advance(
             // action 超时但实际成功的情况必须靠补偿兜住，多余的补偿由屏障空转掉。
             for i in (0..compensates.len()).rev() {
                 if compensates[i] == BranchStatus::Prepared {
-                    return Advance::Call { index: i, op: BranchOp::Compensate };
+                    return Advance::Call {
+                        index: i,
+                        op: BranchOp::Compensate,
+                    };
                 }
             }
             Advance::Finish(GlobalStatus::Failed)
@@ -347,9 +353,21 @@ mod tests {
             assert_eq!(BranchResult::from_grpc(code), want, "gRPC 码 {code} 判错了");
         }
         // 几个最容易写错的，单独钉一遍
-        assert_eq!(BranchResult::from_grpc(1), BranchResult::Unknown, "CANCELLED 是我们自己放弃，不是对方拒绝");
-        assert_eq!(BranchResult::from_grpc(4), BranchResult::Unknown, "DEADLINE_EXCEEDED 绝不能当失败");
-        assert_eq!(BranchResult::from_grpc(14), BranchResult::Unknown, "UNAVAILABLE 绝不能当失败");
+        assert_eq!(
+            BranchResult::from_grpc(1),
+            BranchResult::Unknown,
+            "CANCELLED 是我们自己放弃，不是对方拒绝"
+        );
+        assert_eq!(
+            BranchResult::from_grpc(4),
+            BranchResult::Unknown,
+            "DEADLINE_EXCEEDED 绝不能当失败"
+        );
+        assert_eq!(
+            BranchResult::from_grpc(14),
+            BranchResult::Unknown,
+            "UNAVAILABLE 绝不能当失败"
+        );
         // 不认识的码（未来扩展 / 对方乱返）也必须是 Unknown
         assert_eq!(BranchResult::from_grpc(99), BranchResult::Unknown);
         assert_eq!(BranchResult::from_grpc(-1), BranchResult::Unknown);
@@ -374,12 +392,18 @@ mod tests {
         let c = [Prepared, Prepared];
         assert_eq!(
             saga_advance(GlobalStatus::Submitted, &a, &c),
-            Advance::Call { index: 0, op: BranchOp::Action }
+            Advance::Call {
+                index: 0,
+                op: BranchOp::Action
+            }
         );
         let a = [Succeed, Prepared];
         assert_eq!(
             saga_advance(GlobalStatus::Submitted, &a, &c),
-            Advance::Call { index: 1, op: BranchOp::Action }
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Action
+            }
         );
         let a = [Succeed, Succeed];
         assert_eq!(
@@ -395,12 +419,18 @@ mod tests {
         // 先补第 1 步（后执行的先回滚）
         assert_eq!(
             saga_advance(GlobalStatus::Aborting, &a, &c),
-            Advance::Call { index: 1, op: BranchOp::Compensate }
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Compensate
+            }
         );
         let c = [Prepared, Succeed];
         assert_eq!(
             saga_advance(GlobalStatus::Aborting, &a, &c),
-            Advance::Call { index: 0, op: BranchOp::Compensate }
+            Advance::Call {
+                index: 0,
+                op: BranchOp::Compensate
+            }
         );
         let c = [Succeed, Succeed];
         assert_eq!(
@@ -417,7 +447,10 @@ mod tests {
         let c = [Prepared, Prepared];
         assert_eq!(
             saga_advance(GlobalStatus::Aborting, &a, &c),
-            Advance::Call { index: 1, op: BranchOp::Compensate }
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Compensate
+            }
         );
     }
 
@@ -475,7 +508,10 @@ pub fn tcc_advance(
                     BranchStatus::Succeed => continue,
                     // Failed 也要继续重试 —— 见上面注释，绝不转 aborting
                     BranchStatus::Prepared | BranchStatus::Failed => {
-                        return Advance::Call { index: i, op: BranchOp::Confirm }
+                        return Advance::Call {
+                            index: i,
+                            op: BranchOp::Confirm,
+                        }
                     }
                 }
             }
@@ -485,7 +521,10 @@ pub fn tcc_advance(
             // 逆序 cancel。全部 cancel，空回滚由屏障负责
             for i in (0..cancels.len()).rev() {
                 if cancels[i] != BranchStatus::Succeed {
-                    return Advance::Call { index: i, op: BranchOp::Cancel };
+                    return Advance::Call {
+                        index: i,
+                        op: BranchOp::Cancel,
+                    };
                 }
             }
             Advance::Finish(GlobalStatus::Failed)
@@ -514,7 +553,10 @@ pub fn msg_advance(status: GlobalStatus, actions: &[BranchStatus]) -> Advance {
         GlobalStatus::Submitted => {
             for (i, st) in actions.iter().enumerate() {
                 if *st != BranchStatus::Succeed {
-                    return Advance::Call { index: i, op: BranchOp::Action };
+                    return Advance::Call {
+                        index: i,
+                        op: BranchOp::Action,
+                    };
                 }
             }
             Advance::Finish(GlobalStatus::Succeed)
@@ -544,11 +586,17 @@ mod tcc_msg_tests {
         let x = [Prepared, Prepared];
         assert_eq!(
             tcc_advance(GlobalStatus::Submitted, &c, &x),
-            Advance::Call { index: 0, op: BranchOp::Confirm }
+            Advance::Call {
+                index: 0,
+                op: BranchOp::Confirm
+            }
         );
         assert_eq!(
             tcc_advance(GlobalStatus::Submitted, &[Succeed, Prepared], &x),
-            Advance::Call { index: 1, op: BranchOp::Confirm }
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Confirm
+            }
         );
         assert_eq!(
             tcc_advance(GlobalStatus::Submitted, &[Succeed, Succeed], &x),
@@ -564,7 +612,10 @@ mod tcc_msg_tests {
         let x = [Prepared, Prepared];
         assert_eq!(
             tcc_advance(GlobalStatus::Submitted, &c, &x),
-            Advance::Call { index: 1, op: BranchOp::Confirm },
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Confirm
+            },
             "confirm 失败要继续重试 confirm，不能转 cancel"
         );
         // 穷举：Submitted 阶段永远不会返回 Aborting
@@ -582,11 +633,17 @@ mod tcc_msg_tests {
         let c = [Prepared, Prepared];
         assert_eq!(
             tcc_advance(GlobalStatus::Aborting, &c, &[Prepared, Prepared]),
-            Advance::Call { index: 1, op: BranchOp::Cancel }
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Cancel
+            }
         );
         assert_eq!(
             tcc_advance(GlobalStatus::Aborting, &c, &[Prepared, Succeed]),
-            Advance::Call { index: 0, op: BranchOp::Cancel }
+            Advance::Call {
+                index: 0,
+                op: BranchOp::Cancel
+            }
         );
         assert_eq!(
             tcc_advance(GlobalStatus::Aborting, &c, &[Succeed, Succeed]),
@@ -595,25 +652,37 @@ mod tcc_msg_tests {
         // cancel 失败也要重试，不能就这么算了
         assert_eq!(
             tcc_advance(GlobalStatus::Aborting, &c, &[Succeed, Failed]),
-            Advance::Call { index: 1, op: BranchOp::Cancel }
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Cancel
+            }
         );
     }
 
     #[test]
     fn msg等回查而不是自己推() {
-        assert_eq!(msg_advance(GlobalStatus::Prepared, &[Prepared]), Advance::Wait);
+        assert_eq!(
+            msg_advance(GlobalStatus::Prepared, &[Prepared]),
+            Advance::Wait
+        );
     }
 
     #[test]
     fn msg只往前不补偿() {
         assert_eq!(
             msg_advance(GlobalStatus::Submitted, &[Prepared, Prepared]),
-            Advance::Call { index: 0, op: BranchOp::Action }
+            Advance::Call {
+                index: 0,
+                op: BranchOp::Action
+            }
         );
         // 分支失败也只能重试 —— msg 没有补偿分支
         assert_eq!(
             msg_advance(GlobalStatus::Submitted, &[Failed]),
-            Advance::Call { index: 0, op: BranchOp::Action }
+            Advance::Call {
+                index: 0,
+                op: BranchOp::Action
+            }
         );
         assert_eq!(
             msg_advance(GlobalStatus::Submitted, &[Succeed, Succeed]),
@@ -654,7 +723,10 @@ pub fn xa_advance(
         GlobalStatus::Submitted => {
             for (i, st) in commits.iter().enumerate() {
                 if *st != BranchStatus::Succeed {
-                    return Advance::Call { index: i, op: BranchOp::Commit };
+                    return Advance::Call {
+                        index: i,
+                        op: BranchOp::Commit,
+                    };
                 }
             }
             Advance::Finish(GlobalStatus::Succeed)
@@ -662,7 +734,10 @@ pub fn xa_advance(
         GlobalStatus::Aborting => {
             for i in (0..rollbacks.len()).rev() {
                 if rollbacks[i] != BranchStatus::Succeed {
-                    return Advance::Call { index: i, op: BranchOp::Rollback };
+                    return Advance::Call {
+                        index: i,
+                        op: BranchOp::Rollback,
+                    };
                 }
             }
             Advance::Finish(GlobalStatus::Failed)
@@ -690,11 +765,17 @@ mod xa_tests {
         let r = [Prepared, Prepared];
         assert_eq!(
             xa_advance(GlobalStatus::Submitted, &[Prepared, Prepared], &r),
-            Advance::Call { index: 0, op: BranchOp::Commit }
+            Advance::Call {
+                index: 0,
+                op: BranchOp::Commit
+            }
         );
         assert_eq!(
             xa_advance(GlobalStatus::Submitted, &[Succeed, Prepared], &r),
-            Advance::Call { index: 1, op: BranchOp::Commit }
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Commit
+            }
         );
         assert_eq!(
             xa_advance(GlobalStatus::Submitted, &[Succeed, Succeed], &r),
@@ -708,7 +789,10 @@ mod xa_tests {
         let r = [Prepared, Prepared];
         assert_eq!(
             xa_advance(GlobalStatus::Submitted, &[Succeed, Failed], &r),
-            Advance::Call { index: 1, op: BranchOp::Commit },
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Commit
+            },
             "commit 失败要继续重试 commit"
         );
         // 穷举：Submitted 阶段永远不会走向回滚或失败
@@ -726,7 +810,10 @@ mod xa_tests {
         let c = [Prepared, Prepared];
         assert_eq!(
             xa_advance(GlobalStatus::Aborting, &c, &[Prepared, Prepared]),
-            Advance::Call { index: 1, op: BranchOp::Rollback }
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Rollback
+            }
         );
         assert_eq!(
             xa_advance(GlobalStatus::Aborting, &c, &[Succeed, Succeed]),
@@ -735,7 +822,10 @@ mod xa_tests {
         // rollback 失败也不能就这么算了 —— 那会留下永久持锁的 prepared 事务
         assert_eq!(
             xa_advance(GlobalStatus::Aborting, &c, &[Succeed, Failed]),
-            Advance::Call { index: 1, op: BranchOp::Rollback }
+            Advance::Call {
+                index: 1,
+                op: BranchOp::Rollback
+            }
         );
     }
 

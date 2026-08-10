@@ -48,11 +48,18 @@ impl pb::tc_server::Tc for TcService {
         }))
     }
 
-    async fn prepare(&self, req: Request<pb::PrepareRequest>) -> Result<Response<pb::Empty>, Status> {
+    async fn prepare(
+        &self,
+        req: Request<pb::PrepareRequest>,
+    ) -> Result<Response<pb::Empty>, Status> {
         let r = req.into_inner();
         // proto3 的 int64 没法区分「没传」和「传了 0」，所以用 0 表示走默认值。
         // 宽限期本来也不该是 0 —— 那等于 prepare 完立刻回查，白问一次
-        let grace = if r.grace_secs > 0 { Some(r.grace_secs) } else { None };
+        let grace = if r.grace_secs > 0 {
+            Some(r.grace_secs)
+        } else {
+            None
+        };
         self.api
             .prepare(&r.gid, &r.trans_type, &r.actions, &r.query_prepared, grace)
             .await?;
@@ -80,7 +87,11 @@ impl pb::tc_server::Tc for TcService {
 
     async fn submit(&self, req: Request<pb::SubmitRequest>) -> Result<Response<pb::Empty>, Status> {
         let r = req.into_inner();
-        let tt = if r.trans_type.is_empty() { "saga" } else { &r.trans_type };
+        let tt = if r.trans_type.is_empty() {
+            "saga"
+        } else {
+            &r.trans_type
+        };
         let steps: Vec<SagaStep> = r
             .steps
             .into_iter()
@@ -98,7 +109,10 @@ impl pb::tc_server::Tc for TcService {
         Ok(Response::new(pb::Empty {}))
     }
 
-    async fn query(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::TransView>, Status> {
+    async fn query(
+        &self,
+        req: Request<pb::QueryRequest>,
+    ) -> Result<Response<pb::TransView>, Status> {
         let v = self.api.query(&req.into_inner().gid).await?;
         Ok(Response::new(pb::TransView {
             gid: v.gid,

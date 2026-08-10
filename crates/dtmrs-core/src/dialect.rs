@@ -214,15 +214,15 @@ mod tests {
     fn 从url认后端() {
         assert_eq!(Backend::from_url("sqlite::memory:"), Backend::Sqlite);
         assert_eq!(Backend::from_url("sqlite:/tmp/a.db"), Backend::Sqlite);
-        assert_eq!(
-            Backend::from_url("postgres://u:p@h/db"),
-            Backend::Postgres
-        );
+        assert_eq!(Backend::from_url("postgres://u:p@h/db"), Backend::Postgres);
         assert_eq!(
             Backend::from_url("postgresql://u:p@h/db"),
             Backend::Postgres
         );
-        assert_eq!(Backend::from_url("mysql://root:x@h:3306/db"), Backend::MySql);
+        assert_eq!(
+            Backend::from_url("mysql://root:x@h:3306/db"),
+            Backend::MySql
+        );
         assert_eq!(Backend::from_url("MySQL://ROOT@H/DB"), Backend::MySql);
         assert_eq!(Backend::from_url("mariadb://root@h/db"), Backend::MySql);
     }
@@ -249,10 +249,7 @@ mod tests {
             Backend::Postgres.q(t),
             "INSERT INTO t (k) VALUES ($1) ON CONFLICT DO NOTHING"
         );
-        assert_eq!(
-            Backend::MySql.q(t),
-            "INSERT IGNORE INTO t (k) VALUES (?) "
-        );
+        assert_eq!(Backend::MySql.q(t), "INSERT IGNORE INTO t (k) VALUES (?) ");
     }
 
     #[test]

@@ -83,7 +83,10 @@ async fn 进程内分支全成功() {
         .await
         .unwrap();
 
-    let s = tc.wait_final("emb-happy", Duration::from_secs(5)).await.unwrap();
+    let s = tc
+        .wait_final("emb-happy", Duration::from_secs(5))
+        .await
+        .unwrap();
     assert_eq!(s, GlobalStatus::Succeed);
     let (a1, cc1, a2, cc2) = c.get();
     assert_eq!((a1, a2), (1, 1), "两步各调一次");
@@ -133,7 +136,10 @@ async fn 进程内分支失败触发逆序补偿() {
         .await
         .unwrap();
 
-    let s = tc.wait_final("emb-rb", Duration::from_secs(5)).await.unwrap();
+    let s = tc
+        .wait_final("emb-rb", Duration::from_secs(5))
+        .await
+        .unwrap();
     assert_eq!(s, GlobalStatus::Failed);
     let (_, cc1, _, cc2) = c.get();
     assert_eq!((cc1, cc2), (1, 1), "两步都要补偿");
@@ -300,7 +306,10 @@ async fn 本地分支与远端http可以混用() {
         .await
         .unwrap();
 
-    let s = tc.wait_final("emb-mixed", Duration::from_secs(10)).await.unwrap();
+    let s = tc
+        .wait_final("emb-mixed", Duration::from_secs(10))
+        .await
+        .unwrap();
     assert_eq!(s, GlobalStatus::Succeed);
     assert_eq!(local_hits.load(Ordering::SeqCst), 1, "本地分支被调用");
     assert_eq!(hits.load(Ordering::SeqCst), 1, "远端分支被调用");

@@ -155,13 +155,19 @@ mod tests {
 
     #[test]
     fn 前缀区分本地与远端() {
-        assert_eq!(parse_target("local://deduct"), Target::Local("deduct".into()));
+        assert_eq!(
+            parse_target("local://deduct"),
+            Target::Local("deduct".into())
+        );
         assert_eq!(
             parse_target("http://busi/deduct"),
             Target::Http("http://busi/deduct".into())
         );
         // 没前缀就当 http，保持跟 DTM 的兼容
-        assert_eq!(parse_target("https://a/b"), Target::Http("https://a/b".into()));
+        assert_eq!(
+            parse_target("https://a/b"),
+            Target::Http("https://a/b".into())
+        );
     }
 
     #[test]

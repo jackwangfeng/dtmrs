@@ -91,8 +91,14 @@ async fn spawn_busi(busi: Arc<Busi>, a2_mode: &'static str) -> String {
 
 fn steps(base: &str) -> Vec<SagaStep> {
     vec![
-        SagaStep { action: format!("{base}/a1"), compensate: format!("{base}/c1") },
-        SagaStep { action: format!("{base}/a2"), compensate: format!("{base}/c2") },
+        SagaStep {
+            action: format!("{base}/a1"),
+            compensate: format!("{base}/c1"),
+        },
+        SagaStep {
+            action: format!("{base}/a2"),
+            compensate: format!("{base}/c2"),
+        },
     ]
 }
 
@@ -157,7 +163,11 @@ async fn 超时不能触发回滚而要重试() {
     let g = store.get_global("flaky").await.unwrap().unwrap();
     driver.process(&g).await.unwrap();
     let got = store.get_global("flaky").await.unwrap().unwrap();
-    assert_eq!(got.status, GlobalStatus::Submitted, "500 不能让事务转 aborting");
+    assert_eq!(
+        got.status,
+        GlobalStatus::Submitted,
+        "500 不能让事务转 aborting"
+    );
     assert_eq!(busi.counts().1, 0, "结果未知时绝不能调补偿");
     assert!(got.next_cron_interval > 0, "要设置退避间隔");
 

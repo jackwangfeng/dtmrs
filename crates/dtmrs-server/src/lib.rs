@@ -68,7 +68,10 @@ pub fn msg_rows(
     // 用 SagaStep 复用 payload 格式，compensate 留空（msg 没有补偿）
     let steps: Vec<SagaStep> = actions
         .iter()
-        .map(|a| SagaStep { action: a.clone(), compensate: String::new() })
+        .map(|a| SagaStep {
+            action: a.clone(),
+            compensate: String::new(),
+        })
         .collect();
     let payload = serde_json::to_string(&steps).unwrap_or_else(|_| "[]".into());
     let mut g = global(gid, TransType::Msg, GlobalStatus::Prepared, payload);

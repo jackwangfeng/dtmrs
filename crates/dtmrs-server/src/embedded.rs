@@ -84,7 +84,11 @@ impl EmbeddedBuilder {
         let driver = Driver::new(store.clone(), self.owner).with_registry(registry.clone());
         // 常驻推进器。重启后未终结的事务会被它自动捞起继续推 —— 崩溃恢复就靠这个
         let task = tokio::spawn(driver.clone().run_forever(self.tick));
-        Ok(Embedded { store, registry, task: Some(task) })
+        Ok(Embedded {
+            store,
+            registry,
+            task: Some(task),
+        })
     }
 }
 
@@ -105,7 +109,11 @@ impl Embedded {
     }
 
     pub fn saga(&self, gid: &str) -> SagaBuilder<'_> {
-        SagaBuilder { tc: self, gid: gid.to_string(), steps: Vec::new() }
+        SagaBuilder {
+            tc: self,
+            gid: gid.to_string(),
+            steps: Vec::new(),
+        }
     }
 
     pub async fn status(&self, gid: &str) -> anyhow::Result<Option<GlobalStatus>> {
@@ -114,11 +122,7 @@ impl Embedded {
 
     /// 等到事务落终态。**只是为了测试和"同步等结果"的场景方便** ——
     /// 生产上事务是异步推进的，别在请求路径里等。
-    pub async fn wait_final(
-        &self,
-        gid: &str,
-        timeout: Duration,
-    ) -> anyhow::Result<GlobalStatus> {
+    pub async fn wait_final(&self, gid: &str, timeout: Duration) -> anyhow::Result<GlobalStatus> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(s) = self.status(gid).await? {

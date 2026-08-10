@@ -88,8 +88,8 @@ impl BranchBarrier {
         check_len("gid", gid, Backend::ID_MAX)?;
         check_len("branch_id", branch_id, Backend::ID_MAX)?;
         check_len("trans_type", trans_type, Backend::ID_SHORT_MAX)?;
-        let op = BranchOp::parse(op)
-            .ok_or_else(|| Error::InvalidTransInfo(format!("未知 op: {op}")))?;
+        let op =
+            BranchOp::parse(op).ok_or_else(|| Error::InvalidTransInfo(format!("未知 op: {op}")))?;
         Ok(Self {
             trans_type: trans_type.into(),
             gid: gid.into(),
@@ -165,12 +165,7 @@ impl BranchBarrier {
         Ok(Decision::Execute)
     }
 
-    async fn insert(
-        &self,
-        tx: &mut Transaction<'_, Any>,
-        op: &str,
-        bid: &str,
-    ) -> Result<u64> {
+    async fn insert(&self, tx: &mut Transaction<'_, Any>, op: &str, bid: &str) -> Result<u64> {
         // 三种数据库的"冲突就忽略"写法和占位符都不一样，交给方言层渲染。
         // 关键是**冲突时 rows_affected 必须是 0** —— 整个屏障算法就靠这个
         // 返回值判空回滚和重复请求。三家实测都满足（MySQL 用 INSERT IGNORE；
@@ -207,13 +202,16 @@ mod tests {
     use super::*;
     use sqlx::any::AnyPoolOptions;
 
-        /// 真库测试必须串行：屏障表是共享的，每个测试开头会清表，
+    /// 真库测试必须串行：屏障表是共享的，每个测试开头会清表，
     /// 并行跑就会把别人的行清掉。（gid 各不相同还不够 —— 清表是全表的。）
     static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// 屏障也要在多种后端上验 —— 业务库是 pg 的话，屏障表就在 pg 里。
     /// 配了 DTMRS_TEST_PG 就多跑一遍真 postgres。
-    async fn pools() -> (tokio::sync::MutexGuard<'static, ()>, Vec<(&'static str, AnyPool, Backend)>) {
+    async fn pools() -> (
+        tokio::sync::MutexGuard<'static, ()>,
+        Vec<(&'static str, AnyPool, Backend)>,
+    ) {
         let guard = DB_LOCK.lock().await;
         sqlx::any::install_default_drivers();
         let mem = AnyPoolOptions::new()
@@ -227,11 +225,18 @@ mod tests {
         for (name, env) in [("postgres", "DTMRS_TEST_PG"), ("mysql", "DTMRS_TEST_MYSQL")] {
             if let Ok(url) = std::env::var(env) {
                 let be = Backend::from_url(&url);
-                let p = AnyPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+                let p = AnyPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&url)
+                    .await
+                    .unwrap();
                 // 建表 + 清表只做一次：每个测试各自 DROP+CREATE 会撞上
                 // Postgres 的 DDL 并发竞态。各测试的 gid 本来就不重叠。
                 BranchBarrier::migrate(&p, be).await.expect("建表");
-                sqlx::query("DELETE FROM barrier").execute(&p).await.expect("清表");
+                sqlx::query("DELETE FROM barrier")
+                    .execute(&p)
+                    .await
+                    .expect("清表");
                 v.push((name, p, be));
             }
         }
@@ -252,10 +257,18 @@ mod tests {
         let (_g, backends) = pools().await;
         for (name, p, be) in backends {
             let _ = name;
-        
-            assert_eq!(once(&p, be, "g1", "01", "action").await, Decision::Execute, "{be}");
+
+            assert_eq!(
+                once(&p, be, "g1", "01", "action").await,
+                Decision::Execute,
+                "{be}"
+            );
             // TC 重试 —— 必须被挡住
-            assert_eq!(once(&p, be, "g1", "01", "action").await, Decision::Duplicated, "{be}");
+            assert_eq!(
+                once(&p, be, "g1", "01", "action").await,
+                Decision::Duplicated,
+                "{be}"
+            );
         }
     }
 
@@ -264,11 +277,12 @@ mod tests {
         let (_g, backends) = pools().await;
         for (name, p, be) in backends {
             let _ = name;
-        
+
             // action 从没来过，直接来 compensate
             assert_eq!(
                 once(&p, be, "g2", "01", "compensate").await,
-                Decision::NullCompensation, "{be}"
+                Decision::NullCompensation,
+                "{be}"
             );
         }
     }
@@ -278,9 +292,17 @@ mod tests {
         let (_g, backends) = pools().await;
         for (name, p, be) in backends {
             let _ = name;
-        
-            assert_eq!(once(&p, be, "g3", "01", "action").await, Decision::Execute, "{be}");
-            assert_eq!(once(&p, be, "g3", "01", "compensate").await, Decision::Execute, "{be}");
+
+            assert_eq!(
+                once(&p, be, "g3", "01", "action").await,
+                Decision::Execute,
+                "{be}"
+            );
+            assert_eq!(
+                once(&p, be, "g3", "01", "compensate").await,
+                Decision::Execute,
+                "{be}"
+            );
         }
     }
 
@@ -289,14 +311,19 @@ mod tests {
         let (_g, backends) = pools().await;
         for (name, p, be) in backends {
             let _ = name;
-        
+
             // 补偿先到（网络乱序），空回滚
             assert_eq!(
                 once(&p, be, "g4", "01", "compensate").await,
-                Decision::NullCompensation, "{be}"
+                Decision::NullCompensation,
+                "{be}"
             );
             // 晚到的 action 如果执行了，钱就扣出去再也回不来了 —— 必须丢弃
-            assert_eq!(once(&p, be, "g4", "01", "action").await, Decision::Duplicated, "{be}");
+            assert_eq!(
+                once(&p, be, "g4", "01", "action").await,
+                Decision::Duplicated,
+                "{be}"
+            );
         }
     }
 
@@ -305,9 +332,13 @@ mod tests {
         let (_g, backends) = pools().await;
         for (name, p, be) in backends {
             let _ = name;
-        
+
             once(&p, be, "g5", "01", "action").await;
-            assert_eq!(once(&p, be, "g5", "01", "compensate").await, Decision::Execute, "{be}");
+            assert_eq!(
+                once(&p, be, "g5", "01", "compensate").await,
+                Decision::Execute,
+                "{be}"
+            );
             assert_eq!(
                 once(&p, be, "g5", "01", "compensate").await,
                 Decision::Duplicated
@@ -320,12 +351,28 @@ mod tests {
         let (_g, backends) = pools().await;
         for (name, p, be) in backends {
             let _ = name;
-        
-            assert_eq!(once(&p, be, "g6", "01", "action").await, Decision::Execute, "{be}");
-            assert_eq!(once(&p, be, "g6", "02", "action").await, Decision::Execute, "{be}");
+
+            assert_eq!(
+                once(&p, be, "g6", "01", "action").await,
+                Decision::Execute,
+                "{be}"
+            );
+            assert_eq!(
+                once(&p, be, "g6", "02", "action").await,
+                Decision::Execute,
+                "{be}"
+            );
             // 补 02 不影响 01
-            assert_eq!(once(&p, be, "g6", "02", "compensate").await, Decision::Execute, "{be}");
-            assert_eq!(once(&p, be, "g6", "01", "compensate").await, Decision::Execute, "{be}");
+            assert_eq!(
+                once(&p, be, "g6", "02", "compensate").await,
+                Decision::Execute,
+                "{be}"
+            );
+            assert_eq!(
+                once(&p, be, "g6", "01", "compensate").await,
+                Decision::Execute,
+                "{be}"
+            );
         }
     }
 
@@ -334,7 +381,7 @@ mod tests {
         let (_g, backends) = pools().await;
         for (name, p, be) in backends {
             let _ = name;
-        
+
             // try 没跑过 → cancel 空回滚
             assert_eq!(
                 once(&p, be, "g7", "01", "cancel").await,
@@ -342,8 +389,16 @@ mod tests {
                 "{be}"
             );
             // try 跑过了 → cancel 要真执行（换个 gid，别跟上面那条混）
-            assert_eq!(once(&p, be, "g8", "01", "try").await, Decision::Execute, "{be}");
-            assert_eq!(once(&p, be, "g8", "01", "cancel").await, Decision::Execute, "{be}");
+            assert_eq!(
+                once(&p, be, "g8", "01", "try").await,
+                Decision::Execute,
+                "{be}"
+            );
+            assert_eq!(
+                once(&p, be, "g8", "01", "cancel").await,
+                Decision::Execute,
+                "{be}"
+            );
         }
     }
 
@@ -352,7 +407,7 @@ mod tests {
         let (_g, backends) = pools().await;
         for (name, p, be) in backends {
             let _ = name;
-        
+
             let mut bb = BranchBarrier::new(be, "saga", "g9", "01", "action").unwrap();
             let mut tx = p.begin().await.unwrap();
             // 一个分支内连续两次判定，第二次不该被当成重复
@@ -367,13 +422,17 @@ mod tests {
         let (_g, backends) = pools().await;
         for (name, p, be) in backends {
             let _ = name;
-        
+
             let mut bb = BranchBarrier::new(be, "saga", "g10", "01", "action").unwrap();
             let mut tx = p.begin().await.unwrap();
             assert_eq!(bb.decide(&mut tx).await.unwrap(), Decision::Execute, "{be}");
             tx.rollback().await.unwrap(); // 业务 SQL 失败，整个事务回滚
-            // 屏障记录也跟着没了，所以重试还能再执行 —— 这才是正确的
-            assert_eq!(once(&p, be, "g10", "01", "action").await, Decision::Execute, "{be}");
+                                          // 屏障记录也跟着没了，所以重试还能再执行 —— 这才是正确的
+            assert_eq!(
+                once(&p, be, "g10", "01", "action").await,
+                Decision::Execute,
+                "{be}"
+            );
         }
     }
 
