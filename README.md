@@ -2,6 +2,8 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml/badge.svg)](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A distributed transaction manager written in Rust, targeting feature parity with
 [DTM](https://github.com/dtm-labs/dtm) (Go, 10.9k★).
 

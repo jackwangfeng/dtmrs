@@ -2,6 +2,8 @@
 
 **简体中文** | [English](README.md)
 
+[![CI](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml/badge.svg)](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Rust 写的分布式事务管理器，对标 [DTM](https://github.com/dtm-labs/dtm)（Go，10.9k★）。
 
 **为什么重做**：Rust 生态里没有能用的分布式事务管理器。唯一对标项目
