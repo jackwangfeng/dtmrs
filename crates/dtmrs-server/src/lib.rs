@@ -1,8 +1,11 @@
 //! TC 的可复用部分。做成 lib 是为了让集成测试能直接驱动推进器 ——
 //! bin crate 是不能被 tests/ import 的。
 
+pub mod api;
 pub mod driver;
 pub mod embedded;
+#[cfg(feature = "grpc")]
+pub mod grpc;
 pub mod registry;
 
 use dtmrs_core::{BranchOp, BranchStatus, GlobalStatus, SagaStep, TransType};

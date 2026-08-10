@@ -43,7 +43,46 @@ impl BranchResult {
             _ => Self::Unknown,
         }
     }
+
+    /// 从 gRPC 状态码判定。取值是 gRPC 规范里的标准编号，跟 DTM 的
+    /// `dtmgrpc` 对齐，这样两边的业务服务可以互换。
+    ///
+    /// # 这个映射为什么是这几个码
+    ///
+    /// HTTP 那边靠 409/425 表达「明确失败」和「还在处理」，gRPC 没有这两个码，
+    /// 得从 16 个标准码里各挑一个**不会被基础设施误用**的：
+    ///
+    /// | gRPC 码 | 语义 | 对应 HTTP |
+    /// |---|---|---|
+    /// | `OK`(0) | 成功 | 200 |
+    /// | `ABORTED`(10) | 业务**明确**要求回滚 | 409 |
+    /// | `FAILED_PRECONDITION`(9) | 还在处理，别当失败 | 425 |
+    /// | 其它全部 | 结果**未知**，重试 | 5xx / 超时 |
+    ///
+    /// 关键在最后一行。`UNAVAILABLE`(14)、`DEADLINE_EXCEEDED`(4)、`INTERNAL`(13)
+    /// 这些**都算未知**而不是失败 —— 它们恰恰是网络抖动和超时会产生的码，
+    /// 而超时的时候对方可能已经成功了。这跟 HTTP 侧「超时不等于失败」是同一条命门。
+    ///
+    /// 特别注意 `CANCELLED`(1) 和 `DEADLINE_EXCEEDED`(4)：调用方自己取消/超时
+    /// 产生的码，绝不能当成业务失败 —— 那是**我们这边**放弃了，不是对方拒绝了。
+    pub fn from_grpc(code: i32) -> Self {
+        match code {
+            GRPC_OK => Self::Success,
+            GRPC_ABORTED => Self::Failure,
+            GRPC_FAILED_PRECONDITION => Self::Ongoing,
+            // 包括 CANCELLED / DEADLINE_EXCEEDED / UNAVAILABLE / INTERNAL / …
+            // 一律按未知处理：只重试，不回滚
+            _ => Self::Unknown,
+        }
+    }
 }
+
+/// gRPC 标准状态码。只列用得上的三个，其余一律走 `_ => Unknown`。
+pub const GRPC_OK: i32 = 0;
+/// 业务明确要求回滚。gRPC 侧的 409
+pub const GRPC_ABORTED: i32 = 10;
+/// 还在处理中。gRPC 侧的 425
+pub const GRPC_FAILED_PRECONDITION: i32 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -286,6 +325,47 @@ mod tests {
         );
         assert_eq!(BranchResult::from_http(425, ""), BranchResult::Ongoing);
         assert_eq!(BranchResult::from_http(200, "ok"), BranchResult::Success);
+    }
+
+    #[test]
+    fn grpc只有aborted才算失败() {
+        assert_eq!(BranchResult::from_grpc(0), BranchResult::Success);
+        // 业务明确要求回滚 —— gRPC 侧唯一能触发补偿的码
+        assert_eq!(BranchResult::from_grpc(10), BranchResult::Failure);
+        assert_eq!(BranchResult::from_grpc(9), BranchResult::Ongoing);
+
+        // 穷举 gRPC 全部 16 个标准码：除了这三个，一律是 Unknown。
+        // 这条错了就会数据不一致 —— UNAVAILABLE / DEADLINE_EXCEEDED 正是
+        // 网络抖动和超时产生的码，当成失败去回滚，对方可能其实已经成功了。
+        for code in 0..=15 {
+            let want = match code {
+                0 => BranchResult::Success,
+                10 => BranchResult::Failure,
+                9 => BranchResult::Ongoing,
+                _ => BranchResult::Unknown,
+            };
+            assert_eq!(BranchResult::from_grpc(code), want, "gRPC 码 {code} 判错了");
+        }
+        // 几个最容易写错的，单独钉一遍
+        assert_eq!(BranchResult::from_grpc(1), BranchResult::Unknown, "CANCELLED 是我们自己放弃，不是对方拒绝");
+        assert_eq!(BranchResult::from_grpc(4), BranchResult::Unknown, "DEADLINE_EXCEEDED 绝不能当失败");
+        assert_eq!(BranchResult::from_grpc(14), BranchResult::Unknown, "UNAVAILABLE 绝不能当失败");
+        // 不认识的码（未来扩展 / 对方乱返）也必须是 Unknown
+        assert_eq!(BranchResult::from_grpc(99), BranchResult::Unknown);
+        assert_eq!(BranchResult::from_grpc(-1), BranchResult::Unknown);
+    }
+
+    #[test]
+    fn grpc与http的判定语义一致() {
+        // 同一个业务意图，两种协议必须得到同一个结论 —— 否则同一个服务
+        // 换协议接入就会有不同的回滚行为
+        for (http, grpc) in [(200u16, 0i32), (409, 10), (425, 9), (500, 13), (503, 14)] {
+            assert_eq!(
+                BranchResult::from_http(http, ""),
+                BranchResult::from_grpc(grpc),
+                "HTTP {http} 与 gRPC {grpc} 应当判定一致"
+            );
+        }
     }
 
     #[test]

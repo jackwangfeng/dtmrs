@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+// TC 的 gRPC API，与 HTTP 的 /api/dtmsvr/* 一一对应。
+//
+// 两套协议共用同一个 Store，所以可以混着用：gRPC 提交的事务能用 HTTP 查，
+// 反之亦然。选哪个只是客户端口味问题，语义完全一致。
+package dtmrs.v1;
+
+service Tc {
+  // 生成一个全局事务号。生产上更建议直接用业务单号当 gid
+  rpc NewGid(NewGidRequest) returns (NewGidReply);
+
+  // 第一阶段：msg 建 prepared 事务 + 正向分支；tcc / xa 只建空事务
+  rpc Prepare(PrepareRequest) returns (Empty);
+
+  // 分支登记。**必须先登记再做一阶段** —— 反过来的话一阶段成功但 TC 不知道
+  // 有这个分支，回滚时会漏掉它（TCC 是资源泄漏，XA 会留下永久持锁的事务）
+  rpc RegisterBranch(RegisterBranchRequest) returns (Empty);
+
+  // 提交。saga 在这里一次性给出全部步骤；tcc / msg / xa 是把 prepared 推成 submitted
+  rpc Submit(SubmitRequest) returns (Empty);
+
+  // 主动中止，触发逆序补偿
+  rpc Abort(AbortRequest) returns (Empty);
+
+  // 查一笔事务的当前状态和各分支明细
+  rpc Query(QueryRequest) returns (TransView);
+}
+
+message Empty {}
+
+message NewGidRequest {}
+
+message NewGidReply {
+  string gid = 1;
+}
+
+// 一个 SAGA 步骤：正向动作 + 对应补偿。
+// action / compensate 可以是 http:// 、grpc:// 或 local:// 三种形态，能混用
+message SagaStep {
+  string action = 1;
+  string compensate = 2;
+}
+
+message SubmitRequest {
+  string gid = 1;
+  // saga / tcc / msg / xa，留空按 saga
+  string trans_type = 2;
+  // 只有 saga 用；tcc / msg / xa 走 Prepare
+  repeated SagaStep steps = 3;
+}
+
+message PrepareRequest {
+  string gid = 1;
+  string trans_type = 2;
+  // msg 用：正向分支列表（msg 没有补偿）
+  repeated string actions = 3;
+  // msg 用：回查地址。进程崩在 prepare 和 submit 之间时，TC 靠它决断这单。
+  // **msg 不给这个会被直接拒绝** —— 没有回查地址就没人能决断
+  string query_prepared = 4;
+  // msg 用：回查前的宽限秒数，0 表示用默认值 10
+  int64 grace_secs = 5;
+}
+
+message AbortRequest {
+  string gid = 1;
+}
+
+message QueryRequest {
+  string gid = 1;
+}
+
+message RegisterBranchRequest {
+  string gid = 1;
+  string branch_id = 2;
+  // TCC 用
+  string confirm = 3;
+  string cancel = 4;
+  // TCC 的 try，可选，只为可观测性存一份
+  string try = 5;
+  // XA 用
+  string commit = 6;
+  string rollback = 7;
+}
+
+message BranchView {
+  string branch_id = 1;
+  string op = 2;
+  string url = 3;
+  string status = 4;
+}
+
+message TransView {
+  string gid = 1;
+  string trans_type = 2;
+  string status = 3;
+  string rollback_reason = 4;
+  int64 create_time = 5;
+  // 没终结时没有这个字段
+  optional int64 finish_time = 6;
+  repeated BranchView branches = 7;
+}

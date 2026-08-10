@@ -9,6 +9,12 @@ description = "dtmrs 事务协调器（TC）"
 name = "dtmrs"
 path = "src/main.rs"
 
+[features]
+# gRPC 默认开。关掉能省下 tonic/prost 整条依赖树 —— dtmrs-ffi 就是这么做的，
+# 那边要的是尽量小的 .so，而嵌入式宿主基本用 local:// 分支。
+default = ["grpc"]
+grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
+
 [dependencies]
 dtmrs-core = { path = "../dtmrs-core" }
 dtmrs-store = { path = "../dtmrs-store" }
@@ -20,6 +26,12 @@ reqwest = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
 
 [lib]
 name = "dtmrs_server"
@@ -30,3 +42,7 @@ tokio = { workspace = true }
 axum = { workspace = true }
 dtmrs-xa = { path = "../dtmrs-xa" }
 sqlx = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+tokio-stream = { workspace = true }

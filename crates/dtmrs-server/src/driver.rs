@@ -22,6 +22,9 @@ pub struct Driver {
     pub lease: i64,
     /// 进程内分支注册表。嵌入式模式用，纯 HTTP 部署时是空表
     pub registry: Arc<Registry>,
+    /// gRPC 分支调用器（带 channel 缓存）
+    #[cfg(feature = "grpc")]
+    pub grpc: crate::grpc::client::GrpcCaller,
 }
 
 impl Driver {
@@ -35,6 +38,8 @@ impl Driver {
             owner,
             lease: 30,
             registry: Arc::new(Registry::new()),
+            #[cfg(feature = "grpc")]
+            grpc: crate::grpc::client::GrpcCaller::new(Duration::from_secs(10)),
         }
     }
 
@@ -364,7 +369,7 @@ impl Driver {
         Ok((actions, compensates))
     }
 
-    /// 调一个分支。`local://名字` 走进程内函数，其它走 HTTP。
+    /// 调一个分支。`local://名字` 走进程内函数，`grpc://` 走 gRPC，其它走 HTTP。
     async fn call_branch(
         &self,
         g: &GlobalRow,
@@ -375,6 +380,20 @@ impl Driver {
         match parse_target(url) {
             Target::Local(name) => self.call_local(g, branch_id, op, &name).await,
             Target::Http(u) => self.call_http(g, branch_id, op, &u).await,
+            #[cfg(feature = "grpc")]
+            Target::Grpc(t) => {
+                self.grpc
+                    .call(&t, &g.gid, &g.trans_type.to_string(), branch_id, op.as_str())
+                    .await
+            }
+            // 编译时关掉了 grpc feature，却遇到 grpc:// 分支。
+            // 按「结果未知」处理（重试，不回滚）—— 这是构建配置问题，不是业务失败
+            #[cfg(not(feature = "grpc"))]
+            Target::Grpc(t) => {
+                warn!(gid = %g.gid, branch = %branch_id, endpoint = %t.endpoint,
+                      "遇到 grpc:// 分支但本次构建关掉了 grpc feature，按结果未知处理");
+                BranchResult::Unknown
+            }
         }
     }
 

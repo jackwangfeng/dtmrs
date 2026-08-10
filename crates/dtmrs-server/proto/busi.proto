@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+// 业务服务（RM）的参考定义 —— 给端到端测试用，也可以直接拿去改。
+//
+// # 注意：这个 proto 不是必需的
+//
+// TC 调 gRPC 分支时**不需要知道业务方的 proto**：请求体发空消息，
+// 结果只看 gRPC 状态码，gid / branch_id / op 走 metadata。
+// 所以任何已有的 gRPC 方法都能直接当分支用，不用为 dtmrs 改接口。
+//
+// 这里定义它只是为了让测试和示例有个具体的服务可调。
+package busi.v1;
+
+service Busi {
+  rpc Deduct(Empty) returns (Empty);
+  rpc DeductUndo(Empty) returns (Empty);
+  rpc Shipment(Empty) returns (Empty);
+  rpc ShipmentUndo(Empty) returns (Empty);
+}
+
+message Empty {}

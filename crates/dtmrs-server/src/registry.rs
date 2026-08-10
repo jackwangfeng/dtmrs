@@ -33,23 +33,63 @@ pub struct BranchCtx {
 type BoxFut = Pin<Box<dyn Future<Output = BranchResult> + Send>>;
 type Handler = Arc<dyn Fn(BranchCtx) -> BoxFut + Send + Sync>;
 
-/// 分支目标：进程内函数，还是远端 HTTP。
+/// 分支目标：进程内函数、远端 HTTP，还是远端 gRPC。
 ///
 /// 用 URI 前缀区分而不是加新字段 —— 这样落库格式不变，也跟 DTM 的 http URL
-/// 完全兼容，同一个事务里可以混用两种分支。
+/// 完全兼容，同一个事务里可以三种混用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     /// `local://名字`
     Local(String),
     /// `http://...` / `https://...`
     Http(String),
+    /// `grpc://host:port/包.服务/方法`
+    Grpc(GrpcTarget),
+}
+
+/// 拆好的 gRPC 分支地址。
+///
+/// gRPC 的调用地址天然是两段：连哪个 server（endpoint）+ 调哪个方法（path），
+/// 而 HTTP 是一整个 URL。所以这里必须拆开存，不能像 http 那样原样透传。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrpcTarget {
+    /// tonic 连接用，形如 `http://host:port`
+    pub endpoint: String,
+    /// gRPC 方法路径，形如 `/包.服务/方法`
+    pub path: String,
 }
 
 pub fn parse_target(s: &str) -> Target {
-    match s.strip_prefix("local://") {
-        Some(name) => Target::Local(name.to_string()),
-        None => Target::Http(s.to_string()),
+    if let Some(name) = s.strip_prefix("local://") {
+        return Target::Local(name.to_string());
     }
+    // grpcs:// 走 TLS，但当前 tonic 依赖没开 tls feature，先只认明文。
+    // 认错了不如认不出来 —— 落到 Http 分支会明确报错，而不是静默用错协议。
+    if let Some(rest) = s.strip_prefix("grpc://") {
+        if let Some(t) = parse_grpc(rest) {
+            return Target::Grpc(t);
+        }
+    }
+    Target::Http(s.to_string())
+}
+
+/// `host:port/包.服务/方法` → (endpoint, path)
+///
+/// 必须正好有两段路径（服务名 + 方法名）。少一段或多一段都说明地址写错了，
+/// 这时候**不能猜** —— 返回 None 让它落到 Http 分支去明确失败。
+fn parse_grpc(rest: &str) -> Option<GrpcTarget> {
+    let (authority, path) = rest.split_once('/')?;
+    if authority.is_empty() {
+        return None;
+    }
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() != 2 {
+        return None;
+    }
+    Some(GrpcTarget {
+        endpoint: format!("http://{authority}"),
+        path: format!("/{}/{}", segs[0], segs[1]),
+    })
 }
 
 #[derive(Default)]
@@ -122,6 +162,34 @@ mod tests {
         );
         // 没前缀就当 http，保持跟 DTM 的兼容
         assert_eq!(parse_target("https://a/b"), Target::Http("https://a/b".into()));
+    }
+
+    #[test]
+    fn grpc地址拆成端点与方法路径() {
+        let Target::Grpc(t) = parse_target("grpc://127.0.0.1:9000/busi.Busi/Deduct") else {
+            panic!("应该认成 grpc");
+        };
+        // endpoint 必须带 http:// —— tonic 的 Endpoint 要求是个完整 URI
+        assert_eq!(t.endpoint, "http://127.0.0.1:9000");
+        assert_eq!(t.path, "/busi.Busi/Deduct");
+    }
+
+    #[test]
+    fn 畸形grpc地址不猜而是落回http() {
+        // 少了方法名、少了服务名、路径多一段、没有 authority ——
+        // 全都不能猜。落到 Http 分支会明确失败，比连错服务安全。
+        for bad in [
+            "grpc://127.0.0.1:9000/onlyservice",
+            "grpc://127.0.0.1:9000/",
+            "grpc://127.0.0.1:9000/a/b/c",
+            "grpc:///a/b",
+            "grpc://noslash",
+        ] {
+            assert!(
+                matches!(parse_target(bad), Target::Http(_)),
+                "{bad} 不该被当成合法 grpc 地址"
+            );
+        }
     }
 
     #[tokio::test]
