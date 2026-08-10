@@ -77,6 +77,8 @@ Postgres 的 2PC 默认关着，跑 XA 测试要 `postgres -c max_prepared_trans
 
 ```
 crates/
+  dtmrs/          门面 crate：重新导出各层 + dtmrs 二进制（main.rs 在这儿）。
+                  feature 切分：server(默认) / grpc / barrier / xa / full
   dtmrs-core/     状态机 + 类型，纯逻辑无 I/O。dialect.rs 是 SQL 方言渲染
   dtmrs-store/    存储 + 租约抢占（sqlx::Any，一套 SQL 跑三种库）
   dtmrs-server/   TC：api.rs(协议无关的操作层，HTTP 与 gRPC 共用)
@@ -100,8 +102,11 @@ crates/
    `api.rs`。**别在任一协议层里加判断** —— 两边漂移的后果是「同一个请求走 HTTP
    被拒、走 gRPC 却受理了」。
 
-`dtmrs-server` 同时是 lib 和 bin（bin crate 不能被 `tests/` import，所以推进器
-必须在 lib 里）。
+二进制在 `crates/dtmrs`（门面 crate）里，`dtmrs-server` 是纯库 —— 这样
+`cargo install dtmrs` 和 `cargo add dtmrs` 都是那个显而易见的名字。
+
+⚠ `dtmrs-ffi` 的 crate-type **刻意不带 rlib**：它的 lib 名是 `dtmrs`（为了产出
+`libdtmrs.so`），带上 rlib 会跟门面 crate 的 rlib 撞同一个输出文件名。
 
 ## 绝对不能破坏的语义
 

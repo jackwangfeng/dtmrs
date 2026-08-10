@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/dtmrs",
     "crates/dtmrs-core",
     "crates/dtmrs-store",
     "crates/dtmrs-server",

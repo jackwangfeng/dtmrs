@@ -2,7 +2,7 @@
 
 **简体中文** | [English](README.md)
 
-[![CI](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml/badge.svg)](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/dtmrs-server.svg?logo=rust)](https://crates.io/crates/dtmrs-server) [![Stars](https://img.shields.io/github/stars/jackwangfeng/dtmrs?style=flat&logo=github)](https://github.com/jackwangfeng/dtmrs/stargazers) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![CI](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml/badge.svg)](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/dtmrs.svg?logo=rust)](https://crates.io/crates/dtmrs) [![Stars](https://img.shields.io/github/stars/jackwangfeng/dtmrs?style=flat&logo=github)](https://github.com/jackwangfeng/dtmrs/stargazers) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Rust 写的分布式事务管理器，对标 [DTM](https://github.com/dtm-labs/dtm)（Go，10.9k★）。
 
@@ -651,7 +651,40 @@ tc.submit_workflow("order-1001", "下单", r#"{"amount":100}"#).await?;
 
 HTTP / gRPC 提交 `trans_type=workflow` 会被明确拒绝，而不是假装受理。
 
-## 跑起来
+## 安装
+
+```bash
+cargo install dtmrs                 # 协调器二进制
+DTMRS_DB=sqlite:dtmrs.db dtmrs
+```
+
+当库用的话，`dtmrs` 是各实现 crate 的**门面**——加一个依赖，不用挨个加五个。
+**按你在系统里的角色选 feature**，两端要的东西完全不同：
+
+```toml
+# 跑协调器（或者把它嵌进自己进程）
+dtmrs = "0.1"
+
+# 业务服务（RM）：只需要屏障做幂等。
+# 别把整个协调器（axum、tonic 那一堆）拖进去
+dtmrs = { version = "0.1", default-features = false, features = ["barrier"] }
+```
+
+| Feature | 给你什么 |
+|---|---|
+| `server`（默认） | 协调器本体、`Embedded`、`dtmrs` 二进制 |
+| `grpc` | gRPC 服务端接口 + 调 `grpc://` 分支 |
+| `barrier` | 子事务屏障——任何业务服务接入都必需 |
+| `xa` | 业务侧（RM）的 XA 助手 |
+| `full` | 全都要 |
+
+实测这个切分是有意义的：barrier-only 的依赖树里 **axum / tonic / reqwest 一个都没有**
+（436 个依赖 vs 默认的 634 个）。
+
+想更精细地控制依赖，底下那六个 crate（`dtmrs-core` / `dtmrs-server` / `dtmrs-store` /
+`dtmrs-barrier` / `dtmrs-xa` / `dtmrs-ffi`）也都单独发布。
+
+## 从源码跑
 
 ```bash
 cargo build --release
@@ -739,6 +772,7 @@ tx.commit().await?;   // 原子性的来源：屏障记录与业务变更同生�
 
 ```
 crates/
+  dtmrs/         门面 crate + dtmrs 二进制（用户加这一个依赖就够）
   dtmrs-core/     状态机，纯逻辑无 I/O —— 状态迁移的 bug 全在这层测
                   dialect.rs：sqlite / postgres / mysql 的 SQL 方言渲染
   dtmrs-store/    存储（三种库一套 SQL）+ 租约抢占

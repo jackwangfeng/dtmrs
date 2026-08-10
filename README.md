@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-[![CI](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml/badge.svg)](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/dtmrs-server.svg?logo=rust)](https://crates.io/crates/dtmrs-server) [![Stars](https://img.shields.io/github/stars/jackwangfeng/dtmrs?style=flat&logo=github)](https://github.com/jackwangfeng/dtmrs/stargazers) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![CI](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml/badge.svg)](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/dtmrs.svg?logo=rust)](https://crates.io/crates/dtmrs) [![Stars](https://img.shields.io/github/stars/jackwangfeng/dtmrs?style=flat&logo=github)](https://github.com/jackwangfeng/dtmrs/stargazers) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A distributed transaction manager written in Rust, targeting feature parity with
 [DTM](https://github.com/dtm-labs/dtm) (Go, 10.9k★).
@@ -674,7 +674,38 @@ awkward.
 Submitting `trans_type=workflow` over HTTP or gRPC is explicitly rejected rather than
 silently accepted.
 
-## Running it
+## Installing
+
+```bash
+cargo install dtmrs                 # the coordinator binary
+DTMRS_DB=sqlite:dtmrs.db dtmrs
+```
+
+As a library, `dtmrs` is a facade over the implementation crates — add one dependency
+instead of five. **Pick the feature set for your side of the system**, they need very
+different things:
+
+```toml
+# running the coordinator (or embedding it in your process)
+dtmrs = "0.1"
+
+# a business service (RM): you only need the barrier for idempotence.
+# Don't drag the whole coordinator (axum, tonic, ...) into it
+dtmrs = { version = "0.1", default-features = false, features = ["barrier"] }
+```
+
+| Feature | Gives you |
+|---|---|
+| `server` *(default)* | the coordinator, `Embedded`, the `dtmrs` binary |
+| `grpc` | gRPC server API + calling `grpc://` branches |
+| `barrier` | sub-transaction barrier — required for any business service |
+| `xa` | XA helper for the resource-manager side |
+| `full` | all of the above |
+
+The implementation crates (`dtmrs-core`, `dtmrs-server`, `dtmrs-store`, `dtmrs-barrier`,
+`dtmrs-xa`, `dtmrs-ffi`) are published separately if you want finer control.
+
+## Running from source
 
 ```bash
 cargo build --release
@@ -773,6 +804,7 @@ network hiccup will assume the request was not accepted if you return an error.
 
 ```
 crates/
+  dtmrs/          facade crate + the dtmrs binary (one dependency for users)
   dtmrs-core/     state machine, pure logic, no I/O — where state-transition bugs get tested
                   dialect.rs: SQL dialect rendering for sqlite / postgres / mysql
   dtmrs-store/    storage (one SQL set, three databases) + lease acquisition

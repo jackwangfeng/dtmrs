@@ -293,6 +293,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "dtmrs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "dtmrs-barrier",
+ "dtmrs-core",
+ "dtmrs-server",
+ "dtmrs-store",
+ "dtmrs-xa",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dtmrs-barrier"
 version = "0.1.0"
 dependencies = [

@@ -13,10 +13,10 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use dtmrs_core::SagaStep;
-use dtmrs_server::api::{Api, ApiError, RegisterBranch, TransView};
-use dtmrs_server::driver::Driver;
-use dtmrs_store::Store;
+use dtmrs::server::api::{Api, ApiError, RegisterBranch, TransView};
+use dtmrs::server::driver::Driver;
+use dtmrs::SagaStep;
+use dtmrs::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -160,7 +160,7 @@ async fn serve_http(api: Api, addr: String) -> anyhow::Result<()> {
 
 #[cfg(feature = "grpc")]
 async fn serve_grpc(api: Api, addr: String) -> anyhow::Result<()> {
-    use dtmrs_server::grpc::server::TcService;
+    use dtmrs::server::grpc::server::TcService;
     let sock = addr.parse()?;
     tonic::transport::Server::builder()
         .add_service(TcService::new(api).into_server())

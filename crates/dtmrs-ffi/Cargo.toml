@@ -17,7 +17,10 @@ include = ["src/**/*", "README.md", "dtmrs.h"]
 
 [lib]
 name = "dtmrs"
-crate-type = ["cdylib", "staticlib", "rlib"]
+# 刻意不带 rlib：rlib 只对 Rust→Rust 链接有用，而这个 crate 是给 C 用的。
+# 留着它会跟 facade crate `dtmrs` 的 rlib 撞同一个输出文件名
+# （cargo 现在只警告，但明说未来可能变成硬错误）
+crate-type = ["cdylib", "staticlib"]
 
 
 [dependencies]

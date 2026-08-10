@@ -12,10 +12,6 @@ categories.workspace = true
 description = "Distributed transaction coordinator: SAGA / TCC / two-phase messaging / XA / workflow, over HTTP and gRPC, embeddable as a library"
 readme = "README.md"
 
-[[bin]]
-name = "dtmrs"
-path = "src/main.rs"
-
 
 [features]
 # gRPC 默认开。关掉能省下 tonic/prost 整条依赖树 —— dtmrs-ffi 就是这么做的，
