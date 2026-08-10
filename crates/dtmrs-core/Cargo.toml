@@ -1,0 +1,9 @@
+[package]
+name = "dtmrs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "分布式事务状态机（纯逻辑，无 I/O）"
+
+[dependencies]
+serde = { workspace = true }
