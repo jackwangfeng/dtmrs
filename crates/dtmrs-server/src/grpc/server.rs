@@ -110,6 +110,11 @@ impl pb::tc_server::Tc for TcService {
         Ok(Response::new(pb::Empty {}))
     }
 
+    async fn retry(&self, req: Request<pb::RetryRequest>) -> Result<Response<pb::Empty>, Status> {
+        self.api.retry(&req.into_inner().gid).await?;
+        Ok(Response::new(pb::Empty {}))
+    }
+
     async fn query(
         &self,
         req: Request<pb::QueryRequest>,

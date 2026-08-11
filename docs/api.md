@@ -45,7 +45,10 @@ HTTP 的写操作统一返回：
 |---|---|---|---|
 | `gid` | 是 | | 全局事务号，≤128 字符。**建议直接用业务单号**——那样天然幂等 |
 | `trans_type` | 否 | `saga` | `saga` / `tcc` / `msg` / `xa` |
-| `steps` | saga 必填 | `[]` | 每步 `{action, compensate}` |
+| `steps` | saga 必填 | `[]` | 每步 `{action, compensate, payload}` |
+
+`payload` 是**这一步自己**的请求体（扣款那步要金额、发货那步要地址）。
+留空则发 `{}`。正向和补偿共用同一份——补偿需要知道当初做了什么才能撤销。
 
 分支地址支持三种前缀，**可在同一笔事务里混用**：
 
@@ -142,6 +145,19 @@ gRPC：`Tc.Abort(AbortRequest) → Empty`
 
 ---
 
+## `POST /api/dtmsvr/retry`
+
+立刻重试：把事务排到调度队首，并清掉退避累积。管理台的「立刻重试」按钮走的就是它。
+
+```json
+{"gid": "order-1001"}
+```
+
+**只是排到队首，不跳过任何安全检查** —— 分支该幂等还是要幂等。
+已终结的事务会被拒（200 + `FAILURE` 体 / gRPC `FAILED_PRECONDITION`）。
+
+gRPC：`Tc.Retry(RetryRequest) → Empty`
+
 ## `GET /api/dtmsvr/query?gid=<gid>`
 
 查一笔事务的完整状态。
@@ -193,6 +209,10 @@ gRPC：`Tc.Query(QueryRequest) → TransView`
 gRPC：`Tc.NewGid(NewGidRequest) → NewGidReply`
 
 ---
+
+## `GET /` 和 `/console`
+
+管理台页面。看最近事务、展开分支明细、手动重试/中止。
 
 ## `GET /health`
 

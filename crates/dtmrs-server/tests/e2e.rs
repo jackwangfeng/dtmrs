@@ -340,3 +340,48 @@ async fn 没写payload的步骤发空对象() {
 
     assert_eq!(seen.lock().unwrap().clone(), vec!["{}".to_string()]);
 }
+
+/// 管理台的「立刻重试」：把事务排到调度队首，但不跳过任何安全检查
+#[tokio::test]
+async fn 立刻重试把事务排到队首() {
+    use dtmrs_server::api::{Api, ApiError};
+
+    let store = Store::open("sqlite::memory:").await.unwrap();
+    let api = Api::new(store.clone());
+
+    let steps = vec![SagaStep::new("http://x/a", "http://x/c")];
+    let (g, br) = saga_rows("retry-1", &steps);
+    store.create_global(&g, &br).await.unwrap();
+    // 先让它退避到很久以后，模拟「重试了几次正在等」
+    store.schedule_retry("retry-1", 300).await.unwrap();
+    let before = store.get_global("retry-1").await.unwrap().unwrap();
+    assert!(
+        before.next_cron_time > dtmrs_store::now() + 100,
+        "应该被推到很久以后"
+    );
+
+    api.retry("retry-1").await.expect("未终结的事务可以重试");
+    let after = store.get_global("retry-1").await.unwrap().unwrap();
+    assert!(
+        after.next_cron_time <= dtmrs_store::now() + 1,
+        "重试后应该立刻可被调度"
+    );
+    assert_eq!(
+        after.next_cron_interval, 0,
+        "退避累积要清零，否则下次又等 300 秒"
+    );
+
+    // 终态不能重试 —— 那会让已完结的事务重新变成活跃事务
+    store
+        .set_global_status("retry-1", GlobalStatus::Succeed, "")
+        .await
+        .unwrap();
+    assert!(
+        matches!(api.retry("retry-1").await, Err(ApiError::Conflict(_))),
+        "终态事务重试必须被拒"
+    );
+    assert!(
+        matches!(api.retry("没这个").await, Err(ApiError::NotFound(_))),
+        "不存在的 gid 应该 404"
+    );
+}

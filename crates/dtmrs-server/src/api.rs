@@ -252,6 +252,22 @@ impl Api {
         }
     }
 
+    /// 立刻重试：把下次调度时间提到现在，并清掉退避累积。
+    ///
+    /// 只是「排到队首」，不跳过任何安全检查 —— 分支该幂等还是要幂等。
+    /// 终态事务不能重试（没意义，而且会让它重新变成活跃事务）。
+    pub async fn retry(&self, gid: &str) -> Result<()> {
+        match self.store.get_global(gid).await {
+            Ok(Some(g)) if !g.status.is_final() => {
+                self.store.schedule_now(gid).await.map_err(internal)?;
+                Ok(())
+            }
+            Ok(Some(_)) => Err(ApiError::Conflict("事务已终结，无需重试".into())),
+            Ok(None) => Err(ApiError::NotFound("gid 不存在".into())),
+            Err(e) => Err(internal(e)),
+        }
+    }
+
     pub async fn query(&self, gid: &str) -> Result<TransView> {
         let g = self
             .store

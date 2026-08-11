@@ -187,9 +187,14 @@ fn router(app: App) -> Router {
         .route("/api/dtmsvr/registerBranch", post(register_branch))
         .route("/api/dtmsvr/submit", post(submit))
         .route("/api/dtmsvr/abort", post(abort))
+        .route("/api/dtmsvr/retry", post(retry))
         .route("/api/dtmsvr/query", get(query))
         .route("/api/dtmsvr/all", get(all))
         .route("/health", get(|| async { "ok" }))
+        // 管理台。单文件内嵌，没有构建步骤也没有外部依赖 ——
+        // 内网和离线环境都能直接用
+        .route("/", get(console))
+        .route("/console", get(console))
         .with_state(app)
 }
 
@@ -241,6 +246,16 @@ struct GidQuery {
 
 async fn abort(State(app): State<App>, Json(q): Json<GidQuery>) -> (StatusCode, Json<Reply>) {
     http_result(app.api.abort(&q.gid).await)
+}
+
+/// 立刻重试：把事务排到调度队首。管理台用，也可以直接调
+async fn retry(State(app): State<App>, Json(q): Json<GidQuery>) -> (StatusCode, Json<Reply>) {
+    http_result(app.api.retry(&q.gid).await)
+}
+
+/// 管理台页面。`include_str!` 编进二进制，部署时不用带额外文件
+async fn console() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("console.html"))
 }
 
 async fn query(
