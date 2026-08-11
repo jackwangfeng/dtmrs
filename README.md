@@ -762,41 +762,60 @@ Reproduce: `python3 bench/bench.py --db redis --n 3000 --concurrency 100 --worke
 End-to-end: submit → TC calls two branches → final state. The business branch is a local
 no-op HTTP service, so the numbers mostly reflect TC + storage overhead.
 
-| Storage | Serial (`workers=1`) | Default (`workers=16`) | Tuned |
-|---|---|---|---|
-| Redis | 868 tx/s | **3885 tx/s** | 4865 (32 workers) |
-| sqlite (WAL) | 467 tx/s | **664 tx/s** | parallelism adds nothing |
-| Postgres | 62 tx/s | **777 tx/s** | 2430 (64 workers + `DTMRS_DB_POOL=64`) |
-| MySQL | 17 tx/s | **136 tx/s** | 154 (32 workers) |
+| Storage | Serial (`workers=1`) | Default (`workers=16`) |
+|---|---|---|
+| Redis | 965 tx/s | **4695 tx/s** |
+| Postgres | 267 tx/s | **3424 tx/s** |
+| sqlite (WAL) | 435 tx/s | **682 tx/s** |
+| MySQL | 19 tx/s | **129 tx/s** |
 
-3000 two-step SAGAs, submit concurrency 100, driver tick 5 ms, **median of three runs** —
-this machine runs other things too, single runs swing ±20%, so don't read the last digit.
+Two-step SAGAs, submit concurrency 100, driver tick 5 ms, **median of three runs**, with
+the database **wiped before every run** (see "why these numbers drift" below).
 Machine: 12th Gen Intel(R) Core(TM) i7-12700, 20 cores, Linux; databases in local docker.
+This machine runs other things too, single runs swing ±20%, so don't read the last digit.
 
 Worth spelling out:
 
-- **sqlite gains nothing from parallelism** — its writes serialize across the whole
-  database anyway. It beats Postgres here only because there is no network round trip and
-  no real fsync (`synchronous=NORMAL`).
+- **The default 16 workers already saturates it.** Postgres does 3196 tx/s with 16 workers
+  and 3184 with 64 — the same. The connection pool is not the limit either (raising
+  `DTMRS_DB_POOL` from 32 to 64 changes nothing). Going faster means fewer storage round
+  trips per transaction, not more concurrency.
+- **sqlite gains little from parallelism** — its writes serialize across the whole
+  database anyway.
 - **MySQL is slow because of its own defaults**: `innodb_flush_log_at_trx_commit=1` plus
   `sync_binlog=1` means two fsyncs per commit, and driving one transaction takes several
   commits. Setting `innodb_flush_log_at_trx_commit=2` takes the same code from 123 to
   341 tx/s — that is a durability trade-off, not dtmrs overhead.
-- **Postgres is not fsync-bound**: turning `synchronous_commit` off moved it from 123 to
-  131, i.e. nothing. Its ceiling is the worker count and the connection pool.
+- **Postgres is not fsync-bound**: on a clean database, turning `synchronous_commit` off
+  goes 3100 → 2970, i.e. nothing.
 
-### To go faster, raise both knobs together
+### ⚠ Why these numbers drift: accumulated rows
 
-```bash
-DTMRS_WORKERS=64 DTMRS_DB_POOL=64 dtmrs
+The same command gives 3424 tx/s against an empty database and 777 tx/s once 40k finished
+transactions have piled up — a **4.4× spread**. It also degrades within a single run:
+
+| Transactions per run | Postgres throughput |
+|---|---|
+| 5000 | 3424 tx/s |
+| 20000 | 3196 |
+| 40000 | 2713 |
+
+Driving one transaction issues several UPDATEs, so dead tuples accumulate faster than
+autovacuum reclaims them.
+
+That exposes a **known product gap**: the Redis backend expires final-state records after
+7 days (`DEFAULT_FINAL_TTL`), but **the SQL backends have no retention policy at all** —
+finished transactions are kept forever. For now, run your own cleanup:
+
+```sql
+DELETE FROM trans_branch_op WHERE gid IN (
+  SELECT gid FROM trans_global
+  WHERE status IN ('succeed','failed') AND finish_time < <unix seconds, 7 days ago>);
+DELETE FROM trans_global
+  WHERE status IN ('succeed','failed') AND finish_time < <unix seconds, 7 days ago>;
 ```
 
-Throughput is roughly **min(workers, pool size)**: 64 workers against a pool of 32 gives
-1292 tx/s, and only raising the pool to 64 as well gets 2430. Raising one alone just moves
-the queue.
-
-Think before turning it up: a TC often shares a database with the business, and Postgres
-ships with `max_connections=100`.
+(Branches first, then the parent — the other order leaves orphan rows.)
 
 ### Three real bugs the benchmark caught
 
@@ -813,6 +832,13 @@ one fsync per transaction:
 
 sqlite connections now set `journal_mode=WAL` / `synchronous=NORMAL` /
 `busy_timeout=5000` automatically.
+
+**②' The benchmark harness was itself the bottleneck — 33×.**
+The no-op business service shared a Python process (and a GIL) with a poller that re-queried
+a thousand gids every 50 ms, and `http.server` writes its response in two chunks — with
+Nagle on, the second waits for the peer's delayed ACK, adding a fixed ~40 ms to every branch
+call. Fixing that alone: 96 → 3216 tx/s. **Check you aren't benchmarking your harness**, or
+every conclusion after it is fiction.
 
 **② A lock convoy in the claim query — near-zero parallelism on Postgres.**
 Claiming is "SELECT the most-due transaction → UPDATE to take it". Every worker's SELECT

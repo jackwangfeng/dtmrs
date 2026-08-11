@@ -731,38 +731,57 @@ DESIGN.md 里原本明确写着**不抽 `Store` trait**，理由是「三种库�
 测的是**端到端**：提交 → TC 依次调两个分支 → 落终态。业务分支是本地零操作的
 HTTP 服务，所以数字基本反映 TC + 存储的开销。
 
-| 存储 | 串行推进（`workers=1`） | 默认（`workers=16`） | 调到最大 |
-|---|---|---|---|
-| Redis | 868 笔/秒 | **3885 笔/秒** | 4865（32 worker） |
-| sqlite（WAL） | 467 笔/秒 | **664 笔/秒** | 并行没有额外收益 |
-| Postgres | 62 笔/秒 | **777 笔/秒** | 2430（64 worker + `DTMRS_DB_POOL=64`） |
-| MySQL | 17 笔/秒 | **136 笔/秒** | 154（32 worker） |
+| 存储 | 串行推进（`workers=1`） | 默认（`workers=16`） |
+|---|---|---|
+| Redis | 965 笔/秒 | **4695 笔/秒** |
+| Postgres | 267 笔/秒 | **3424 笔/秒** |
+| sqlite（WAL） | 435 笔/秒 | **682 笔/秒** |
+| MySQL | 19 笔/秒 | **129 笔/秒** |
 
-3000 笔两步 SAGA，提交并发 100，推进器 tick 5ms，**取三次的中位数**——
-这台机器上还跑着别的东西，单次结果能差 ±20%，别把个位数当真。
+两步 SAGA，提交并发 100，推进器 tick 5ms，**取三次的中位数**，
+每次跑之前**都把库清空**（见下面「这些数字为什么会漂」）。
 机器：12th Gen Intel(R) Core(TM) i7-12700，20 核，Linux；数据库都在本机 docker 里。
+这台机器上还跑着别的东西，单次结果能差 ±20%，别把个位数当真。
 
 几点值得说明：
 
-- **sqlite 从并行里拿不到额外收益**，因为它的写本来就是全库串行的。
-  它比 Postgres 快只是因为没有网络往返、也没有真正的 fsync（`synchronous=NORMAL`）。
+- **默认的 16 个 worker 基本就到顶了。** Postgres 上 16 个 worker 3196 笔/秒、
+  64 个 3184 —— 一样。连接池也不是瓶颈（`DTMRS_DB_POOL` 从 32 加到 64 没区别）。
+  想再快得减少每笔事务的存储往返次数，加并发没用。
+- **sqlite 从并行里拿不到多少收益**，因为它的写本来就是全库串行的。
 - **MySQL 慢是它自己的默认配置**：`innodb_flush_log_at_trx_commit=1` +
   `sync_binlog=1`，每次提交两次 fsync，而推一笔事务要好几次提交。
   把 `innodb_flush_log_at_trx_commit` 设成 2，同样的代码就从 123 涨到 341 笔/秒 ——
   这是持久性取舍，不是 dtmrs 的开销。
-- **Postgres 不是 fsync 瓶颈**：关掉 `synchronous_commit` 只有 123 → 131，
-  几乎没变化。它的上限是连接池和 worker 数，两个一起调才涨。
+- **Postgres 不是 fsync 瓶颈**：库干净时关掉 `synchronous_commit` 是
+  3100 → 2970，也就是没区别。
 
-### 想调快就同时调这两个
+### ⚠ 这些数字为什么会漂：库里的存量数据
 
-```bash
-DTMRS_WORKERS=64 DTMRS_DB_POOL=64 dtmrs
+同一条命令，空库跑出 3424 笔/秒，库里堆了 4 万笔历史事务之后只有 777 ——
+**差 4.4 倍**。跑得越久越慢，一次跑的笔数越多也越慢：
+
+| 一次跑的笔数 | Postgres 吞吐 |
+|---|---|
+| 5000 | 3424 笔/秒 |
+| 20000 | 3196 |
+| 40000 | 2713 |
+
+原因是每笔事务要 UPDATE 好几次，死元组堆积得比 autovacuum 收得快。
+
+由此带出一个**已知的产品缺口**：Redis 后端给终态记录挂了 7 天 TTL
+（`DEFAULT_FINAL_TTL`），**SQL 后端没有任何保留策略** —— 已完成的事务会永远留着。
+现在得自己写清理任务：
+
+```sql
+DELETE FROM trans_branch_op WHERE gid IN (
+  SELECT gid FROM trans_global
+  WHERE status IN ('succeed','failed') AND finish_time < <7天前的unix秒>);
+DELETE FROM trans_global
+  WHERE status IN ('succeed','failed') AND finish_time < <7天前的unix秒>;
 ```
 
-吞吐大约等于 **min(worker 数, 连接池大小)** 决定：64 个 worker 配 32 的池子
-只有 1292 笔/秒，池子也开到 64 才有 2430。只调一个会卡在另一个上。
-
-调大之前想清楚：TC 常常和业务共用一个数据库，而 Postgres 默认才 100 条连接。
+（先删分支再删主表，顺序反了会留下孤儿行。）
 
 ### 压测抓出来的三个真问题
 
@@ -779,6 +798,12 @@ DTMRS_WORKERS=64 DTMRS_DB_POOL=64 dtmrs
 
 现在 sqlite 连接会自动设 `journal_mode=WAL` / `synchronous=NORMAL` /
 `busy_timeout=5000`。
+
+**②' 压测脚本自己就是瓶颈 —— 33 倍。**
+零操作业务服务和「每 50ms 重查上千个 gid」挤在同一个 Python 进程里，
+而且 `http.server` 的响应分两次 write，开着 Nagle 时第二段要等对端延迟 ACK，
+每次分支调用固定多 ~40ms。修完这一条：96 → 3216 笔/秒。
+**先确认自己没在测压测脚本**，否则后面所有结论都是假的。
 
 **② 抢占待办时的锁车队 —— Postgres 上并行度几乎为 0。**
 抢占是「SELECT 出最该跑的那笔 → UPDATE 占坑」。N 个 worker 的 SELECT

@@ -28,21 +28,39 @@ DTMRS_DB=sqlite:dtmrs.db dtmrs
 推进器是 N 个并行的抢占循环，每个循环抢一笔推一笔。**一笔事务内部仍然按序**
 （SAGA 就是顺序语义），并行只发生在事务之间。
 
-端到端吞吐大约由 **min(`DTMRS_WORKERS`, `DTMRS_DB_POOL`)** 决定 ——
-只调一个会卡在另一个上。实测（Postgres，20 核机器）：
+实测（Postgres，20 核机器，空库）：
 
 | worker | 连接池 | 吞吐 |
 |---|---|---|
-| 1 | 32 | 62 笔/秒 |
-| 16 | 32 | 777 笔/秒（默认） |
-| 64 | 32 | 1292 笔/秒 ← 卡在池子上 |
-| 64 | 64 | 2430 笔/秒 |
+| 1 | 32 | 267 笔/秒 |
+| 16 | 32 | 3196 笔/秒（默认） |
+| 64 | 32 | 3184 笔/秒 |
+| 64 | 64 | 3227 笔/秒 |
 
-调大之前先想清楚两件事：
+**默认的 16 就基本到顶了，调大没用。** 再往上要减少每笔事务的存储往返次数，
+不是加并发。所以先别急着调这两个参数 —— 大概率你的瓶颈不在这儿。
 
-- TC 常常和业务共用一个数据库，而 **Postgres 默认只有 100 条连接**。
-  多实例部署时是 `实例数 × DTMRS_DB_POOL`。
-- **sqlite 调了也没用**：它的写是全库串行的，1 个 worker 和 16 个差别不大。
+真要调的话记住：TC 常常和业务共用一个数据库，而 **Postgres 默认只有 100 条连接**，
+多实例部署时占用是 `实例数 × DTMRS_DB_POOL`。
+**sqlite 调了也没用**，它的写是全库串行的。
+
+### ⚠ SQL 后端要自己清理历史数据
+
+Redis 后端给终态记录挂了 7 天 TTL，**SQL 后端没有任何保留策略**。
+这不只是占磁盘：实测库里堆到 4 万笔历史事务之后，同样的压测从 3424 笔/秒
+掉到 777 —— **慢 4.4 倍**。推一笔事务要 UPDATE 好几次，死元组堆积得比
+autovacuum 收得快。
+
+上线前记得配个定时清理（`finish_time` 是 unix 秒）：
+
+```sql
+-- 先删分支再删主表，顺序反了会留下孤儿行
+DELETE FROM trans_branch_op WHERE gid IN (
+  SELECT gid FROM trans_global
+  WHERE status IN ('succeed','failed') AND finish_time < <7天前的unix秒>);
+DELETE FROM trans_global
+  WHERE status IN ('succeed','failed') AND finish_time < <7天前的unix秒>;
+```
 
 各存储后端的完整数字见 README 的「性能」一节。
 

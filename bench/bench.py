@@ -227,6 +227,55 @@ def verify_final(prefix, n, concurrency=16, patience=30):
             time.sleep(0.5)
 
 
+def reset_db(dsn):
+    """把库清空，返回一句「做了什么」的说明。
+
+    ⚠ 这一步不能省，也不能失败了当没事：早期版本只清 sqlite 文件，
+    Postgres / MySQL / Redis 的数据一轮轮往上堆。跑到 4 万笔存量之后，
+    同一条命令的结果从 2430 笔/秒掉到 1317 —— **报出来的数字不可复现**，
+    还会让人误以为是代码变慢了。
+
+    清不掉就明确说清不掉，让报数的人自己判断，别默默给个脏数字。
+    """
+    import shlex
+    import urllib.parse as up
+
+    if dsn.startswith("sqlite"):
+        path = dsn.split(":", 1)[1].split("?")[0]
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(path + suffix)
+            except FileNotFoundError:
+                pass
+        return f"已删除 {path}"
+
+    u = up.urlparse(dsn)
+    if dsn.startswith("redis"):
+        db = (u.path or "/0").lstrip("/") or "0"
+        cmd = f"redis-cli -h {u.hostname} -p {u.port or 6379} -n {db} flushdb"
+    elif dsn.startswith("postgres"):
+        env_pw = f"PGPASSWORD={shlex.quote(up.unquote(u.password or ''))} "
+        cmd = (f"{env_pw}psql -h {u.hostname} -p {u.port or 5432} "
+               f"-U {u.username} -d {u.path.lstrip('/')} -q -c "
+               f"'TRUNCATE trans_global, trans_branch_op'")
+    elif dsn.startswith("mysql"):
+        cmd = (f"mysql -h {u.hostname} -P {u.port or 3306} -u {u.username} "
+               f"-p{up.unquote(u.password or '')} {u.path.lstrip('/')} "
+               f"-e 'TRUNCATE trans_global; TRUNCATE trans_branch_op'")
+    else:
+        return "⚠ 不认识的 DSN，没清库 —— 数字会受存量数据影响"
+
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if r.returncode == 0:
+        return "已清空"
+    # 表还不存在是正常的（第一次跑），别当错误
+    err = (r.stderr or "").strip().splitlines()
+    if any("does not exist" in e or "Unknown table" in e or "doesn't exist" in e
+           for e in err):
+        return "库是空的（表还没建）"
+    return f"⚠ 没清掉（{err[-1] if err else r.returncode}）—— 数字会受存量数据影响"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="sqlite",
@@ -250,12 +299,7 @@ def main():
         "redis": os.environ.get("BENCH_REDIS", "redis://127.0.0.1:16379/1"),
     }.get(args.db, args.db)
 
-    if dsn.startswith("sqlite"):
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                os.remove("/tmp/bench.db" + suffix)
-            except FileNotFoundError:
-                pass
+    reset = reset_db(dsn)
 
     done = mp.Value("i", 0)
     busi = start_busi(args.busi_procs, done)
@@ -297,9 +341,11 @@ def main():
         final_n, dist = verify_final(prefix, args.n)
 
         if args.quiet:
+            # 清库失败一定要带出来 —— 存量数据会让数字慢慢往下漂
+            warn = "" if reset.startswith(("已", "库是")) else f"  {reset}"
             print(f"{args.db:9s} workers={args.workers:>3s}  "
                   f"{finished/drive_secs:7.0f} 笔/秒  "
-                  f"终态 {final_n}/{args.n}")
+                  f"终态 {final_n}/{args.n}{warn}")
             return 0
 
         print(f"\n=== dtmrs 压测 · 存储={args.db} ===")
@@ -310,6 +356,7 @@ def main():
         print(f"  推进器 tick   : {args.tick} ms")
         print(f"  推进 worker   : {args.workers}")
         print(f"  业务服务进程  : {args.busi_procs}")
+        print(f"  跑之前清库    : {reset}")
         print(f"  ---")
         print(f"  提交阶段      : {submit_secs:.2f}s  →  {args.n/submit_secs:.0f} 笔/秒")
         print(f"  提交+推完     : {drive_secs:.2f}s  →  {finished/drive_secs:.0f} 笔/秒")
