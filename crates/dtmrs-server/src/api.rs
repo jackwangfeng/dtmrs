@@ -84,11 +84,63 @@ pub struct RegisterBranch {
 #[derive(Clone)]
 pub struct Api {
     pub store: Store,
+    /// 提交后**直接开推**用的推进器。`None` 就是老行为：写完就返回，
+    /// 等推进器自己抢到再推。见 [`Api::with_inline_driver`]
+    inline: Option<crate::driver::Driver>,
 }
 
 impl Api {
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            inline: None,
+        }
+    }
+
+    /// 开启「提交后直接开推」。
+    ///
+    /// # 省掉的是那次抢占往返
+    ///
+    /// 老流程：提交方写完事务就返回，推进器再 `lock_one_due` 抢一次才能推。
+    /// 那次抢占**每笔事务都要付**，在 Redis 上是一次 Lua 往返 —— 实测它就是
+    /// saga 落后 DTM 的主要原因（saga 只有一次客户端请求，摊不薄）。
+    ///
+    /// 新流程：建事务的那条写入里**顺便把租约占在自己手上**
+    /// （`owner=自己`、`next_cron_time=现在+租约`），写成功就等于抢到了，
+    /// 直接推。零额外往返。
+    ///
+    /// # 跟 DTM 的差别：我们不阻塞提交
+    ///
+    /// DTM 是在 submit 请求里同步把事务推完，客户端要一直等。这里是
+    /// **spawn 出去推，提交立刻返回** —— 省掉往返的同时保住了提交延迟。
+    ///
+    /// # 代价
+    ///
+    /// 租约一占就是 `lease` 秒。如果进程在「写完」和「推完」之间挂了，
+    /// 这笔要等租约到期才会被别的实例接手，而不是下一个 tick。
+    /// 这跟「推进器抢到之后崩了」是同一种情形，不是新引入的风险。
+    pub fn with_inline_driver(mut self, d: crate::driver::Driver) -> Self {
+        self.inline = Some(d);
+        self
+    }
+
+    /// 建事务前把租约字段填上。返回是否真的占了 —— 没开内联就不占。
+    fn claim_for_inline(&self, g: &mut dtmrs_store::GlobalRow) -> bool {
+        let Some(d) = &self.inline else { return false };
+        g.owner = d.owner.clone();
+        g.next_cron_time = dtmrs_store::now() + d.lease;
+        true
+    }
+
+    /// 把已经拿到租约的事务扔出去推。**不等它跑完** —— 提交要立刻返回。
+    fn drive_detached(&self, g: dtmrs_store::GlobalRow) {
+        let Some(d) = self.inline.clone() else { return };
+        tokio::spawn(async move {
+            if let Err(e) = d.process(&g).await {
+                // 推失败不影响提交的结果，租约到期后会被重新捞起来
+                tracing::warn!(gid = %g.gid, error = %e, "提交后直接推进出错，等租约到期重试");
+            }
+        });
     }
 
     /// 时间戳 + 进程内计数。生产建议客户端直接用业务单号当 gid ——
@@ -118,14 +170,22 @@ impl Api {
                     // ⚠ 不带步骤的重复提交**必须幂等成功**，不能因为 steps 为空
                     // 就报错 —— 客户端重试时经常只带 gid。只有事务压根不存在，
                     // 才是真的参数错误。（`tc的grpc_api与http同源` 钉着这条）
-                    return match self.store.submit_prepared(gid).await.map_err(internal)? {
+                    return match self
+                        .store
+                        .submit_prepared(gid, "", dtmrs_store::now())
+                        .await
+                        .map_err(internal)?
+                    {
                         SubmitOutcome::Advanced | SubmitOutcome::Already => Ok(()),
                         SubmitOutcome::Missing => {
                             Err(ApiError::BadRequest("saga 的 steps 不能为空".into()))
                         }
                     };
                 }
-                let (g, branches) = saga_rows(gid, steps);
+                let (mut g, branches) = saga_rows(gid, steps);
+                // 开了内联推进的话，这条写入顺便把租约占下来，写成功就直接推，
+                // 不用再走一次抢占（见 `with_inline_driver`）
+                let claimed = self.claim_for_inline(&mut g);
                 // **先建，不先查。** `create_global` 本身就是幂等的（已存在返回
                 // false 且不覆盖），所以正常路径一次往返就够 —— 这是 saga 提交的
                 // 热路径，先查一次等于白付一次往返，而且那还是个 Lua 脚本调用，
@@ -136,12 +196,18 @@ impl Api {
                     .await
                     .map_err(internal)?
                 {
+                    if claimed {
+                        self.drive_detached(g);
+                    }
                     return Ok(());
                 }
                 // 已存在。可能是重复提交（幂等返回成功就行），也可能是这个 gid
                 // 其实是 prepare 过的 tcc/msg/xa —— 客户端没传 trans_type 时
                 // 会被当成 saga。后一种要真的把它推成 submitted，交给下面决断
-                self.store.submit_prepared(gid).await.map_err(internal)?;
+                self.store
+                    .submit_prepared(gid, "", dtmrs_store::now())
+                    .await
+                    .map_err(internal)?;
                 Ok(())
             }
             TransType::Tcc | TransType::Msg | TransType::Xa => {
@@ -149,7 +215,12 @@ impl Api {
                 //
                 // **一次存储调用做完**（原来是 get_global + set_global_status
                 // + schedule_now 三次）。Redis 上这三次是 11 条命令，现在 3 条
-                match self.store.submit_prepared(gid).await.map_err(internal)? {
+                match self
+                    .store
+                    .submit_prepared(gid, "", dtmrs_store::now())
+                    .await
+                    .map_err(internal)?
+                {
                     // 已经提交过 —— 幂等返回成功
                     SubmitOutcome::Advanced | SubmitOutcome::Already => Ok(()),
                     SubmitOutcome::Missing => {

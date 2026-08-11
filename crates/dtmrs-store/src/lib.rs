@@ -283,7 +283,7 @@ impl SqlStore {
         let n = sqlx::query(&self.be.q("{INS} trans_global
              (gid,trans_type,status,payload,next_cron_time,next_cron_interval,
               owner,rollback_reason,query_prepared,create_time,update_time)
-             VALUES (?,?,?,?,?,?,'','',?,?,?)
+             VALUES (?,?,?,?,?,?,?,'',?,?,?)
              {NOCONFLICT}"))
         .bind(&g.gid)
         .bind(g.trans_type.to_string())
@@ -291,6 +291,11 @@ impl SqlStore {
         .bind(&g.payload)
         .bind(g.next_cron_time)
         .bind(g.next_cron_interval)
+        // ⚠ owner 要真的写进去，不能像原来那样写死空串。
+        // 提交方可以在建事务时就把租约占在自己手上（owner=自己、
+        // next_cron_time=现在+租约），这样它能直接开推，
+        // **省掉一次抢占往返** —— 见 `Api::submit`
+        .bind(&g.owner)
         .bind(&g.query_prepared)
         .bind(t)
         .bind(t)
@@ -529,7 +534,16 @@ impl SqlStore {
     /// **一次调用做完原来三次的活**（`get_global` + `set_global_status` +
     /// `schedule_now`）。Redis 后端上这是一个 Lua 脚本，11 条命令降到 3 条 ——
     /// 那边是单线程 CPU 瓶颈，命令数直接决定吞吐。
-    pub async fn submit_prepared(&self, gid: &str) -> Result<SubmitOutcome> {
+    ///
+    /// `owner` / `next_cron_time` 让提交方**顺便把租约占下来**：传自己的
+    /// owner 和「现在 + 租约」，这一条 UPDATE 之后事务就归调用方推了，
+    /// 不用再走一次抢占。不想占就传空 owner 和 `now()`。
+    pub async fn submit_prepared(
+        &self,
+        gid: &str,
+        owner: &str,
+        next_cron_time: i64,
+    ) -> Result<SubmitOutcome> {
         // 先查一次。saga 第一次提交时事务还不存在，这是最常见的路径，
         // 一次 SELECT 就该返回，不值得为它先空跑一条 UPDATE
         let st: Option<String> =
@@ -548,11 +562,12 @@ impl SqlStore {
         // ⚠ `AND status=?`（prepared）不能省：并发重复提交时，
         // 别把已经在推进的事务硬拽回队首
         sqlx::query(&self.be.q("UPDATE trans_global SET status=?, update_time=?,
-             next_cron_time=?, next_cron_interval=0
+             next_cron_time=?, next_cron_interval=0, owner=?
              WHERE gid=? AND status=?"))
         .bind(GlobalStatus::Submitted.as_str())
         .bind(t)
-        .bind(t)
+        .bind(next_cron_time)
+        .bind(owner)
         .bind(gid)
         .bind(GlobalStatus::Prepared.as_str())
         .execute(&self.pool)
@@ -1058,7 +1073,7 @@ dispatch! {
     fn lock_one_due(&self, owner: &str, lease: i64) -> Option<GlobalRow>;
     fn set_global_status(&self, gid: &str, status: GlobalStatus, reason: &str) -> ();
     /// 把 prepared 推成 submitted 并排进调度队列，一次调用做完。见 [`SubmitOutcome`]
-    fn submit_prepared(&self, gid: &str) -> SubmitOutcome;
+    fn submit_prepared(&self, gid: &str, owner: &str, next_cron_time: i64) -> SubmitOutcome;
     fn set_branch_result(&self, gid: &str, branch_id: &str, op: BranchOp, status: BranchStatus, payload: &str) -> ();
     fn set_branch_status(&self, gid: &str, branch_id: &str, op: BranchOp, status: BranchStatus) -> ();
     fn schedule_retry(&self, gid: &str, interval: i64) -> ();

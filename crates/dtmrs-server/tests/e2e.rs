@@ -4,6 +4,7 @@
 //! 每个断言都盯着一个具体的失效模式，不是"跑通了就行"。
 
 use dtmrs_core::{GlobalStatus, SagaStep};
+use dtmrs_server::api::Api;
 use dtmrs_server::driver::Driver;
 use dtmrs_server::saga_rows;
 use dtmrs_store::Store;
@@ -383,5 +384,64 @@ async fn 立刻重试把事务排到队首() {
     assert!(
         matches!(api.retry("没这个").await, Err(ApiError::NotFound(_))),
         "不存在的 gid 应该 404"
+    );
+}
+
+/// 提交后直接开推：**不靠推进器抢**也能推完，而且这笔事务在租约期内
+/// 对抢占是不可见的。
+///
+/// 后半条是这个优化的安全底线：提交时就把租约占在自己手上，
+/// 如果 `lock_one_due` 还能抢到它，就会出现两个地方同时推同一笔事务。
+#[tokio::test]
+async fn 提交后直接开推_不经过抢占且不会被重复推进() {
+    let (store, driver, busi, st) = setup("ok").await;
+    // 注意：**没有起 run_forever**。能推完就说明确实是提交那条路推的
+    let api = Api::new(store.clone()).with_inline_driver(driver.clone());
+
+    api.submit("inline-1", "saga", &st).await.unwrap();
+
+    // 刚提交完，租约在提交方手上 —— 抢占必须抢不到
+    let stolen = store.lock_one_due("另一个实例", 60).await.unwrap();
+    assert!(
+        stolen.is_none(),
+        "租约期内被别人抢到了，会导致同一笔事务被推两次"
+    );
+
+    for _ in 0..100 {
+        if store
+            .get_global("inline-1")
+            .await
+            .unwrap()
+            .is_some_and(|g| g.status == GlobalStatus::Succeed)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let got = store.get_global("inline-1").await.unwrap().unwrap();
+    assert_eq!(got.status, GlobalStatus::Succeed, "提交那条路应该把它推完");
+    let (a1, c1, a2, c2) = busi.counts();
+    assert_eq!((a1, a2), (1, 1), "每个正向分支只调一次");
+    assert_eq!((c1, c2), (0, 0), "成功路径绝不能调补偿");
+}
+
+/// 关掉内联时必须退回老行为：提交只写库，**不推** ——
+/// 否则「关掉」这个开关就是假的
+#[tokio::test]
+async fn 不开内联时提交不推进() {
+    let (store, _driver, busi, st) = setup("ok").await;
+    let api = Api::new(store.clone());
+
+    api.submit("no-inline", "saga", &st).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let got = store.get_global("no-inline").await.unwrap().unwrap();
+    assert_eq!(got.status, GlobalStatus::Submitted, "不该被推进");
+    assert_eq!(busi.counts(), (0, 0, 0, 0), "一个分支都不该被调");
+    // 而且这时候抢占要能抢到它 —— 没占租约
+    assert!(
+        store.lock_one_due("worker", 60).await.unwrap().is_some(),
+        "没开内联就不该占租约，推进器要能抢到"
     );
 }

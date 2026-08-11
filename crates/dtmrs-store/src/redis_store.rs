@@ -245,14 +245,14 @@ impl RedisStore {
             redis.call('HSET', KEYS[1],
                 'gid', ARGV[1], 'trans_type', ARGV[2], 'status', ARGV[3],
                 'payload', ARGV[4], 'next_cron_time', ARGV[5],
-                'next_cron_interval', ARGV[6], 'owner', '', 'rollback_reason', '',
+                'next_cron_interval', ARGV[6], 'owner', ARGV[10], 'rollback_reason', '',
                 'query_prepared', ARGV[7], 'create_time', ARGV[8], 'update_time', ARGV[8])
-            -- 分支从第 10 个 ARGV 开始，每两个一组（field, value），
+            -- 分支从第 11 个 ARGV 开始，每两个一组（field, value），
             -- 定义和状态各占一组。**一条 HSET 全写完** —— 原来是每个字段
             -- 一条 HSETNX，分支多的时候命令数线性涨。
             -- 上面已经确认过全局键不存在，所以不需要 NX 语义
-            if #ARGV >= 10 then
-                redis.call('HSET', KEYS[2], unpack(ARGV, 10))
+            if #ARGV >= 11 then
+                redis.call('HSET', KEYS[2], unpack(ARGV, 11))
             end
             if ARGV[9] == '1' then
                 redis.call('ZADD', KEYS[3], ARGV[5], ARGV[1])
@@ -288,7 +288,10 @@ impl RedisStore {
                 "1"
             } else {
                 "0"
-            });
+            })
+            // ⚠ owner 要真的写进去（原来写死空串）。提交方可以在建事务时
+            // 就把租约占在自己手上，直接开推，省掉一次抢占往返 —— 见 `Api::submit`
+            .arg(&g.owner);
         for b in branches {
             inv.arg(Self::bfield(&b.branch_id, b.op))
                 .arg(Self::branch_value(b));
@@ -560,7 +563,12 @@ impl RedisStore {
     ///
     /// `HMGET` 读不到就说明键不存在 —— **不用再单发一次 `EXISTS`**，
     /// 这个套路下面几个脚本里也都用上了。
-    pub async fn submit_prepared(&self, gid: &str) -> Result<SubmitOutcome> {
+    pub async fn submit_prepared(
+        &self,
+        gid: &str,
+        owner: &str,
+        next_cron_time: i64,
+    ) -> Result<SubmitOutcome> {
         let t = crate::now();
         let script = redis::Script::new(&format!(
             r#"
@@ -569,9 +577,10 @@ impl RedisStore {
             if not v[1] then return 'MISSING' end
             if v[1] ~= ARGV[3] then return 'ALREADY' end
             redis.call('HSET', KEYS[1], 'status', ARGV[2], 'update_time', ARGV[1],
-                       'next_cron_time', ARGV[1], 'next_cron_interval', 0)
+                       'next_cron_time', ARGV[5], 'next_cron_interval', 0,
+                       'owner', ARGV[6])
             if schedulable(ARGV[2], v[2]) then
-                redis.call('ZADD', KEYS[2], ARGV[1], ARGV[4])
+                redis.call('ZADD', KEYS[2], ARGV[5], ARGV[4])
             end
             return 'ADVANCED'
             "#,
@@ -585,6 +594,8 @@ impl RedisStore {
             .arg(GlobalStatus::Submitted.as_str())
             .arg(GlobalStatus::Prepared.as_str())
             .arg(gid)
+            .arg(next_cron_time)
+            .arg(owner)
             .invoke_async(&mut c)
             .await?;
         Ok(match r.as_str() {

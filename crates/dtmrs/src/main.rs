@@ -151,7 +151,18 @@ async fn main() -> anyhow::Result<()> {
     // 常驻推进器。崩溃恢复就靠它：重启后未终结的事务会被重新捞起
     tokio::spawn(driver.clone().run_forever(Duration::from_millis(tick_ms)));
 
-    let api = Api::new(store);
+    // 提交后直接开推：省掉每笔事务一次抢占往返。默认开，
+    // `DTMRS_INLINE_SUBMIT=0` 关掉（见 `Api::with_inline_driver`）
+    let inline = !matches!(
+        std::env::var("DTMRS_INLINE_SUBMIT").as_deref(),
+        Ok("0") | Ok("false")
+    );
+    let api = if inline {
+        Api::new(store).with_inline_driver(driver.clone())
+    } else {
+        Api::new(store)
+    };
+    info!(inline_submit = inline, "提交后是否直接开推");
 
     // gRPC 和 HTTP 各占一个端口，任一个挂了就整体退出 —— 不能出现
     // 「HTTP 还活着但 gRPC 已经死了」这种半可用状态，那会让客户端困惑

@@ -762,26 +762,46 @@ Reproduce: `python3 bench/bench.py --db redis --n 3000 --concurrency 100 --worke
 End-to-end: submit → TC calls two branches → final state. The business branch is a local
 no-op HTTP service, so the numbers mostly reflect TC + storage overhead.
 
-| Storage | Serial (`workers=1`) | Default (`workers=16`) |
-|---|---|---|
-| Redis | 965 tx/s | **4695 tx/s** |
-| Postgres | 267 tx/s | **3424 tx/s** |
-| sqlite (WAL) | 435 tx/s | **682 tx/s** |
-| MySQL | 19 tx/s | **129 tx/s** |
+| Storage | Inline submit off | **Default (inline submit)** | Gain |
+|---|---|---|---|
+| Redis | 7654 tx/s | **13105 tx/s** | 1.7× |
+| Postgres | 3396 tx/s | **4982 tx/s** | 1.5× |
+| sqlite (WAL) | 673 tx/s | **1798 tx/s** | 2.7× |
+| MySQL | 122 tx/s | **242 tx/s** | 2.0× |
 
-Two-step SAGAs, submit concurrency 100, driver tick 5 ms, **median of three runs**, with
-the database **wiped before every run** (see "why these numbers drift" below).
+20k two-step SAGAs, submit concurrency 100, driver tick 5 ms, **median of three runs**,
+with the database **wiped before every run** (see "why these numbers drift" below).
 Machine: 12th Gen Intel(R) Core(TM) i7-12700, 20 cores, Linux; databases in local docker.
 This machine runs other things too, single runs swing ±20%, so don't read the last digit.
 
+### Inline submit: one claim round trip saved per transaction
+
+Previously the submitter wrote the transaction and returned, and the driver had to
+**claim** it via `lock_one_due` before it could be driven. Every transaction paid for that
+claim — one Lua round trip on Redis.
+
+Now the write that creates the transaction **takes the lease at the same time**
+(`owner = me`, `next_cron_time = now + lease`), so a successful write *is* the claim, and
+we drive immediately. Zero extra round trips.
+
+The difference from DTM: DTM drives the transaction to completion **inside** the submit
+request, so the client waits. We spawn the drive and **submit still returns immediately** —
+the round trip is saved without paying for it in submit latency.
+
+The cost: the lease is held for `DTMRS_LEASE` seconds. If the process dies between "written"
+and "driven", that transaction waits for lease expiry rather than the next tick. This is the
+same situation as "the driver claimed it and then crashed" — not a new risk.
+`DTMRS_INLINE_SUBMIT=0` turns it off.
+
+⚠ **With inline submit on, `DTMRS_WORKERS` means something different**: happy-path driving
+happens on the submit path, and workers only handle retries and crash recovery. Measured
+throughput at `workers=1` and `workers=16` is now nearly identical — stop tuning it for
+throughput.
+
 Worth spelling out:
 
-- **The default 16 workers already saturates it.** Postgres does 3196 tx/s with 16 workers
-  and 3184 with 64 — the same. The connection pool is not the limit either (raising
-  `DTMRS_DB_POOL` from 32 to 64 changes nothing). Going faster means fewer storage round
-  trips per transaction, not more concurrency.
-- **sqlite gains little from parallelism** — its writes serialize across the whole
-  database anyway.
+- **sqlite gains the most** (2.7×). Its writes serialize database-wide so it never
+  benefited from parallel workers, but removing a whole write is a real saving.
 - **MySQL is slow because of its own defaults**: `innodb_flush_log_at_trx_commit=1` plus
   `sync_binlog=1` means two fsyncs per commit, and driving one transaction takes several
   commits. Setting `innodb_flush_log_at_trx_commit=2` takes the same code from 123 to
@@ -796,16 +816,17 @@ generator, 20k transactions, median of three:
 
 | Mode | dtmrs | DTM v1.19 | |
 |---|---|---|---|
-| msg, 1 forward step | **12540 tx/s** | 10299 | dtmrs +22% |
-| saga, 2 steps | 7630 | **9339 tx/s** | DTM +22% |
+| saga, 2 steps | **14112 tx/s** | 9582 | dtmrs +47% |
+| msg, 1 forward step | **12371 tx/s** | 10058 | dtmrs +23% |
 
-**One win each, and the reason is architectural rather than one codebase being tighter:**
+The saga row used to be a **22% loss** (7630 vs 9339). The gap was exactly the claim round
+trip described above: DTM drives inline in the submit request and never queues, while we
+claimed every transaction first. Folding the claim into the creating write turned a 22%
+deficit into a 47% lead.
 
-DTM drives the transaction to completion **inline in the submit request**; dtmrs returns
-from submit immediately and lets the driver claim it from a queue. That claim
-(`lock_one_due`) is one Lua round trip on Redis that **every transaction pays**. A saga is
-a single client request, so the fixed cost weighs heavily; msg has two (prepare + submit),
-which amortizes it — and there our batched scripts come out ahead.
+(The msg path does not do inline driving yet — its `submit_prepared` would have to return
+the transaction body for us to drive it directly, which is extra work on a path that was
+already winning. Known remaining headroom.)
 
 Two honest footnotes:
 
