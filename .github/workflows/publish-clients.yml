@@ -35,9 +35,12 @@ jobs:
         with:
           # 24 自带 npm 11.x，满足 trusted publishing 的 ≥11.5.1
           node-version: '24'
-          # ⚠ 刻意**不设** registry-url：它会生成一个带 NODE_AUTH_TOKEN 占位符的
-          #   .npmrc，npm 可能因此走 token 认证而不是 OIDC。
-          #   发布目标由 package.json 的 publishConfig.registry 指定
+          # registry-url **必须有** —— npm 靠它知道该跟哪个 registry 做 OIDC 交换。
+          # 去掉它会直接 ENEEDAUTH（撞过）。
+          # setup-node 会写一个带 NODE_AUTH_TOKEN 占位符的 .npmrc，那是无害的：
+          # npm 会先尝试 OIDC，失败才回退到 token
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
 
       - name: 确认版本满足 trusted publishing 的要求
         run: |
