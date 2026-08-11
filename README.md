@@ -789,6 +789,44 @@ Worth spelling out:
 - **Postgres is not fsync-bound**: on a clean database, turning `synchronous_commit` off
   goes 3100 → 2970, i.e. nothing.
 
+### Flash sales: two-phase messaging on Redis
+
+Flash sales use **two-phase messaging (msg)**, not SAGA — you cannot un-sell an item, so
+there is no compensation to write. The shape is `prepare` → (your own local transaction,
+decrementing stock) → `submit`, after which the TC guarantees the downstream step is
+eventually delivered.
+
+Same machine, Redis storage, 20k transactions, median of three:
+
+| Mode | Forward steps | Throughput |
+|---|---|---|
+| **msg** | 1 (the typical flash-sale shape) | **11573 tx/s** |
+| saga | 2 | 8653 tx/s |
+| msg | 2 | 7903 tx/s |
+
+Two things worth noting:
+
+- **Step count matters more than mode.** At an equal 2 steps, msg is slightly *slower*
+  than saga, because the msg client sends two requests (prepare + submit) where saga sends
+  one. msg wins because a flash sale only needs one downstream step.
+- **You pick msg for correctness, not throughput** — it is the only mode that fits when
+  there is nothing to compensate. It is also cheaper to store: 1450 bytes per transaction
+  in Redis versus 1961 for a two-step SAGA.
+
+### ⚠ Storage network path: docker port publishing costs 36%
+
+Every number above was measured with storage in docker, published via `-p`. Switching to
+`--network host` (i.e. storage and TC talking directly on one host):
+
+| Path | redis-benchmark | Single-conn p50 | msg, 1 step |
+|---|---|---|---|
+| `--network host` | 187k req/s | 0.015 ms | **11573 tx/s** |
+| `-p 16379:6379` | 151k req/s | 0.023 ms | 8500 tx/s |
+
+Only ~8 µs more per round trip, but driving one transaction makes dozens of sequential
+Redis calls, and it compounds to 36%. **These numbers therefore depend on your deployment
+topology — say which one you used when quoting them.**
+
 ### ⚠ Why these numbers drift: accumulated rows
 
 The same command gives 3424 tx/s against an empty database and 777 tx/s once 40k finished

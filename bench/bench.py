@@ -35,14 +35,33 @@
 所以跑完还会**全量核对一遍真实终态**（不计时），对不上就明确报出来 ——
 只报一个自己没验过的数字是不诚实的。
 
+# ⚠ docker 的端口映射会吃掉 36%
+
+存储跑在 docker 里、靠 `-p 16379:6379` 发布端口的话，每次往返要多走一层
+NAT / docker-proxy。实测：
+
+| 路径 | redis-benchmark | 单连接 p50 | 本压测（msg 1 步）|
+|---|---|---|---|
+| `--network host` | 187k req/s | 0.015 ms | **11573 笔/秒** |
+| `-p 16379:6379` | 151k req/s | 0.023 ms | 8500 笔/秒 |
+
+每次往返只多 ~8µs，但推一笔事务要串行打几十次 Redis，累积就是 36%。
+**报数时必须说明用的是哪种**。想复现 host 那一列：
+
+    docker run -d --name dtmrs-redis-host --network host redis:7 \
+        redis-server --port 16999 --save ''
+    BENCH_REDIS=redis://127.0.0.1:16999/1 python3 bench/bench.py --db redis ...
+
 # 影响结果的因素（报数时必须一起报）
 
 - 存储（sqlite 本地文件 / Postgres / MySQL / Redis 差一个量级）
+- **存储的网络路径**：见上面那节，docker 端口映射差 36%
+- 事务模式（`--mode saga|msg`）和步数（`--steps`）
 - 推进 worker 数（`--workers`）：单进程内并行抢占的协程数
 - TC 的 tick 间隔：推进器空转时的轮询周期，直接决定延迟下限
 - 业务分支耗时：这里是 ~0，真实业务会大得多
 - 机器：CPU 核数、磁盘、是否与数据库同机
-- 压测脚本的业务服务进程数（`--busi-procs`）：不够就是在测脚本
+- 压测脚本的进程数（`--busi-procs` / `--client-procs`）：不够就是在测脚本
 """
 
 import argparse
@@ -63,7 +82,8 @@ BUSI_PORT = 8899
 TC_HOST, TC_PORT = "127.0.0.1", 36700
 TC_HTTP = f"{TC_HOST}:{TC_PORT}"
 
-# 第二步的正向动作路径。命中它 == 这笔事务的最后一步业务动作成功了
+# 最后一步的正向动作路径。命中它 == 这笔事务的最后一步业务动作成功了。
+# 由 --steps 决定，main() 里会改写
 FINAL_ACTION = "/a2"
 
 
@@ -140,24 +160,74 @@ def wait_http(path, timeout=30):
     return False
 
 
-def submit_all(n, concurrency, prefix):
+def client_calls(mode, gid, steps):
+    """一笔事务客户端要按顺序发的请求，`[(path, body), ...]`。
+
+    两种模式的**客户端往返次数不一样**，这是它们本质的差别之一：
+
+    - `saga`：一次 submit 就带上全部步骤和补偿
+    - `msg`：prepare →（业务自己的本地事务）→ submit，**两次**。
+      换来的是没有补偿分支：秒杀这类场景本来也没有「反向扣库存」这回事，
+      一致性靠「本地事务成功了就一定把消息投出去」保证
+    """
+    acts = [f"http://127.0.0.1:{BUSI_PORT}/a{i + 1}" for i in range(steps)]
+    if mode == "saga":
+        body = {
+            "gid": gid,
+            "steps": [
+                {"action": a, "compensate": f"http://127.0.0.1:{BUSI_PORT}/c{i + 1}"}
+                for i, a in enumerate(acts)
+            ],
+        }
+        return [("/api/dtmsvr/submit", json.dumps(body).encode())]
+
+    prepare = {
+        "gid": gid,
+        "trans_type": "msg",
+        "actions": acts,
+        # 崩在 prepare 和 submit 之间时 TC 靠它决断，这里跑不到
+        "query_prepared": f"http://127.0.0.1:{BUSI_PORT}/query",
+    }
+    return [
+        ("/api/dtmsvr/prepare", json.dumps(prepare).encode()),
+        ("/api/dtmsvr/submit", json.dumps({"gid": gid, "trans_type": "msg"}).encode()),
+    ]
+
+
+def submit_all(n, concurrency, prefix, mode, steps, procs):
     """并发提交 n 笔事务，返回提交阶段耗时。
 
-    每个线程一条 keep-alive 长连接 —— 上一版每笔都重开 TCP，
+    ⚠ **提交端必须是多进程的**，理由和业务服务那边一样：单个 Python 进程
+    的 HTTP 客户端实测只能推 ~5500 req/s（打 `/health` 这种零成本端点也一样），
+    再往上就是 GIL 在挡。
+
+    这个坑差点让人得出错误结论：比较 saga 和 msg 时，msg 每笔要发两个请求
+    （prepare + submit），于是它「看起来慢 45%」—— 其实两种模式的提交阶段
+    都顶在客户端的 5500 req/s 上，测的根本不是 dtmrs。
+    """
+    per = (n + procs - 1) // procs
+    t0 = time.perf_counter()
+    ps = []
+    for k in range(procs):
+        lo, hi = k * per, min((k + 1) * per, n)
+        if lo >= hi:
+            break
+        p = mp.Process(target=submit_slice,
+                       args=(lo, hi, concurrency, prefix, mode, steps), daemon=True)
+        p.start()
+        ps.append(p)
+    for p in ps:
+        p.join()
+    return time.perf_counter() - t0
+
+
+def submit_slice(lo, hi, concurrency, prefix, mode, steps):
+    """一个提交进程负责 `[lo, hi)` 这一段。
+
+    每个线程一条 keep-alive 长连接 —— 早期版本每笔都重开 TCP，
     提交阶段测的一半是握手
     """
-    bodies = [
-        json.dumps({
-            "gid": f"{prefix}-{i}",
-            "steps": [
-                {"action": f"http://127.0.0.1:{BUSI_PORT}/a1",
-                 "compensate": f"http://127.0.0.1:{BUSI_PORT}/c1"},
-                {"action": f"http://127.0.0.1:{BUSI_PORT}{FINAL_ACTION}",
-                 "compensate": f"http://127.0.0.1:{BUSI_PORT}/c2"},
-            ],
-        }).encode()
-        for i in range(n)
-    ]
+    work = [client_calls(mode, f"{prefix}-{i}", steps) for i in range(lo, hi)]
 
     local = threading.local()
 
@@ -166,12 +236,11 @@ def submit_all(n, concurrency, prefix):
             local.c = http.client.HTTPConnection(TC_HOST, TC_PORT, timeout=30)
         return local.c
 
-    def one(body):
+    def send(path, body):
         for attempt in range(2):
             try:
                 c = conn()
-                c.request("POST", "/api/dtmsvr/submit", body,
-                          {"content-type": "application/json"})
+                c.request("POST", path, body, {"content-type": "application/json"})
                 c.getresponse().read()
                 return
             except Exception:
@@ -184,10 +253,12 @@ def submit_all(n, concurrency, prefix):
                 if attempt:
                     raise
 
-    t0 = time.perf_counter()
+    def one(calls):
+        for path, body in calls:
+            send(path, body)
+
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        list(pool.map(one, bodies))
-    return time.perf_counter() - t0
+        list(pool.map(one, work))
 
 
 def verify_final(prefix, n, concurrency=16, patience=30):
@@ -286,9 +357,18 @@ def main():
     ap.add_argument("--workers", default="8", help="推进器并行 worker 数")
     ap.add_argument("--busi-procs", type=int, default=8,
                     help="零操作业务服务的进程数。太少就是在测压测脚本自己")
+    ap.add_argument("--client-procs", type=int, default=8,
+                    help="提交端的进程数。单进程只能推 ~5500 req/s，太少同样是在测脚本")
+    ap.add_argument("--mode", default="saga", choices=("saga", "msg"),
+                    help="saga（带补偿）| msg（二阶段消息，秒杀那类场景用的）")
+    ap.add_argument("--steps", type=int, default=2, help="一笔事务几个正向分支")
     ap.add_argument("--bin", default="target/release/dtmrs")
     ap.add_argument("--quiet", action="store_true", help="只打一行结果，方便扫参数")
     args = ap.parse_args()
+
+    # 完成判定盯的是最后一步正向动作
+    global FINAL_ACTION
+    FINAL_ACTION = f"/a{args.steps}"
 
     dsn = {
         "sqlite": "sqlite:/tmp/bench.db",
@@ -321,7 +401,8 @@ def main():
 
         prefix = f"b{int(time.time())}"
         t_start = time.perf_counter()
-        submit_secs = submit_all(args.n, args.concurrency, prefix)
+        submit_secs = submit_all(args.n, args.concurrency, prefix,
+                                 args.mode, args.steps, args.client_procs)
 
         # 完成判定：直接读共享内存里的计数，不发一个请求（见模块头注释）
         stalled = 0
@@ -343,7 +424,7 @@ def main():
         if args.quiet:
             # 清库失败一定要带出来 —— 存量数据会让数字慢慢往下漂
             warn = "" if reset.startswith(("已", "库是")) else f"  {reset}"
-            print(f"{args.db:9s} workers={args.workers:>3s}  "
+            print(f"{args.mode:5s} {args.db:9s} workers={args.workers:>3s}  "
                   f"{finished/drive_secs:7.0f} 笔/秒  "
                   f"终态 {final_n}/{args.n}{warn}")
             return 0
@@ -351,11 +432,13 @@ def main():
         print(f"\n=== dtmrs 压测 · 存储={args.db} ===")
         print(f"  机器          : {platform.processor() or platform.machine()}, "
               f"{os.cpu_count()} 核, {platform.system()}")
-        print(f"  事务          : {args.n} 笔 × 2 步（业务分支零操作）")
+        print(f"  模式          : {args.mode}")
+        print(f"  事务          : {args.n} 笔 × {args.steps} 步（业务分支零操作）")
         print(f"  提交并发      : {args.concurrency}")
         print(f"  推进器 tick   : {args.tick} ms")
         print(f"  推进 worker   : {args.workers}")
         print(f"  业务服务进程  : {args.busi_procs}")
+        print(f"  提交端进程    : {args.client_procs}")
         print(f"  跑之前清库    : {reset}")
         print(f"  ---")
         print(f"  提交阶段      : {submit_secs:.2f}s  →  {args.n/submit_secs:.0f} 笔/秒")
