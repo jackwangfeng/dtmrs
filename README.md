@@ -972,11 +972,11 @@ different things:
 
 ```toml
 # running the coordinator (or embedding it in your process)
-dtmrs = "0.2"
+dtmrs = "0.3"
 
 # a business service (RM): you only need the barrier for idempotence.
 # Don't drag the whole coordinator (axum, tonic, ...) into it
-dtmrs = { version = "0.2", default-features = false, features = ["barrier"] }
+dtmrs = { version = "0.3", default-features = false, features = ["barrier"] }
 ```
 
 | Feature | Gives you |

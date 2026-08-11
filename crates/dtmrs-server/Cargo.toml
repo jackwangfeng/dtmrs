@@ -22,8 +22,8 @@ grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
 redis = ["dtmrs-store/redis"]
 
 [dependencies]
-dtmrs-core = { path = "../dtmrs-core", version = "0.2.0" }
-dtmrs-store = { path = "../dtmrs-store", version = "0.2.0" }
+dtmrs-core = { path = "../dtmrs-core", version = "0.3.0" }
+dtmrs-store = { path = "../dtmrs-store", version = "0.3.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -48,7 +48,7 @@ path = "src/lib.rs"
 [dev-dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
-dtmrs-xa = { path = "../dtmrs-xa", version = "0.2.0" }
+dtmrs-xa = { path = "../dtmrs-xa", version = "0.3.0" }
 sqlx = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }

@@ -39,11 +39,11 @@ Go 做不到这个形态：`c-shared` 会把整个运行时拖进宿主进程。
 
 ```toml
 # 跑协调器（或把它嵌进自己进程）
-dtmrs = "0.2"
+dtmrs = "0.3"
 
 # 业务服务（RM）：只需要屏障做幂等，
 # 别把整个协调器（axum、tonic 那一堆）拖进去
-dtmrs = { version = "0.2", default-features = false, features = ["barrier"] }
+dtmrs = { version = "0.3", default-features = false, features = ["barrier"] }
 ```
 
 | Feature | 给你什么 |
