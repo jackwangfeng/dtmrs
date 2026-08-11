@@ -54,14 +54,11 @@ jobs:
           fi
           echo "npm=$(npm --version) node=$(node --version)"
 
-      - name: 诊断 OIDC 环境
+      - name: 确认 OIDC 环境就绪
         run: |
-          echo "id-token 权限是否生效（这两个变量由 GitHub 在有 id-token:write 时注入）:"
-          echo "  ACTIONS_ID_TOKEN_REQUEST_URL: ${ACTIONS_ID_TOKEN_REQUEST_URL:+已注入}${ACTIONS_ID_TOKEN_REQUEST_URL:-缺失}"
-          echo "  ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+已注入}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-缺失}"
-          echo "  仓库: $GITHUB_REPOSITORY | 工作流文件: $(basename "$GITHUB_WORKFLOW_REF" | cut -d@ -f1)"
-          echo "setup-node 写的 .npmrc:"
-          sed -E 's#(_authToken=).*#\1<值已隐藏>#' "$NPM_CONFIG_USERCONFIG" 2>/dev/null || echo "  (无)"
+          # 缺这两个变量说明 id-token: write 没生效，publish 会直接 ENEEDAUTH
+          : "${ACTIONS_ID_TOKEN_REQUEST_URL:?缺 OIDC 环境变量，检查 permissions.id-token}"
+          echo "OIDC 环境就绪，仓库 $GITHUB_REPOSITORY"
 
       - name: 看看会发什么
         working-directory: clients/node
@@ -78,7 +75,7 @@ jobs:
         if: ${{ !inputs.dry_run }}
         working-directory: clients/node
         # 配了 trusted publisher 之后 npm 自动走 OIDC，并附带 provenance
-        run: npm publish --loglevel=verbose
+        run: npm publish
 
   pypi:
     if: inputs.target == 'pypi' || inputs.target == 'both'

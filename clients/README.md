@@ -116,6 +116,13 @@ GitHub Actions 用 OIDC 直接向 registry 证明身份，**不需要任何长�
 > 先手动发一次（`NPM_OTP=xxxxxx ./publish.sh node`），之后就能全走 OIDC。
 >
 > ⚠ 工作流**文件名**是配置的一部分，改名会导致发布失败。
+>
+> ⚠ **Environment name 必须留空**（除非工作流的 npm job 里也设了同名 environment）——
+> 填了但对不上会一直报 `OIDC token exchange error - package not found`，
+> 而这个报错措辞有误导性，看着像包不存在。
+>
+> ⚠ setup-node 的 `registry-url` **必须保留**。去掉会直接 ENEEDAUTH ——
+> npm 靠它知道跟哪个 registry 做 OIDC 交换。它写的 NODE_AUTH_TOKEN 占位符无害。
 
 **PyPI** —— PyPI 支持 *pending publisher*，**全新项目也能直接走 OIDC**，不用先手动发：
 [Publishing → Add a new pending publisher](https://pypi.org/manage/account/publishing/)，填项目名
