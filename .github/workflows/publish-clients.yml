@@ -1,0 +1,93 @@
+# 发布业务侧客户端到 npm / PyPI —— 全程 OIDC，仓库里不存任何长期 token。
+#
+# ⚠ 这个文件的**文件名**要填进 npmjs.com 和 PyPI 的信任配置里，改名会导致发布失败。
+#
+# 手动触发（workflow_dispatch）而不是推 tag 就发 —— 发布不可逆，
+# npm/PyPI 只能 yank 不能删，让人显式点一下更安全。
+name: publish-clients
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 发哪个
+        required: true
+        default: both
+        type: choice
+        options: [npm, pypi, both]
+      dry_run:
+        description: 只演练不真发
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  npm:
+    if: inputs.target == 'npm' || inputs.target == 'both'
+    runs-on: ubuntu-latest
+    permissions:
+      # OIDC 就靠它 —— 没有这条，npm 拿不到身份令牌
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # trusted publishing 要求 Node ≥ 22.14
+          node-version: '22.14'
+          registry-url: https://registry.npmjs.org/
+
+      - name: 确保 npm ≥ 11.5.1（trusted publishing 的最低版本）
+        run: |
+          npm install -g npm@latest
+          npm --version
+          node --version
+
+      - name: 看看会发什么
+        working-directory: clients/node
+        run: npm pack --dry-run
+
+      - name: 演练
+        if: inputs.dry_run
+        working-directory: clients/node
+        run: |
+          echo "dry_run=true，只演练不发布"
+          npm publish --dry-run
+
+      - name: 发布（OIDC，无 token）
+        if: ${{ !inputs.dry_run }}
+        working-directory: clients/node
+        # 配了 trusted publisher 之后 npm 自动走 OIDC，并附带 provenance。
+        # 这里**刻意不设 NODE_AUTH_TOKEN** —— 有 token 反而会走回老路
+        run: npm publish
+
+  pypi:
+    if: inputs.target == 'pypi' || inputs.target == 'both'
+    runs-on: ubuntu-latest
+    # PyPI 的信任发布可以绑定到环境，加一层人工审批（可选）
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: 构建
+        working-directory: clients/python
+        run: |
+          python -m pip install --quiet build twine
+          python -m build --outdir dist
+          python -m twine check dist/*
+          ls -la dist/
+
+      - name: 演练
+        if: inputs.dry_run
+        run: echo "dry_run=true，构建和校验都过了，没有上传"
+
+      - name: 发布（OIDC，无 token）
+        if: ${{ !inputs.dry_run }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: clients/python/dist

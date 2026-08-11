@@ -7,6 +7,8 @@
 # 凭据从各工具自己的位置读，本脚本不碰、不打印：
 #   PyPI   ~/.pypirc 或 TWINE_USERNAME=__token__ TWINE_PASSWORD=pypi-xxx
 #   npm    ~/.npmrc 里的 //registry.npmjs.org/:_authToken=
+#          开了 2FA 的话还要动态码：NPM_OTP=123456 ./publish.sh node
+#          （或者生成 token 时勾上 "Bypass two-factor authentication"）
 #          ⚠ SSH 环境下别用 `npm login`（默认要弹浏览器），见 README 的说明。
 #          ⚠ 本机 registry 若指向淘宝等镜像不影响发布 —— package.json 里
 #             publishConfig 已经把目标钉死在官方源，镜像是只读的发不上去
@@ -37,7 +39,11 @@ if [ "$ONLY" = all ] || [ "$ONLY" = node ]; then
     fi
     echo "  当前 npm 账号: $who"
     npm pack --dry-run
-    confirm "发布 dtmrs-barrier@$VERSION 到 npm？" && npm publish )
+    # 账号开了 2FA 且 token 没勾 bypass 的话，必须带动态码：
+    #   NPM_OTP=123456 ./publish.sh node
+    OTP_ARG=""
+    [ -n "${NPM_OTP:-}" ] && OTP_ARG="--otp=$NPM_OTP"
+    confirm "发布 dtmrs-barrier@$VERSION 到 npm？" && npm publish $OTP_ARG )
 fi
 
 if [ "$ONLY" = all ] || [ "$ONLY" = java ]; then

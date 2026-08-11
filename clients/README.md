@@ -70,17 +70,60 @@ token 可以限定权限、随时吊销，比存登录态安全。
 npm login --auth-type=legacy --registry https://registry.npmjs.org/
 ```
 
-**③ web 流程但手动开链接** —— 必须加 `--browser false`：
+**③ web 流程 —— SSH 下走不通，别试了**
 
-```bash
-npm login --registry https://registry.npmjs.org/ --browser false
+`npm login` 会打印登录 URL，但 **npm 把 URL 里的会话 ID 当密钥脱敏成了 `***`**
+（调试日志里也是 `***`，捞不出来），所以那条链接复制出去必然 404。
+加 `--browser false` 能避免 `xdg-open` 报错，但 URL 照样是脱敏的 —— 这条路
+在无浏览器环境下等于自己把自己堵死。**用方式 ① 的 token。**
+
+### 开了 2FA 怎么发布
+
+token 认证通过不代表能发布。如果账号开了 2FA 而 token 没勾
+**Bypass two-factor authentication**，`npm publish` 会报：
+
+```
+403 Two-factor authentication or granular access token with bypass 2fa enabled is required
 ```
 
-它会打印一个 URL，复制到你本机浏览器打开完成授权，CLI 这边轮询到就登录成功。
+两条路：
 
-> ⚠ **不加 `--browser false` 会失败**。npm 打印完 URL 会去调 `xdg-open`，
-> 服务器上没装任何浏览器 → `xdg-open: no method available` → npm 以 code 3 退出，
-> **轮询也跟着停了**，这时候你再去开那个链接也没用。
+```bash
+# ① 发布时补一个动态码（推荐，token 权限更小）
+NPM_OTP=123456 ./publish.sh node
+
+# ② 或者重新生成 token 时勾上 "Bypass two-factor authentication"
+#    ⚠ npm 正在收紧这类 token，长期看方式 ① 更稳
+```
+
+### 推荐：Trusted Publishing（OIDC），不存任何 token
+
+仓库里有现成的工作流 [`.github/workflows/publish-clients.yml`](../.github/workflows/publish-clients.yml)，
+GitHub Actions 用 OIDC 直接向 registry 证明身份，**不需要任何长期 token，也不需要 2FA 交互**。
+
+一次性配置：
+
+**npm** —— 到 npmjs.com 的**包设置页** → Trusted Publisher → 填：
+
+| 字段 | 值 |
+|---|---|
+| Organization or user | `jackwangfeng` |
+| Repository | `dtmrs` |
+| Workflow filename | `publish-clients.yml` |
+| Allowed actions | 勾 `npm publish` |
+
+> ⚠ npm 的信任发布是在**包的设置页**里配的，所以包**得先存在**。全新的包需要
+> 先手动发一次（`NPM_OTP=xxxxxx ./publish.sh node`），之后就能全走 OIDC。
+>
+> ⚠ 工作流**文件名**是配置的一部分，改名会导致发布失败。
+
+**PyPI** —— PyPI 支持 *pending publisher*，**全新项目也能直接走 OIDC**，不用先手动发：
+[Publishing → Add a new pending publisher](https://pypi.org/manage/account/publishing/)，填项目名
+`dtmrs-barrier`、owner `jackwangfeng`、repo `dtmrs`、workflow `publish-clients.yml`、
+environment `pypi`。
+
+配好之后在 Actions 页手动触发这个工作流，选 target 和是否 dry_run。
+**默认是 dry_run=true**，确认输出没问题再关掉重跑。
 
 > ⚠ **如果你的 npm registry 指向淘宝等镜像**（`npm config get registry` 看一下），
 > 那是**只读镜像，发布会失败**。认证和发布都必须对着 `registry.npmjs.org`。
