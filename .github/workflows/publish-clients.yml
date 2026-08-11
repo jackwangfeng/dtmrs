@@ -192,8 +192,13 @@ jobs:
           mvn -B -Prelease verify -DskipTests
           echo "--- 构件和签名 ---"
           ls -1 target/*.jar target/*.asc
-          # 没有 .asc 就说明签名没生效，那样 deploy 到 Central 一定被拒
-          test -f target/dtmrs-barrier-*.jar.asc || { echo "❌ 签名没生成"; exit 1; }
+          # 没有 .asc 就说明签名没生效，那样 deploy 到 Central 一定被拒。
+          # ⚠ 别用 `test -f target/*.asc` —— glob 展开成多个文件时 test 只收
+          # 一个参数，会直接返回假，把「签名齐全」误报成「没生成」（踩过）
+          n=$(ls -1 target/*.asc 2>/dev/null | wc -l)
+          echo "签名文件数: $n"
+          # jar + sources + javadoc + pom = 4 个，少一个 Central 就会拒
+          [ "$n" -ge 4 ] || { echo "❌ 签名不全，只有 $n 个（应有 4 个）"; exit 1; }
 
       - name: 上传到 Central（停在门户等人点发布）
         if: ${{ !inputs.dry_run }}
