@@ -574,20 +574,24 @@ impl RedisStore {
             r#"
             {sched}
             local v = redis.call('HMGET', KEYS[1], 'status', 'trans_type')
-            if not v[1] then return 'MISSING' end
-            if v[1] ~= ARGV[3] then return 'ALREADY' end
+            if not v[1] then return {{'MISSING'}} end
+            if v[1] ~= ARGV[3] then return {{'ALREADY'}} end
             redis.call('HSET', KEYS[1], 'status', ARGV[2], 'update_time', ARGV[1],
                        'next_cron_time', ARGV[5], 'next_cron_interval', 0,
                        'owner', ARGV[6])
             if schedulable(ARGV[2], v[2]) then
                 redis.call('ZADD', KEYS[2], ARGV[5], ARGV[4])
             end
-            return 'ADVANCED'
+            -- 尾巴上带回事务体，调用方占了租约就能直接开推，不用再读一次。
+            -- 首元素是标记，后面是 HGETALL 的 field/value 对
+            local r = redis.call('HGETALL', KEYS[1])
+            table.insert(r, 1, 'ADVANCED')
+            return r
             "#,
             sched = LUA_SCHEDULABLE
         ));
         let mut c = self.conn.clone();
-        let r: String = script
+        let r: Vec<String> = script
             .key(self.gkey(gid))
             .key(self.ikey())
             .arg(t)
@@ -598,9 +602,20 @@ impl RedisStore {
             .arg(owner)
             .invoke_async(&mut c)
             .await?;
-        Ok(match r.as_str() {
-            "MISSING" => SubmitOutcome::Missing,
-            "ADVANCED" => SubmitOutcome::Advanced,
+        Ok(match r.first().map(String::as_str) {
+            Some("ADVANCED") => {
+                let map: std::collections::HashMap<String, String> = r[1..]
+                    .chunks(2)
+                    .filter(|c| c.len() == 2)
+                    .map(|c| (c[0].clone(), c[1].clone()))
+                    .collect();
+                match Self::global_from(&map) {
+                    Some(g) => SubmitOutcome::Advanced(Box::new(g)),
+                    // 理论上不会发生（刚写完就读不出来），保守当成已提交
+                    None => SubmitOutcome::Already,
+                }
+            }
+            Some("MISSING") => SubmitOutcome::Missing,
             _ => SubmitOutcome::Already,
         })
     }

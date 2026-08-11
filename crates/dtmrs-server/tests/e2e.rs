@@ -445,3 +445,54 @@ async fn 不开内联时提交不推进() {
         "没开内联就不该占租约，推进器要能抢到"
     );
 }
+
+/// msg 模式也走内联：prepare → submit 之后**不靠推进器抢**就能推完，
+/// 而且租约期内抢占看不到它。
+///
+/// msg 跟 saga 的区别是事务体不在提交方手上（是 prepare 时建的），
+/// 所以 `submit_prepared` 要把它一起带回来 —— 这条测试同时钉住了那个返回值：
+/// 带不回来的话下面就推不动。
+#[tokio::test]
+async fn msg提交后直接开推_不经过抢占() {
+    let (store, driver, busi, st) = setup("ok").await;
+    let api = Api::new(store.clone()).with_inline_driver(driver.clone());
+    let actions: Vec<String> = st.iter().map(|s| s.action.clone()).collect();
+
+    api.prepare(
+        "inline-msg",
+        "msg",
+        &actions,
+        "http://127.0.0.1:1/q",
+        Some(10),
+    )
+    .await
+    .unwrap();
+    // prepared 的 msg 本来就是可调度的（要回查），所以这里先确认它在队列里
+    api.submit("inline-msg", "msg", &[]).await.unwrap();
+
+    // 提交方占着租约 —— 抢占必须抢不到
+    assert!(
+        store
+            .lock_one_due("另一个实例", 60)
+            .await
+            .unwrap()
+            .is_none(),
+        "租约期内被别人抢到了，会导致同一笔事务被推两次"
+    );
+
+    for _ in 0..100 {
+        if store
+            .get_global("inline-msg")
+            .await
+            .unwrap()
+            .is_some_and(|g| g.status == GlobalStatus::Succeed)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let got = store.get_global("inline-msg").await.unwrap().unwrap();
+    assert_eq!(got.status, GlobalStatus::Succeed, "提交那条路应该把它推完");
+    let (a1, _, a2, _) = busi.counts();
+    assert_eq!((a1, a2), (1, 1), "两个正向分支各调一次");
+}

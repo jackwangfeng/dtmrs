@@ -132,6 +132,21 @@ impl Api {
         true
     }
 
+    /// 把 prepared 推成 submitted，开了内联就**顺便占下租约**。
+    ///
+    /// 返回 `Advanced` 时事务体一起带回来了，调用方可以直接 [`Self::drive_detached`]，
+    /// 不用再读一次（Redis 是脚本尾巴上的 HGETALL，SQL 是本来就要发的那条 SELECT）
+    async fn claim_and_submit(&self, gid: &str) -> Result<SubmitOutcome> {
+        let (owner, nct) = match &self.inline {
+            Some(d) => (d.owner.clone(), dtmrs_store::now() + d.lease),
+            None => (String::new(), dtmrs_store::now()),
+        };
+        self.store
+            .submit_prepared(gid, &owner, nct)
+            .await
+            .map_err(internal)
+    }
+
     /// 把已经拿到租约的事务扔出去推。**不等它跑完** —— 提交要立刻返回。
     fn drive_detached(&self, g: dtmrs_store::GlobalRow) {
         let Some(d) = self.inline.clone() else { return };
@@ -170,13 +185,12 @@ impl Api {
                     // ⚠ 不带步骤的重复提交**必须幂等成功**，不能因为 steps 为空
                     // 就报错 —— 客户端重试时经常只带 gid。只有事务压根不存在，
                     // 才是真的参数错误。（`tc的grpc_api与http同源` 钉着这条）
-                    return match self
-                        .store
-                        .submit_prepared(gid, "", dtmrs_store::now())
-                        .await
-                        .map_err(internal)?
-                    {
-                        SubmitOutcome::Advanced | SubmitOutcome::Already => Ok(()),
+                    return match self.claim_and_submit(gid).await? {
+                        SubmitOutcome::Advanced(g) => {
+                            self.drive_detached(*g);
+                            Ok(())
+                        }
+                        SubmitOutcome::Already => Ok(()),
                         SubmitOutcome::Missing => {
                             Err(ApiError::BadRequest("saga 的 steps 不能为空".into()))
                         }
@@ -204,10 +218,9 @@ impl Api {
                 // 已存在。可能是重复提交（幂等返回成功就行），也可能是这个 gid
                 // 其实是 prepare 过的 tcc/msg/xa —— 客户端没传 trans_type 时
                 // 会被当成 saga。后一种要真的把它推成 submitted，交给下面决断
-                self.store
-                    .submit_prepared(gid, "", dtmrs_store::now())
-                    .await
-                    .map_err(internal)?;
+                if let SubmitOutcome::Advanced(g) = self.claim_and_submit(gid).await? {
+                    self.drive_detached(*g);
+                }
                 Ok(())
             }
             TransType::Tcc | TransType::Msg | TransType::Xa => {
@@ -215,14 +228,16 @@ impl Api {
                 //
                 // **一次存储调用做完**（原来是 get_global + set_global_status
                 // + schedule_now 三次）。Redis 上这三次是 11 条命令，现在 3 条
-                match self
-                    .store
-                    .submit_prepared(gid, "", dtmrs_store::now())
-                    .await
-                    .map_err(internal)?
-                {
+                match self.claim_and_submit(gid).await? {
+                    // 推成 submitted 了。开了内联就直接推 —— 跟 saga 一样，
+                    // 省掉那次抢占往返。事务体是 submit_prepared 顺带返回的，
+                    // 没有多付一次读
+                    SubmitOutcome::Advanced(g) => {
+                        self.drive_detached(*g);
+                        Ok(())
+                    }
                     // 已经提交过 —— 幂等返回成功
-                    SubmitOutcome::Advanced | SubmitOutcome::Already => Ok(()),
+                    SubmitOutcome::Already => Ok(()),
                     SubmitOutcome::Missing => {
                         Err(ApiError::BadRequest("tcc/xa/msg 要先调 prepare".into()))
                     }

@@ -816,17 +816,22 @@ generator, 20k transactions, median of three:
 
 | Mode | dtmrs | DTM v1.19 | |
 |---|---|---|---|
-| saga, 2 steps | **14112 tx/s** | 9582 | dtmrs +47% |
-| msg, 1 forward step | **12371 tx/s** | 10058 | dtmrs +23% |
+| msg, 1 forward step (flash-sale shape) | **18580 tx/s** | 9853 | dtmrs +89% |
+| saga, 2 steps | **13883 tx/s** | 9208 | dtmrs +51% |
 
-The saga row used to be a **22% loss** (7630 vs 9339). The gap was exactly the claim round
-trip described above: DTM drives inline in the submit request and never queues, while we
-claimed every transaction first. Folding the claim into the creating write turned a 22%
-deficit into a 47% lead.
+These two rows used to be **msg +22%, saga −22%**. The gap was exactly the claim round trip
+described above: DTM drives inline in the submit request and never queues, while we claimed
+every transaction first. After folding the claim into the submitting write:
 
-(The msg path does not do inline driving yet — its `submit_prepared` would have to return
-the transaction body for us to drive it directly, which is extra work on a path that was
-already winning. Known remaining headroom.)
+| | Before inline | After inline |
+|---|---|---|
+| saga, 2 steps | 7630 (−22%) | **13883 (+51%)** |
+| msg, 1 step | 12371 (+23%) | **18580 (+89%)** |
+
+A msg transaction body is created at `prepare` time, so it is not in the submitter's hands
+— `submit_prepared` therefore hands it back. On Redis that is one `HGETALL` on the tail of
+the script; on SQL it is the SELECT we were already sending, widened from `status` to the
+full row. **Neither backend pays an extra round trip for it.**
 
 Two honest footnotes:
 

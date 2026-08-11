@@ -53,12 +53,17 @@ pub fn now() -> i64 {
 /// 之所以要区分三种情况：`submit` 既要处理「tcc/msg/xa 把 prepared 推成
 /// submitted」，也要处理「saga 第一次提交，事务还不存在」，还要保证
 /// **重复提交返回成功而不是报错**（见 `api::submit` 的注释）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum SubmitOutcome {
     /// gid 不存在 —— 调用方该按新事务建
     Missing,
-    /// 本来停在 prepared，已经推成 submitted 并排进调度队列
-    Advanced,
+    /// 本来停在 prepared，已经推成 submitted 并排进调度队列。
+    ///
+    /// **带上事务体**：调用方要是顺便占了租约（见 `submit_prepared` 的
+    /// `owner` 参数），可以拿它直接开推，不用再读一次。为这个多带的返回值，
+    /// 两种后端都没有多付往返 —— Redis 是脚本尾巴上加一个 `HGETALL`，
+    /// SQL 是把本来就要发的那条 SELECT 从「只取 status」改成取全行
+    Advanced(Box<GlobalRow>),
     /// 已经提交过了。**必须当成功返回**，否则客户端会以为没受理
     Already,
 }
@@ -545,16 +550,18 @@ impl SqlStore {
         next_cron_time: i64,
     ) -> Result<SubmitOutcome> {
         // 先查一次。saga 第一次提交时事务还不存在，这是最常见的路径，
-        // 一次 SELECT 就该返回，不值得为它先空跑一条 UPDATE
-        let st: Option<String> =
-            sqlx::query_scalar(&self.be.q("SELECT status FROM trans_global WHERE gid=?"))
-                .bind(gid)
-                .fetch_optional(&self.pool)
-                .await?;
-        let Some(st) = st else {
+        // 一次 SELECT 就该返回，不值得为它先空跑一条 UPDATE。
+        // 取全行而不只是 status —— 反正这条 SELECT 免不了，顺手把事务体带回去，
+        // 调用方就能直接开推（见 `SubmitOutcome::Advanced`）
+        let row = sqlx::query(&self.be.q(&format!("{SELECT_GLOBAL} WHERE gid=?")))
+            .bind(gid)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
             return Ok(SubmitOutcome::Missing);
         };
-        if st != GlobalStatus::Prepared.as_str() {
+        let mut g = global_from_row(row);
+        if g.status != GlobalStatus::Prepared {
             return Ok(SubmitOutcome::Already);
         }
         let t = now();
@@ -572,7 +579,11 @@ impl SqlStore {
         .bind(GlobalStatus::Prepared.as_str())
         .execute(&self.pool)
         .await?;
-        Ok(SubmitOutcome::Advanced)
+        // 把刚写下去的三个字段补到返回的事务体上，省掉一次回读
+        g.status = GlobalStatus::Submitted;
+        g.next_cron_time = next_cron_time;
+        g.owner = owner.to_string();
+        Ok(SubmitOutcome::Advanced(Box::new(g)))
     }
 
     /// 让某个事务立刻可被调度（提交/中止之后叫一下，不用等 cron 周期）
