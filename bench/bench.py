@@ -364,6 +364,8 @@ def main():
     ap.add_argument("--steps", type=int, default=2, help="一笔事务几个正向分支")
     ap.add_argument("--bin", default="target/release/dtmrs")
     ap.add_argument("--quiet", action="store_true", help="只打一行结果，方便扫参数")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="跳过终态核对。**只在数存储命令次数时用** —— 核对本身要把\n                         每笔事务都查一遍，会把每笔的命令数算多（踩过）")
     args = ap.parse_args()
 
     # 完成判定盯的是最后一步正向动作
@@ -419,7 +421,10 @@ def main():
         finished = done.value
 
         # 不计时的正确性核对
-        final_n, dist = verify_final(prefix, args.n)
+        if args.no_verify:
+            final_n, dist = -1, {"跳过核对": args.n}
+        else:
+            final_n, dist = verify_final(prefix, args.n)
 
         if args.quiet:
             # 清库失败一定要带出来 —— 存量数据会让数字慢慢往下漂
