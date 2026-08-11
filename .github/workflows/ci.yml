@@ -101,6 +101,7 @@ jobs:
         run: |
           docker run -d --name pg -p 5432:5432 -e POSTGRES_PASSWORD=dtmrs -e POSTGRES_DB=dtmrs postgres:16-alpine
           docker run -d --name my -p 3306:3306 -e MYSQL_ROOT_PASSWORD=dtmrs -e MYSQL_DATABASE=dtmrs mysql:8.0
+          docker run -d --name rd -p 6379:6379 redis:7-alpine
           for i in $(seq 1 60); do docker exec pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 2; done
           for i in $(seq 1 60); do docker exec my mysqladmin ping -uroot -pdtmrs >/dev/null 2>&1 && break; sleep 2; done
 
@@ -109,6 +110,7 @@ jobs:
         env:
           DTMRS_TEST_PG: jdbc:postgresql://127.0.0.1:5432/dtmrs?user=postgres&password=dtmrs
           DTMRS_TEST_MYSQL: jdbc:mysql://127.0.0.1:3306/dtmrs?user=root&password=dtmrs
+          DTMRS_TEST_REDIS_JAVA: 127.0.0.1:6379
         run: |
           mkdir -p lib && cd lib
           curl -sSLO https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar
@@ -120,6 +122,7 @@ jobs:
         env:
           DTMRS_TEST_PG_GO: postgres://postgres:dtmrs@127.0.0.1:5432/dtmrs?sslmode=disable
           DTMRS_TEST_MYSQL_GO: root:dtmrs@tcp(127.0.0.1:3306)/dtmrs
+          DTMRS_TEST_REDIS_GO: 127.0.0.1:6379
         run: go test -v ./...
 
       - name: Python
@@ -127,16 +130,19 @@ jobs:
         env:
           DTMRS_TEST_PG_PY: postgresql://postgres:dtmrs@127.0.0.1:5432/dtmrs
           DTMRS_TEST_MYSQL_PY: 127.0.0.1|3306|root|dtmrs|dtmrs
+          DTMRS_TEST_REDIS_PY: 127.0.0.1:6379
         run: |
           pip install --quiet psycopg2-binary pymysql
           python3 test_barrier.py
+          python3 test_barrier_redis.py
 
       - name: Node
         working-directory: clients/node
         env:
           DTMRS_TEST_PG_NODE: postgresql://postgres:dtmrs@127.0.0.1:5432/dtmrs
           DTMRS_TEST_MYSQL_NODE: mysql://root:dtmrs@127.0.0.1:3306/dtmrs
-        run: npm install --no-audit --no-fund && node test.js
+          DTMRS_TEST_REDIS_NODE: 127.0.0.1:6379
+        run: npm install --no-audit --no-fund && node test.js && node test-redis.js
 
       # 文档里的例子必须真能跑 —— 起真 TC + 真 MySQL，四个语言各走
       # 正常提交/逆序补偿/幂等三个场景，断言的是**账户余额**不是"没报错"

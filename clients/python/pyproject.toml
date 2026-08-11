@@ -29,7 +29,7 @@ Changelog = "https://github.com/jackwangfeng/dtmrs/blob/master/CHANGELOG.md"
 
 [tool.setuptools]
 # 只打这一个模块，别把测试和 pip --target 装下来的驱动卷进去
-py-modules = ["dtmrs_barrier"]
+py-modules = ["dtmrs_barrier", "dtmrs_barrier_redis"]
 
 [tool.setuptools.package-data]
 "*" = ["README.md"]

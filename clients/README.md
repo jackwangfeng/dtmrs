@@ -301,10 +301,44 @@ cd clients && ./verify-examples.sh all      # 或 go / python / node / java
 两个问题——这就是它只要十几行的原因。完整推演见
 [docs/integration.md](../docs/integration.md)。
 
+## 业务数据在 Redis 里（秒杀）
+
+上面那套屏障要求「屏障记录和业务 SQL 在同一个本地事务里提交」。
+**秒杀的库存通常就在 Redis 里，没有 SQL 事务可以加入** —— 那就用 Redis 版：
+原子性来源换成「屏障判定和业务操作在同一个 Lua 脚本里」。
+
+| 语言 | 文件 | 入口 |
+|---|---|---|
+| Go | `go/barrier_redis.go` | `NewRedisBarrier(...).CheckAdjustAmount(eval, key, -1)` |
+| Python | `python/dtmrs_barrier_redis.py` | `RedisBarrier(...).check_adjust_amount(r, key, -1)` |
+| Node | `node/barrier-redis.js` | `new RedisBarrier(...).checkAdjustAmount(evalFn, key, -1)` |
+| Java | `java/src/main/java/dtmrs/RedisBarrier.java` | `new RedisBarrier(...).checkAdjustAmount(eval, key, -1)` |
+
+**四个实现都不引入任何 Redis 库**：只要你给一个「执行 Lua」的回调
+（Go 是 `RedisEval` 接口，Java 是 `Eval` 接口，Python 要 `.eval()` 方法，
+Node 要 `(script, keys, args) => Promise`）。用 go-redis / Jedis / redis-py /
+ioredis 都行，自己包一层即可 —— 各语言文件头都给了一行的适配示例。
+
+不是加减法的业务用 `call()` 传自己的 Lua。判定语义和 Rust 版逐条一致。
+
+⚠ **两处跟 SQL 版的行为差异**（介质决定的）：屏障键会过期（默认 7 天，
+**必须长于事务的最大生命周期**，短了会漏补偿）；业务失败要由脚本
+`return 'FAILURE'` 表达。详见 [docs/integration.md](../docs/integration.md)。
+
 ## 跑测试
 
 每个实现都有一套**相同的**五场景测试：首次执行、幂等、空回滚、悬挂、真补偿。
 四个语言 × Postgres / MySQL 都实跑通过（CI 里每次都跑）。
+
+Redis 屏障另有一套 7 条的测试，四个语言**用例名一一对应**（跟 Rust 版也对应）——
+名字对不上就说明有一边跑偏了。加环境变量即可：
+
+```bash
+DTMRS_TEST_REDIS_GO='127.0.0.1:6379'    # go/    ：go test -run TestRedis
+DTMRS_TEST_REDIS_PY='127.0.0.1:6379'    # python/：python3 test_barrier_redis.py
+DTMRS_TEST_REDIS_NODE='127.0.0.1:6379'  # node/  ：node test-redis.js
+DTMRS_TEST_REDIS_JAVA='127.0.0.1:6379'  # java/  ：./run-test.sh
+```
 
 ```bash
 # Java

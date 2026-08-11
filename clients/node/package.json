@@ -30,6 +30,7 @@
   "files": [
     "barrier.js",
     "barrier.d.ts",
+    "barrier-redis.js",
     "README.md",
     "LICENSE"
   ],
