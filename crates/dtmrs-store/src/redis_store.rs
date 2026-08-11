@@ -32,7 +32,7 @@
 //!
 //! 多个 TC 实例抢同一笔事务时，Redis 侧不需要行锁也不会重复推进。
 
-use crate::{BranchRow, GlobalRow, MID};
+use crate::{BranchRow, GlobalRow, SubmitOutcome, MID};
 use dtmrs_core::dialect::check_len;
 use dtmrs_core::{Backend, BranchOp, BranchStatus, GlobalStatus, TransType};
 use redis::aio::MultiplexedConnection;
@@ -121,9 +121,28 @@ impl RedisStore {
 
     /// 分支在 hash 里的字段名。用 `\x1f`（单元分隔符）拼，
     /// 因为它不可能出现在 branch_id 或 op 里
+    /// 分支的**不变部分**（url + payload）在 `b:{gid}` 里的字段名。
+    ///
+    /// # 为什么可变的 status 要单独一个字段（见 [`Self::sfield`]）
+    ///
+    /// 早先 url / payload / status 一起塞在一个 JSON 值里，于是改一次状态要
+    /// `HGET` → `cjson.decode` → 改 → `cjson.encode` → `HSET`：两条命令外加
+    /// 两次 JSON 编解码，全花在 Redis 那个唯一的线程上。
+    ///
+    /// 拆开之后改状态就是**一条 `HSET`，不读、不解析**。读那边不变 ——
+    /// `list_branches` still 一次 `HGETALL` 把两种字段一起取回来。
     fn bfield(branch_id: &str, op: BranchOp) -> String {
         format!("{}\x1f{}", branch_id, op.as_str())
     }
+
+    /// 分支状态字段。跟 [`Self::bfield`] 同一个哈希，多一个 `\x1fs` 后缀
+    fn sfield(branch_id: &str, op: BranchOp) -> String {
+        format!("{}\x1f{}\x1fs", branch_id, op.as_str())
+    }
+
+    /// 状态字段的后缀。`branch_id` 和 op 里都不会出现 `\x1f`，所以拿它区分
+    /// 两类字段是安全的
+    const SUFFIX: &'static str = "\x1fs";
 
     fn parse_bfield(f: &str) -> Option<(String, BranchOp)> {
         let (b, o) = f.split_once('\x1f')?;
@@ -147,16 +166,19 @@ impl RedisStore {
         Ok(())
     }
 
+    /// 分支的不变部分。**status 不在里面** —— 见 [`Self::bfield`]
     fn branch_value(b: &BranchRow) -> String {
         serde_json::json!({
             "url": b.url,
             "payload": b.payload,
-            "status": b.status.as_str(),
         })
         .to_string()
     }
 
-    fn branch_from(gid: &str, field: &str, val: &str) -> Option<BranchRow> {
+    /// `status` 由调用方从同一个 HGETALL 结果里按 [`Self::sfield`] 取出来传进来。
+    /// 取不到按 `prepared` 算：老数据、或者写了定义还没写状态的中间态，
+    /// 都该当成「还没跑」而不是「跑过了」
+    fn branch_from(gid: &str, field: &str, val: &str, status: Option<&str>) -> Option<BranchRow> {
         let (branch_id, op) = Self::parse_bfield(field)?;
         let v: serde_json::Value = serde_json::from_str(val).ok()?;
         Some(BranchRow {
@@ -173,9 +195,7 @@ impl RedisStore {
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string(),
-            status: v
-                .get("status")
-                .and_then(|x| x.as_str())
+            status: status
                 .and_then(BranchStatus::parse)
                 .unwrap_or(BranchStatus::Prepared),
         })
@@ -219,7 +239,7 @@ impl RedisStore {
         }
         let t = crate::now();
 
-        let script = redis::Script::new(&format!(
+        let script = redis::Script::new(
             r#"
             if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
             redis.call('HSET', KEYS[1],
@@ -227,20 +247,24 @@ impl RedisStore {
                 'payload', ARGV[4], 'next_cron_time', ARGV[5],
                 'next_cron_interval', ARGV[6], 'owner', '', 'rollback_reason', '',
                 'query_prepared', ARGV[7], 'create_time', ARGV[8], 'update_time', ARGV[8])
-            -- 分支从第 10 个 ARGV 开始，每两个一组（field, value）
-            for i = 10, #ARGV, 2 do
-                redis.call('HSETNX', KEYS[2], ARGV[i], ARGV[i + 1])
+            -- 分支从第 10 个 ARGV 开始，每两个一组（field, value），
+            -- 定义和状态各占一组。**一条 HSET 全写完** —— 原来是每个字段
+            -- 一条 HSETNX，分支多的时候命令数线性涨。
+            -- 上面已经确认过全局键不存在，所以不需要 NX 语义
+            if #ARGV >= 10 then
+                redis.call('HSET', KEYS[2], unpack(ARGV, 10))
             end
             if ARGV[9] == '1' then
                 redis.call('ZADD', KEYS[3], ARGV[5], ARGV[1])
             end
             redis.call('ZADD', KEYS[4], ARGV[8], ARGV[1])
-            -- 管理视图只看最近的，索引留个上限免得内存无限涨
-            redis.call('ZREMRANGEBYRANK', KEYS[4], 0, -{cap})
+            -- ⚠ 这里**不做**裁剪。原来每建一笔就跟一条 ZREMRANGEBYRANK，
+            -- 等于每笔事务为管理台的「最近事务」列表多付一条命令。
+            -- 裁剪挪到 list_recent 里 —— 那是控制台翻页时才走的路径，
+            -- 频率比写路径低几个数量级，效果完全一样
             return 1
             "#,
-            cap = RECENT_CAP + 1
-        ));
+        );
 
         let mut inv = script.prepare_invoke();
         inv.key(self.gkey(&g.gid))
@@ -263,6 +287,13 @@ impl RedisStore {
         for b in branches {
             inv.arg(Self::bfield(&b.branch_id, b.op))
                 .arg(Self::branch_value(b));
+            // 状态字段缺失就按 prepared 读（见 branch_from），所以新建的分支
+            // **根本不用写状态**。这也让 register_branch 的 HSETNX 保持幂等：
+            // 重复登记不会把已经成功的分支状态抹回去
+            if b.status != BranchStatus::Prepared {
+                inv.arg(Self::sfield(&b.branch_id, b.op))
+                    .arg(b.status.as_str());
+            }
         }
 
         let mut c = self.conn.clone();
@@ -279,9 +310,19 @@ impl RedisStore {
     pub async fn list_branches(&self, gid: &str) -> Result<Vec<BranchRow>> {
         let mut c = self.conn.clone();
         let map: std::collections::HashMap<String, String> = c.hgetall(self.bkey(gid)).await?;
+        // 一次 HGETALL 拿回两类字段：定义（`01\x1faction`）和状态
+        // （`01\x1faction\x1fs`）。命令数没变，但改状态那边省掉了读+JSON
         let mut v: Vec<BranchRow> = map
             .iter()
-            .filter_map(|(f, val)| Self::branch_from(gid, f, val))
+            .filter(|(f, _)| !f.ends_with(Self::SUFFIX))
+            .filter_map(|(f, val)| {
+                Self::branch_from(
+                    gid,
+                    f,
+                    val,
+                    map.get(&format!("{f}{}", Self::SUFFIX)).map(|s| s.as_str()),
+                )
+            })
             .collect();
         // SQL 那边没写 ORDER BY，顺序本来就没保证；这里显式排一下更可预期
         v.sort_by(|a, b| {
@@ -309,8 +350,10 @@ impl RedisStore {
             for i = 1, #cands do
                 local gid = cands[i]
                 local gkey = ARGV[4] .. gid
-                local st = redis.call('HGET', gkey, 'status')
-                local tt = redis.call('HGET', gkey, 'trans_type')
+                -- 一条 HMGET 拿两个字段。索引自愈保留着（下面两个 ZREM），
+                -- 只是把两次 HGET 合成一次
+                local v = redis.call('HMGET', gkey, 'status', 'trans_type')
+                local st, tt = v[1], v[2]
                 if not st then
                     -- 事务本体没了（过期了），索引里的残留清掉
                     redis.call('ZREM', KEYS[1], gid)
@@ -365,17 +408,25 @@ impl RedisStore {
         let script = redis::Script::new(&format!(
             r#"
             {sched}
-            if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-            local tt = redis.call('HGET', KEYS[1], 'trans_type')
-            redis.call('HSET', KEYS[1], 'status', ARGV[1], 'update_time', ARGV[2])
+            -- 一次 HMGET 把判断要用的字段全拿到：读不到 trans_type 就等于
+            -- 键不存在，所以 EXISTS 不用单发。原来这里是
+            -- EXISTS + HGET(trans_type) + HGET(next_cron_time) 三条
+            local v = redis.call('HMGET', KEYS[1], 'trans_type', 'next_cron_time')
+            local tt, nct = v[1], v[2]
+            if not tt then return 0 end
+            -- 要写的字段先攒起来，最后一条 HSET 落完 —— 原来状态、finish_time、
+            -- rollback_reason 是分三条写的
+            local f = {{'status', ARGV[1], 'update_time', ARGV[2]}}
             if ARGV[3] == '1' then
-                redis.call('HSET', KEYS[1], 'finish_time', ARGV[2])
+                f[#f + 1] = 'finish_time'
+                f[#f + 1] = ARGV[2]
             end
             if ARGV[4] ~= '' then
-                redis.call('HSET', KEYS[1], 'rollback_reason', ARGV[4])
+                f[#f + 1] = 'rollback_reason'
+                f[#f + 1] = ARGV[4]
             end
+            redis.call('HSET', KEYS[1], unpack(f))
             if schedulable(ARGV[1], tt) then
-                local nct = redis.call('HGET', KEYS[1], 'next_cron_time')
                 redis.call('ZADD', KEYS[2], nct, ARGV[5])
             else
                 redis.call('ZREM', KEYS[2], ARGV[5])
@@ -408,9 +459,9 @@ impl RedisStore {
 
     /// 落分支状态和结果数据。
     ///
-    /// 分支是一个 JSON 值，改一个字段得读-改-写 —— 所以走脚本，
-    /// 保证「状态」和「结果」在同一次写里落盘。分两步写的话中间崩了，
-    /// 会出现「标了成功但结果丢了」，workflow 重放时就拿不到返回值。
+    /// 结果数据（`payload`）和状态**必须在同一次写里落盘**：分两步写的话
+    /// 中间崩了会出现「标了成功但结果丢了」，workflow 重放时就拿不到返回值。
+    /// 一条 `HSET` 同时写两个字段天然满足这一点，不用脚本。
     pub async fn set_branch_result(
         &self,
         gid: &str,
@@ -420,29 +471,31 @@ impl RedisStore {
         payload: &str,
     ) -> Result<()> {
         check_len("payload", payload, MID).map_err(|e| err(&e.to_string()))?;
-        let script = redis::Script::new(
-            r#"
-            local cur = redis.call('HGET', KEYS[1], ARGV[1])
-            if not cur then return 0 end
-            local v = cjson.decode(cur)
-            v['status'] = ARGV[2]
-            if ARGV[4] == '1' then v['payload'] = ARGV[3] end
-            redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(v))
-            return 1
-            "#,
-        );
+        // payload 属于「定义」那一格，所以要连 url 一起重写 —— 先读回来。
+        // 这条路径只有 workflow 用（记忆化要存返回值），不在推进热路上
         let mut c = self.conn.clone();
-        let _: i64 = script
-            .key(self.bkey(gid))
-            .arg(Self::bfield(branch_id, op))
-            .arg(status.as_str())
-            .arg(payload)
-            .arg("1")
-            .invoke_async(&mut c)
+        let cur: Option<String> = c.hget(self.bkey(gid), Self::bfield(branch_id, op)).await?;
+        let Some(cur) = cur else { return Ok(()) };
+        let mut v: serde_json::Value = serde_json::from_str(&cur).unwrap_or(serde_json::json!({}));
+        v["payload"] = serde_json::Value::String(payload.to_string());
+        // 一条 HSET 写两个字段 —— 单条命令天然原子，不需要 MULTI 或脚本
+        let _: () = c
+            .hset_multiple(
+                self.bkey(gid),
+                &[
+                    (Self::bfield(branch_id, op), v.to_string()),
+                    (Self::sfield(branch_id, op), status.as_str().to_string()),
+                ],
+            )
             .await?;
         Ok(())
     }
 
+    /// 只落状态 —— **推进热路上唯一会改分支的操作**。
+    ///
+    /// 状态拆成独立字段之后，这里就是一条 `HSET`：不读、不解析 JSON。
+    /// 原来是 `HGET` + `cjson.decode` + `cjson.encode` + `HSET`，
+    /// 两条命令加两次编解码，全压在 Redis 那唯一的线程上。
     pub async fn set_branch_status(
         &self,
         gid: &str,
@@ -450,22 +503,9 @@ impl RedisStore {
         op: BranchOp,
         status: BranchStatus,
     ) -> Result<()> {
-        let script = redis::Script::new(
-            r#"
-            local cur = redis.call('HGET', KEYS[1], ARGV[1])
-            if not cur then return 0 end
-            local v = cjson.decode(cur)
-            v['status'] = ARGV[2]
-            redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(v))
-            return 1
-            "#,
-        );
         let mut c = self.conn.clone();
-        let _: i64 = script
-            .key(self.bkey(gid))
-            .arg(Self::bfield(branch_id, op))
-            .arg(status.as_str())
-            .invoke_async(&mut c)
+        let _: () = c
+            .hset(self.bkey(gid), Self::sfield(branch_id, op), status.as_str())
             .await?;
         Ok(())
     }
@@ -498,15 +538,58 @@ impl RedisStore {
     }
 
     /// 让某个事务立刻可被调度（提交/中止之后叫一下，不用等 cron 周期）
+    /// 把停在 prepared 的事务推成 submitted 并排进调度队列，**一个脚本做完**。
+    ///
+    /// 原来是 `get_global`(HGETALL) + `set_global_status` + `schedule_now`
+    /// 三次往返、11 条 Redis 命令；现在 3 条。Redis 是单线程 CPU 瓶颈，
+    /// 命令数就是吞吐。
+    ///
+    /// `HMGET` 读不到就说明键不存在 —— **不用再单发一次 `EXISTS`**，
+    /// 这个套路下面几个脚本里也都用上了。
+    pub async fn submit_prepared(&self, gid: &str) -> Result<SubmitOutcome> {
+        let t = crate::now();
+        let script = redis::Script::new(&format!(
+            r#"
+            {sched}
+            local v = redis.call('HMGET', KEYS[1], 'status', 'trans_type')
+            if not v[1] then return 'MISSING' end
+            if v[1] ~= ARGV[3] then return 'ALREADY' end
+            redis.call('HSET', KEYS[1], 'status', ARGV[2], 'update_time', ARGV[1],
+                       'next_cron_time', ARGV[1], 'next_cron_interval', 0)
+            if schedulable(ARGV[2], v[2]) then
+                redis.call('ZADD', KEYS[2], ARGV[1], ARGV[4])
+            end
+            return 'ADVANCED'
+            "#,
+            sched = LUA_SCHEDULABLE
+        ));
+        let mut c = self.conn.clone();
+        let r: String = script
+            .key(self.gkey(gid))
+            .key(self.ikey())
+            .arg(t)
+            .arg(GlobalStatus::Submitted.as_str())
+            .arg(GlobalStatus::Prepared.as_str())
+            .arg(gid)
+            .invoke_async(&mut c)
+            .await?;
+        Ok(match r.as_str() {
+            "MISSING" => SubmitOutcome::Missing,
+            "ADVANCED" => SubmitOutcome::Advanced,
+            _ => SubmitOutcome::Already,
+        })
+    }
+
     pub async fn schedule_now(&self, gid: &str) -> Result<()> {
         let t = crate::now();
         let script = redis::Script::new(&format!(
             r#"
             {sched}
-            if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+            -- 一条 HMGET 顶掉原来的 EXISTS + HGET(status) + HGET(trans_type)
+            local v = redis.call('HMGET', KEYS[1], 'status', 'trans_type')
+            local st, tt = v[1], v[2]
+            if not st then return 0 end
             redis.call('HSET', KEYS[1], 'next_cron_time', ARGV[1], 'next_cron_interval', 0)
-            local st = redis.call('HGET', KEYS[1], 'status')
-            local tt = redis.call('HGET', KEYS[1], 'trans_type')
             -- 这里跟 schedule_retry 不同：submit / abort 之后事务**变得**可调度了，
             -- 索引里没有就得加进去
             if schedulable(st, tt) then
@@ -563,6 +646,10 @@ impl RedisStore {
     /// 最近的事务，按创建时间倒序。**只有最近 [`RECENT_CAP`] 笔**，不是全量历史
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<GlobalRow>> {
         let mut c = self.conn.clone();
+        // 顺手裁掉超出上限的旧成员。**故意放在读这一侧** ——
+        // 放在 create_global 里的话每笔事务都要多一条命令，而那是热路径；
+        // 这里是控制台翻页才走的，频率低几个数量级，控住内存的效果一样
+        let _: i64 = c.zremrangebyrank(self.akey(), 0, -(RECENT_CAP + 1)).await?;
         let gids: Vec<String> = c
             .zrevrange(self.akey(), 0, (limit.max(1) - 1) as isize)
             .await?;

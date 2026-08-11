@@ -18,7 +18,7 @@
 
 use crate::{msg_rows, saga_rows, tcc_rows};
 use dtmrs_core::{BranchOp, GlobalStatus, SagaStep, TransType};
-use dtmrs_store::Store;
+use dtmrs_store::{Store, SubmitOutcome};
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,33 +112,50 @@ impl Api {
             return Err(ApiError::BadRequest("未知 trans_type".into()));
         };
 
-        // tcc / msg / xa：prepare 已经建过事务，submit 只是把它推成 submitted
-        if let Ok(Some(g)) = self.store.get_global(gid).await {
-            if g.status == GlobalStatus::Prepared {
-                self.store
-                    .set_global_status(gid, GlobalStatus::Submitted, "")
-                    .await
-                    .map_err(internal)?;
-                let _ = self.store.schedule_now(gid).await;
-            }
-            // 已经提交过 —— 幂等返回成功
-            return Ok(());
-        }
-
         match tt {
             TransType::Saga => {
                 if steps.is_empty() {
-                    return Err(ApiError::BadRequest("saga 的 steps 不能为空".into()));
+                    // ⚠ 不带步骤的重复提交**必须幂等成功**，不能因为 steps 为空
+                    // 就报错 —— 客户端重试时经常只带 gid。只有事务压根不存在，
+                    // 才是真的参数错误。（`tc的grpc_api与http同源` 钉着这条）
+                    return match self.store.submit_prepared(gid).await.map_err(internal)? {
+                        SubmitOutcome::Advanced | SubmitOutcome::Already => Ok(()),
+                        SubmitOutcome::Missing => {
+                            Err(ApiError::BadRequest("saga 的 steps 不能为空".into()))
+                        }
+                    };
                 }
                 let (g, branches) = saga_rows(gid, steps);
-                self.store
+                // **先建，不先查。** `create_global` 本身就是幂等的（已存在返回
+                // false 且不覆盖），所以正常路径一次往返就够 —— 这是 saga 提交的
+                // 热路径，先查一次等于白付一次往返，而且那还是个 Lua 脚本调用，
+                // 比普通命令贵得多（实测多这一次让 saga 吞吐掉了 16%）
+                if self
+                    .store
                     .create_global(&g, &branches)
                     .await
-                    .map_err(internal)?;
+                    .map_err(internal)?
+                {
+                    return Ok(());
+                }
+                // 已存在。可能是重复提交（幂等返回成功就行），也可能是这个 gid
+                // 其实是 prepare 过的 tcc/msg/xa —— 客户端没传 trans_type 时
+                // 会被当成 saga。后一种要真的把它推成 submitted，交给下面决断
+                self.store.submit_prepared(gid).await.map_err(internal)?;
                 Ok(())
             }
             TransType::Tcc | TransType::Msg | TransType::Xa => {
-                Err(ApiError::BadRequest("tcc/xa/msg 要先调 prepare".into()))
+                // prepare 已经建过事务，submit 只是把它推成 submitted。
+                //
+                // **一次存储调用做完**（原来是 get_global + set_global_status
+                // + schedule_now 三次）。Redis 上这三次是 11 条命令，现在 3 条
+                match self.store.submit_prepared(gid).await.map_err(internal)? {
+                    // 已经提交过 —— 幂等返回成功
+                    SubmitOutcome::Advanced | SubmitOutcome::Already => Ok(()),
+                    SubmitOutcome::Missing => {
+                        Err(ApiError::BadRequest("tcc/xa/msg 要先调 prepare".into()))
+                    }
+                }
             }
             // workflow 的「步骤」是**代码**，没法表示成 URL 存进库里，
             // 所以只能在嵌入式形态下提交（Embedded::workflow + submit_workflow）。

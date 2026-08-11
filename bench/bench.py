@@ -7,11 +7,28 @@
 提交 → TC 调两个分支 → 落终态。业务分支是本地零操作的 HTTP 服务，
 所以测出来的基本是 TC + 存储的开销。
 
-# 这个数字**不能**用来跟 DTM 比
+# 跟 DTM 比：`--target dtm`
 
-没有跑同一套硬件、同一个业务服务、同一种存储配置的 DTM 对照组，
-所以这里只报 dtmrs 自己在不同存储上的相对表现，以及绝对量级。
-拿它去说「比 X 快」是不诚实的。
+现在有对照组了（同机、同一个 Redis、同一个业务服务、同一个压测客户端）。
+DTM 由使用者自己起，脚本不去动它：
+
+    docker run -d --name dtm-bench --network host --ulimit nofile=1048576:1048576 \
+        -v $PWD/bench/dtm.yml:/app/dtm/conf.yml yedf/dtm:latest -c /app/dtm/conf.yml
+    python3 bench/bench.py --target dtm --mode saga --steps 2 --n 20000
+
+**跑对照之前必须先确认这三件事**，否则结论会完全反过来（都踩过）：
+
+1. **业务服务的 accept 队列**。`socketserver` 默认 `request_queue_size = 5`。
+   用连接池的客户端几乎不受影响，每次新建连接的客户端会被内核直接 RST。
+   没改之前 DTM 测出来 1500 笔/秒且日志里 5667 条 connection reset，
+   改成 4096 之后 9600 笔/秒、零错误 —— 差 6 倍，全是脚本的锅。
+2. **两边的监听端口都要在内核临时端口范围之外**
+   （`/proc/sys/net/ipv4/ip_local_port_range`，常见 32768 起）。
+   压测时海量外连会把范围内的端口占作本地端口，服务就起不来了。
+3. **DTM 容器的 nofile**。默认额度不够，会刷 `too many open files`。
+
+还要注意 DTM 的 `UpdateBranchSync`（默认 0 = 分支状态异步落盘）。
+实测开成 1 差别不大，但报数时该说明。
 
 # 压测脚本自己不能成为瓶颈 —— 这里踩过一次
 
@@ -79,7 +96,11 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BUSI_PORT = 8899
-TC_HOST, TC_PORT = "127.0.0.1", 36700
+# ⚠ 端口要选在**内核临时端口范围之外**（见 /proc/sys/net/ipv4/ip_local_port_range，
+# 常见是 32768 起）。原来用 36700 —— 正好落在范围内，压测时客户端的海量外连
+# 随时可能把它占作本地端口，于是 TC 起不来，报 Address already in use。
+# 这个坑只在对端连接churn 大的时候才现形，查了很久
+TC_HOST, TC_PORT = "127.0.0.1", 26700
 TC_HTTP = f"{TC_HOST}:{TC_PORT}"
 
 # 最后一步的正向动作路径。命中它 == 这笔事务的最后一步业务动作成功了。
@@ -124,6 +145,13 @@ class ReusePortServer(ThreadingHTTPServer):
     # 3.11+ 才有。K 个进程绑同一个端口，内核按连接分发
     allow_reuse_port = True
     daemon_threads = True
+    # ⚠ socketserver 的默认 accept 队列只有 **5**。
+    #
+    # 这条对「用连接池的客户端」几乎没影响（长连接建一次用很久），但对
+    # 「每次调用新建连接」的客户端是毁灭性的：队列一满内核直接 RST，
+    # 表现为对方日志里成片的 connection reset + 重试。
+    # 拿它去对比两个实现，等于按「客户端复不复用连接」给分，不是在测事务协调。
+    request_queue_size = 4096
 
 
 def busi_main(done):
@@ -148,6 +176,27 @@ def start_busi(procs, done):
     raise RuntimeError("业务服务起不来")
 
 
+def wait_port_free(port, timeout=30):
+    """等端口真的释放。
+
+    ⚠ 不能省：上一轮的 TC 刚退出时端口可能还在 TIME_WAIT / 内核还没回收，
+    直接起下一轮会撞 `Address already in use`，而那条错误只会进日志文件，
+    在批量扫参数时表现为**某几行结果凭空消失**（踩过，查了半天）。
+    """
+    for _ in range(timeout * 10):
+        try:
+            s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((TC_HOST, port))
+            s.close()
+            return True
+        except OSError as e:
+            last = e
+            time.sleep(0.1)
+    print(f"  bind {TC_HOST}:{port} 失败: {last}", file=sys.stderr)
+    return False
+
+
 def wait_http(path, timeout=30):
     for _ in range(timeout * 10):
         try:
@@ -160,8 +209,11 @@ def wait_http(path, timeout=30):
     return False
 
 
-def client_calls(mode, gid, steps):
+def client_calls(mode, gid, steps, target="dtmrs"):
     """一笔事务客户端要按顺序发的请求，`[(path, body), ...]`。
+
+    `target="dtm"` 时换成 DTM 的报文格式做对照：它的 steps 之外还要一个等长的
+    `payloads` 数组，msg 的 prepare / submit 都要带完整事务体。
 
     两种模式的**客户端往返次数不一样**，这是它们本质的差别之一：
 
@@ -171,6 +223,20 @@ def client_calls(mode, gid, steps):
       一致性靠「本地事务成功了就一定把消息投出去」保证
     """
     acts = [f"http://127.0.0.1:{BUSI_PORT}/a{i + 1}" for i in range(steps)]
+
+    if target == "dtm":
+        body = {"gid": gid, "trans_type": mode, "payloads": ["{}"] * steps}
+        if mode == "saga":
+            body["steps"] = [
+                {"action": a, "compensate": f"http://127.0.0.1:{BUSI_PORT}/c{i + 1}"}
+                for i, a in enumerate(acts)
+            ]
+            return [("/api/dtmsvr/submit", json.dumps(body).encode())]
+        body["steps"] = [{"action": a} for a in acts]
+        body["query_prepared"] = f"http://127.0.0.1:{BUSI_PORT}/query"
+        raw = json.dumps(body).encode()
+        return [("/api/dtmsvr/prepare", raw), ("/api/dtmsvr/submit", raw)]
+
     if mode == "saga":
         body = {
             "gid": gid,
@@ -194,7 +260,7 @@ def client_calls(mode, gid, steps):
     ]
 
 
-def submit_all(n, concurrency, prefix, mode, steps, procs):
+def submit_all(n, concurrency, prefix, mode, steps, procs, target):
     """并发提交 n 笔事务，返回提交阶段耗时。
 
     ⚠ **提交端必须是多进程的**，理由和业务服务那边一样：单个 Python 进程
@@ -213,7 +279,7 @@ def submit_all(n, concurrency, prefix, mode, steps, procs):
         if lo >= hi:
             break
         p = mp.Process(target=submit_slice,
-                       args=(lo, hi, concurrency, prefix, mode, steps), daemon=True)
+                       args=(lo, hi, concurrency, prefix, mode, steps, target), daemon=True)
         p.start()
         ps.append(p)
     for p in ps:
@@ -221,13 +287,13 @@ def submit_all(n, concurrency, prefix, mode, steps, procs):
     return time.perf_counter() - t0
 
 
-def submit_slice(lo, hi, concurrency, prefix, mode, steps):
+def submit_slice(lo, hi, concurrency, prefix, mode, steps, target):
     """一个提交进程负责 `[lo, hi)` 这一段。
 
     每个线程一条 keep-alive 长连接 —— 早期版本每笔都重开 TCP，
     提交阶段测的一半是握手
     """
-    work = [client_calls(mode, f"{prefix}-{i}", steps) for i in range(lo, hi)]
+    work = [client_calls(mode, f"{prefix}-{i}", steps, target) for i in range(lo, hi)]
 
     local = threading.local()
 
@@ -261,7 +327,7 @@ def submit_slice(lo, hi, concurrency, prefix, mode, steps):
         list(pool.map(one, work))
 
 
-def verify_final(prefix, n, concurrency=16, patience=30):
+def verify_final(prefix, n, target="dtmrs", concurrency=16, patience=30):
     """全量核对真实终态。**不计时** —— 这是正确性核对，不是性能指标。
 
     ⚠ 必须重试着等。主指标是「最后一步动作成功」，它比「落终态」早一次
@@ -277,7 +343,9 @@ def verify_final(prefix, n, concurrency=16, patience=30):
             local.c = http.client.HTTPConnection(TC_HOST, TC_PORT, timeout=10)
         try:
             local.c.request("GET", f"/api/dtmsvr/query?gid={prefix}-{i}")
-            return json.loads(local.c.getresponse().read())["status"]
+            r = json.loads(local.c.getresponse().read())
+            # DTM 把事务包在 transaction 里，我们是平铺的
+            return r["transaction"]["status"] if target == "dtm" else r["status"]
         except Exception:
             try:
                 local.c.close()
@@ -362,6 +430,10 @@ def main():
     ap.add_argument("--mode", default="saga", choices=("saga", "msg"),
                     help="saga（带补偿）| msg（二阶段消息，秒杀那类场景用的）")
     ap.add_argument("--steps", type=int, default=2, help="一笔事务几个正向分支")
+    ap.add_argument("--target", default="dtmrs", choices=("dtmrs", "dtm"),
+                    help="压谁。dtm 表示对照组：**不由本脚本启动**，"
+                         "自己先把 DTM 跑起来（见 bench/README.md）")
+    ap.add_argument("--tc-port", type=int, default=0, help="TC 端口，0 表示按 target 取默认")
     ap.add_argument("--bin", default="target/release/dtmrs")
     ap.add_argument("--quiet", action="store_true", help="只打一行结果，方便扫参数")
     ap.add_argument("--no-verify", action="store_true",
@@ -369,8 +441,11 @@ def main():
     args = ap.parse_args()
 
     # 完成判定盯的是最后一步正向动作
-    global FINAL_ACTION
+    global FINAL_ACTION, TC_PORT, TC_HTTP
     FINAL_ACTION = f"/a{args.steps}"
+    # DTM 默认听 36789；我们自己起的 TC 用 36700 避开它
+    TC_PORT = args.tc_port or (26789 if args.target == "dtm" else 26700)
+    TC_HTTP = f"{TC_HOST}:{TC_PORT}"
 
     dsn = {
         "sqlite": "sqlite:/tmp/bench.db",
@@ -381,7 +456,8 @@ def main():
         "redis": os.environ.get("BENCH_REDIS", "redis://127.0.0.1:16379/1"),
     }.get(args.db, args.db)
 
-    reset = reset_db(dsn)
+    # DTM 那边的存储由使用者自己准备和清理，脚本不去动别人的库
+    reset = reset_db(dsn) if args.target == "dtmrs" else "外部 TC，未清库"
 
     done = mp.Value("i", 0)
     busi = start_busi(args.busi_procs, done)
@@ -389,13 +465,18 @@ def main():
     env = dict(os.environ,
                DTMRS_DB=dsn,
                DTMRS_ADDR=TC_HTTP,
-               DTMRS_GRPC_ADDR="127.0.0.1:36701",
+               DTMRS_GRPC_ADDR="127.0.0.1:26701",
                DTMRS_TICK_MS=args.tick,
                DTMRS_WORKERS=args.workers,
                RUST_LOG="warn")
     # TC 日志留着 —— 出问题时没日志等于瞎猜
-    tc_log = open("/tmp/bench_tc.log", "w")
-    tc = subprocess.Popen([args.bin], env=env, stdout=tc_log, stderr=tc_log)
+    tc = None
+    if args.target == "dtmrs":
+        if not wait_port_free(TC_PORT):
+            print(f"端口 {TC_PORT} 一直被占着，起不了 TC", file=sys.stderr)
+            return 1
+        tc_log = open("/tmp/bench_tc.log", "w")
+        tc = subprocess.Popen([args.bin], env=env, stdout=tc_log, stderr=tc_log)
     try:
         if not wait_http("/health"):
             print("TC 起不来，看 /tmp/bench_tc.log", file=sys.stderr)
@@ -404,7 +485,7 @@ def main():
         prefix = f"b{int(time.time())}"
         t_start = time.perf_counter()
         submit_secs = submit_all(args.n, args.concurrency, prefix,
-                                 args.mode, args.steps, args.client_procs)
+                                 args.mode, args.steps, args.client_procs, args.target)
 
         # 完成判定：直接读共享内存里的计数，不发一个请求（见模块头注释）
         stalled = 0
@@ -424,12 +505,12 @@ def main():
         if args.no_verify:
             final_n, dist = -1, {"跳过核对": args.n}
         else:
-            final_n, dist = verify_final(prefix, args.n)
+            final_n, dist = verify_final(prefix, args.n, args.target)
 
         if args.quiet:
             # 清库失败一定要带出来 —— 存量数据会让数字慢慢往下漂
             warn = "" if reset.startswith(("已", "库是")) else f"  {reset}"
-            print(f"{args.mode:5s} {args.db:9s} workers={args.workers:>3s}  "
+            print(f"{args.target:6s} {args.mode:5s} {args.db:9s} workers={args.workers:>3s}  "
                   f"{finished/drive_secs:7.0f} 笔/秒  "
                   f"终态 {final_n}/{args.n}{warn}")
             return 0
@@ -457,11 +538,12 @@ def main():
             print(f"  ⚠ 有 {args.n-final_n} 笔没落终态")
         return 0
     finally:
-        tc.terminate()
-        try:
-            tc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            tc.kill()
+        if tc is not None:
+            tc.terminate()
+            try:
+                tc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                tc.kill()
         for p in busi:
             p.terminate()
 

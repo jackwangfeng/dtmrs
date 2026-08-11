@@ -48,6 +48,21 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// [`Store::submit_prepared`] 的结果。
+///
+/// 之所以要区分三种情况：`submit` 既要处理「tcc/msg/xa 把 prepared 推成
+/// submitted」，也要处理「saga 第一次提交，事务还不存在」，还要保证
+/// **重复提交返回成功而不是报错**（见 `api::submit` 的注释）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// gid 不存在 —— 调用方该按新事务建
+    Missing,
+    /// 本来停在 prepared，已经推成 submitted 并排进调度队列
+    Advanced,
+    /// 已经提交过了。**必须当成功返回**，否则客户端会以为没受理
+    Already,
+}
+
 #[derive(Debug, Clone)]
 pub struct GlobalRow {
     pub gid: String,
@@ -507,6 +522,42 @@ impl SqlStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 把停在 prepared 的事务推成 submitted，并立刻排进调度队列。
+    ///
+    /// **一次调用做完原来三次的活**（`get_global` + `set_global_status` +
+    /// `schedule_now`）。Redis 后端上这是一个 Lua 脚本，11 条命令降到 3 条 ——
+    /// 那边是单线程 CPU 瓶颈，命令数直接决定吞吐。
+    pub async fn submit_prepared(&self, gid: &str) -> Result<SubmitOutcome> {
+        // 先查一次。saga 第一次提交时事务还不存在，这是最常见的路径，
+        // 一次 SELECT 就该返回，不值得为它先空跑一条 UPDATE
+        let st: Option<String> =
+            sqlx::query_scalar(&self.be.q("SELECT status FROM trans_global WHERE gid=?"))
+                .bind(gid)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(st) = st else {
+            return Ok(SubmitOutcome::Missing);
+        };
+        if st != GlobalStatus::Prepared.as_str() {
+            return Ok(SubmitOutcome::Already);
+        }
+        let t = now();
+        // 状态、退避、排队一条 UPDATE 落完。
+        // ⚠ `AND status=?`（prepared）不能省：并发重复提交时，
+        // 别把已经在推进的事务硬拽回队首
+        sqlx::query(&self.be.q("UPDATE trans_global SET status=?, update_time=?,
+             next_cron_time=?, next_cron_interval=0
+             WHERE gid=? AND status=?"))
+        .bind(GlobalStatus::Submitted.as_str())
+        .bind(t)
+        .bind(t)
+        .bind(gid)
+        .bind(GlobalStatus::Prepared.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(SubmitOutcome::Advanced)
     }
 
     /// 让某个事务立刻可被调度（提交/中止之后叫一下，不用等 cron 周期）
@@ -1006,6 +1057,8 @@ dispatch! {
     /// 抢一个到期事务。多实例不重复推进就靠它的原子性
     fn lock_one_due(&self, owner: &str, lease: i64) -> Option<GlobalRow>;
     fn set_global_status(&self, gid: &str, status: GlobalStatus, reason: &str) -> ();
+    /// 把 prepared 推成 submitted 并排进调度队列，一次调用做完。见 [`SubmitOutcome`]
+    fn submit_prepared(&self, gid: &str) -> SubmitOutcome;
     fn set_branch_result(&self, gid: &str, branch_id: &str, op: BranchOp, status: BranchStatus, payload: &str) -> ();
     fn set_branch_status(&self, gid: &str, branch_id: &str, op: BranchOp, status: BranchStatus) -> ();
     fn schedule_retry(&self, gid: &str, interval: i64) -> ();

@@ -789,6 +789,36 @@ Worth spelling out:
 - **Postgres is not fsync-bound**: on a clean database, turning `synchronous_commit` off
   goes 3100 → 2970, i.e. nothing.
 
+### Head-to-head with DTM
+
+Same machine, same Redis (`--network host`), same no-op business service, same load
+generator, 20k transactions, median of three:
+
+| Mode | dtmrs | DTM v1.19 | |
+|---|---|---|---|
+| msg, 1 forward step | **12540 tx/s** | 10299 | dtmrs +22% |
+| saga, 2 steps | 7630 | **9339 tx/s** | DTM +22% |
+
+**One win each, and the reason is architectural rather than one codebase being tighter:**
+
+DTM drives the transaction to completion **inline in the submit request**; dtmrs returns
+from submit immediately and lets the driver claim it from a queue. That claim
+(`lock_one_due`) is one Lua round trip on Redis that **every transaction pays**. A saga is
+a single client request, so the fixed cost weighs heavily; msg has two (prepare + submit),
+which amortizes it — and there our batched scripts come out ahead.
+
+Two honest footnotes:
+
+- This comparison took three attempts to get right. The first run had DTM at 1500 tx/s —
+  because the harness's business service had an accept queue of 5 (Python `socketserver`'s
+  default). DTM does not pool connections and was getting RST by the kernel; we do, so we
+  barely noticed. Raising it to 4096 took DTM to 9600 tx/s with zero errors. **When
+  benchmarking across implementations, suspect your harness first.**
+- DTM defaults to `UpdateBranchSync: 0` (branch status written asynchronously). The table
+  above sets it to 1 to match our durability; measured difference was negligible.
+
+See the header of `bench/bench.py` to reproduce, plus two more traps you must check first.
+
 ### Flash sales: two-phase messaging on Redis
 
 Flash sales use **two-phase messaging (msg)**, not SAGA — you cannot un-sell an item, so

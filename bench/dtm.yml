@@ -1,0 +1,13 @@
+Store:
+  Driver: 'redis'
+  Host: '127.0.0.1'
+  Port: 16999
+  Db: '2'
+MicroService:
+  Driver: 'default'
+LogLevel: 'warn'
+# 端口挪出内核临时端口范围（32768-60999），否则压测时会被外连占掉
+HttpPort: 26789
+GrpcPort: 26790
+JsonRpcPort: 26791
+UpdateBranchSync: 1
