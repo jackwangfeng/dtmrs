@@ -852,13 +852,13 @@ there is no compensation to write. The shape is `prepare` → (your own local tr
 decrementing stock) → `submit`, after which the TC guarantees the downstream step is
 eventually delivered.
 
-Same machine, Redis storage, 20k transactions, median of three:
+Same machine, Redis storage (**host networking**, see the next section), 20k transactions, median of three:
 
 | Mode | Forward steps | Throughput |
 |---|---|---|
-| **msg** | 1 (the typical flash-sale shape) | **11573 tx/s** |
-| saga | 2 | 8653 tx/s |
-| msg | 2 | 7903 tx/s |
+| **msg** | 1 (the typical flash-sale shape) | **18213 tx/s** |
+| saga | 2 | 13917 tx/s |
+| msg | 2 | 13506 tx/s |
 
 Two things worth noting:
 
@@ -866,40 +866,46 @@ Two things worth noting:
   than saga, because the msg client sends two requests (prepare + submit) where saga sends
   one. msg wins because a flash sale only needs one downstream step.
 - **You pick msg for correctness, not throughput** — it is the only mode that fits when
-  there is nothing to compensate. It is also cheaper to store: 1450 bytes per transaction
-  in Redis versus 1961 for a two-step SAGA.
+  there is nothing to compensate. It is also cheaper to store: 1339 bytes per transaction
+  in Redis versus 1661 for a two-step SAGA.
 
-### ⚠ Storage network path: docker port publishing costs 36%
+### ⚠ Storage network path: docker port publishing costs 11%
 
-Every number above was measured with storage in docker, published via `-p`. Switching to
-`--network host` (i.e. storage and TC talking directly on one host):
+The per-storage table at the top of this section used `-p` port publishing; the flash-sale
+table used `--network host`. The difference between the two:
 
 | Path | redis-benchmark | Single-conn p50 | msg, 1 step |
 |---|---|---|---|
-| `--network host` | 187k req/s | 0.015 ms | **11573 tx/s** |
-| `-p 16379:6379` | 151k req/s | 0.023 ms | 8500 tx/s |
+| `--network host` | 187k req/s | 0.015 ms | **18316 tx/s** |
+| `-p 16379:6379` | 151k req/s | 0.023 ms | 16504 tx/s |
 
-Only ~8 µs more per round trip, but driving one transaction makes dozens of sequential
-Redis calls, and it compounds to 36%. **These numbers therefore depend on your deployment
-topology — say which one you used when quoting them.**
+Only ~8 µs more per round trip, but a transaction makes several sequential Redis calls and
+it compounds to 11%. **These numbers therefore depend on your deployment topology — say
+which one you used when quoting them.**
 
-### ⚠ Why these numbers drift: accumulated rows
+(This gap used to be **36%**. Inline submit cut the round trips per transaction, so a cost
+billed per round trip shrank with them — which is itself confirmation that the original 36%
+really was about round-trip count.)
 
-The same command gives 3424 tx/s against an empty database and 777 tx/s once 40k finished
-transactions have piled up — a **4.4× spread**. It also degrades within a single run:
+### Wipe the database when benchmarking (though it matters much less now)
 
-| Transactions per run | Postgres throughput |
-|---|---|
-| 5000 | 3424 tx/s |
-| 20000 | 3196 |
-| 40000 | 2713 |
+Accumulated rows used to dominate: 3424 tx/s against an empty database versus 777 tx/s once
+40k finished transactions had piled up — a **4.4× spread**. The cause was the claim query
+scanning an index whose dead tuples accumulated faster than autovacuum reclaimed them.
 
-Driving one transaction issues several UPDATEs, so dead tuples accumulate faster than
-autovacuum reclaims them.
+**Inline submit largely removed this**, because the claim query is no longer on the happy
+path. Measured on Postgres: 5147 tx/s on an empty database, 5036 tx/s with 40k rows
+pre-loaded — within noise. Runs of 5000 / 20000 / 40000 no longer degrade either
+(4068 / 5147 / 5046).
 
-That exposes a **known product gap**: the Redis backend expires final-state records after
-7 days (`DEFAULT_FINAL_TTL`), but **the SQL backends have no retention policy at all** —
-finished transactions are kept forever. For now, run your own cleanup:
+`bench/bench.py` still wipes by default (`--no-reset` turns it off for exactly this
+experiment) — retries and crash recovery still go through the claim path, and that path is
+still sensitive to table size.
+
+**The retention gap is still real**: the Redis backend expires final-state records after 7
+days (`DEFAULT_FINAL_TTL`), but **the SQL backends have no retention policy at all** —
+finished transactions are kept forever and disk grows without bound. For now, run your own
+cleanup:
 
 ```sql
 DELETE FROM trans_branch_op WHERE gid IN (

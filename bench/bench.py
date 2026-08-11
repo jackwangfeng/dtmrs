@@ -52,17 +52,18 @@ DTM 由使用者自己起，脚本不去动它：
 所以跑完还会**全量核对一遍真实终态**（不计时），对不上就明确报出来 ——
 只报一个自己没验过的数字是不诚实的。
 
-# ⚠ docker 的端口映射会吃掉 36%
+# ⚠ docker 的端口映射会吃掉 11%
 
 存储跑在 docker 里、靠 `-p 16379:6379` 发布端口的话，每次往返要多走一层
 NAT / docker-proxy。实测：
 
 | 路径 | redis-benchmark | 单连接 p50 | 本压测（msg 1 步）|
 |---|---|---|---|
-| `--network host` | 187k req/s | 0.015 ms | **11573 笔/秒** |
-| `-p 16379:6379` | 151k req/s | 0.023 ms | 8500 笔/秒 |
+| `--network host` | 187k req/s | 0.015 ms | **18316 笔/秒** |
+| `-p 16379:6379` | 151k req/s | 0.023 ms | 16504 笔/秒 |
 
-每次往返只多 ~8µs，但推一笔事务要串行打几十次 Redis，累积就是 36%。
+每次往返只多 ~8µs，但一笔事务要串行打好几次 Redis，累积起来就有 11%
+（内联提交之前每笔往返更多，这个差距曾经是 36%）。
 **报数时必须说明用的是哪种**。想复现 host 那一列：
 
     docker run -d --name dtmrs-redis-host --network host redis:7 \
@@ -72,7 +73,7 @@ NAT / docker-proxy。实测：
 # 影响结果的因素（报数时必须一起报）
 
 - 存储（sqlite 本地文件 / Postgres / MySQL / Redis 差一个量级）
-- **存储的网络路径**：见上面那节，docker 端口映射差 36%
+- **存储的网络路径**：见上面那节，docker 端口映射差 11%
 - 事务模式（`--mode saga|msg`）和步数（`--steps`）
 - 推进 worker 数（`--workers`）：单进程内并行抢占的协程数
 - TC 的 tick 间隔：推进器空转时的轮询周期，直接决定延迟下限
@@ -436,6 +437,9 @@ def main():
     ap.add_argument("--tc-port", type=int, default=0, help="TC 端口，0 表示按 target 取默认")
     ap.add_argument("--bin", default="target/release/dtmrs")
     ap.add_argument("--quiet", action="store_true", help="只打一行结果，方便扫参数")
+    ap.add_argument("--no-reset", action="store_true",
+                    help="不清库。用来量「存量数据对吞吐的影响」——"
+                         "正常跑一定要清，否则数字会随存量一路往下漂")
     ap.add_argument("--no-verify", action="store_true",
                     help="跳过终态核对。**只在数存储命令次数时用** —— 核对本身要把\n                         每笔事务都查一遍，会把每笔的命令数算多（踩过）")
     args = ap.parse_args()
@@ -457,7 +461,10 @@ def main():
     }.get(args.db, args.db)
 
     # DTM 那边的存储由使用者自己准备和清理，脚本不去动别人的库
-    reset = reset_db(dsn) if args.target == "dtmrs" else "外部 TC，未清库"
+    if args.no_reset:
+        reset = "⚠ 按要求没清库"
+    else:
+        reset = reset_db(dsn) if args.target == "dtmrs" else "外部 TC，未清库"
 
     done = mp.Value("i", 0)
     busi = start_busi(args.busi_procs, done)
