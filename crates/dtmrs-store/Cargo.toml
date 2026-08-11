@@ -20,7 +20,7 @@ default = []
 redis = ["dep:redis", "dep:serde_json"]
 
 [dependencies]
-dtmrs-core = { path = "../dtmrs-core", version = "0.1.0" }
+dtmrs-core = { path = "../dtmrs-core", version = "0.2.0" }
 redis = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sqlx = { workspace = true }

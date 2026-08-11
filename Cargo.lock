@@ -325,7 +325,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dtmrs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "dtmrs-barrier"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dtmrs-core",
  "sqlx",
@@ -354,14 +354,14 @@ dependencies = [
 
 [[package]]
 name = "dtmrs-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "dtmrs-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dtmrs-core",
  "dtmrs-server",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "dtmrs-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "dtmrs-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dtmrs-core",
  "redis",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "dtmrs-xa"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dtmrs-core",
  "sqlx",

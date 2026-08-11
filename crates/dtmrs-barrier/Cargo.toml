@@ -14,7 +14,7 @@ description = "Sub-transaction barrier: one table solving idempotence, empty rol
 readme = "README.md"
 
 [dependencies]
-dtmrs-core = { path = "../dtmrs-core", version = "0.1.0" }
+dtmrs-core = { path = "../dtmrs-core", version = "0.2.0" }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 
