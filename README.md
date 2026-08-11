@@ -218,6 +218,21 @@ restart you must register a handler under the same name.
 - `submit()` verifies that every name is registered — better to fail at submit time than
   to discover it after side effects have landed
 
+## Documentation
+
+The README covers *what this is*; **[docs/](docs/) covers how to use it**
+(guides are in Chinese; the [docs.rs API reference](https://docs.rs/dtmrs) is language-neutral):
+
+| Guide | |
+|---|---|
+| [快速上手](docs/quickstart.md) | 5-minute walkthrough |
+| [五种模式怎么选](docs/choosing-a-mode.md) | **choosing a transaction mode** |
+| [业务侧接入](docs/integration.md) | **integrating your services** |
+| [部署与运维](docs/deployment.md) | production, multi-instance, monitoring |
+| [API 参考](docs/api.md) | HTTP + gRPC reference |
+| [排错](docs/troubleshooting.md) | troubleshooting |
+
+
 ## What works today
 
 | Capability | Status |
