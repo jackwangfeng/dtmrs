@@ -1,6 +1,6 @@
 # 业务侧客户端（子事务屏障）
 
-给**业务服务（RM）**接入 dtmrs 用。Java / Go / Python / Node 各一份。
+给**业务服务（RM）**接入 dtmrs 用。Java / Go / Python / Node / Rust 五个语言。
 
 ## 为什么只有屏障，没有「提交事务」的 SDK
 
@@ -14,159 +14,264 @@
 共享同一个本地事务**。这就是子事务屏障。
 
 算法本身只有十几行，但外面裹着一圈坑（见下），写错了不报错，是**静默的重复扣款**。
-所以这里给出各语言的参考实现。
 
-## 用哪个
+## 安装
 
-| 语言 | 文件 | 依赖 |
+| 语言 | 安装 | 依赖 |
 |---|---|---|
-| Java | [`java/src/main/java/dtmrs/Barrier.java`](java/src/main/java/dtmrs/Barrier.java) | 只要 JDBC，无第三方依赖 |
-| Go | [`go/barrier.go`](go/barrier.go) | 只要 `database/sql`，无第三方依赖 |
-| Python | [`python/dtmrs_barrier.py`](python/dtmrs_barrier.py) | 只要 DB-API 2.0 游标 |
-| Node | [`node/barrier.js`](node/barrier.js) | 无（适配 pg / mysql2 的返回格式） |
-| Rust | [`dtmrs-barrier`](https://crates.io/crates/dtmrs-barrier) | 已发布到 crates.io |
+| Java | `io.github.jackwangfeng:dtmrs-barrier:0.2.0` | 只要 JDBC |
+| Go | `go get github.com/jackwangfeng/dtmrs/clients/go` | 只要 `database/sql` |
+| Python | `pip install dtmrs-barrier` | 只要 DB-API 2.0 游标 |
+| Node | `npm install dtmrs-barrier` | 无（自带 TS 类型） |
+| Rust | `cargo add dtmrs --features barrier` | sqlx |
 
-都是**零框架依赖**的小库，也可以直接把单个文件复制进项目。
+都是**零运行时依赖**的小库，也可以直接把单个源文件复制进项目。
 
-```xml
-<!-- Maven -->
-<dependency>
-  <groupId>io.github.jackwangfeng</groupId>
-  <artifactId>dtmrs-barrier</artifactId>
-  <version>0.2.0</version>
-</dependency>
-```
+---
 
-```bash
-pip install dtmrs-barrier
-npm install dtmrs-barrier
-cargo add dtmrs --features barrier
-```
+## 完整例子
 
-Go 走 `go get github.com/jackwangfeng/dtmrs/clients/go`（Go 的模块机制不需要中心
-仓库，打了 tag 就能拉）。
+下面每段都是从 [`<语言>/example/`](.) 里**实际跑通的服务**摘出来的，不是手写的伪代码。
+`./verify-examples.sh` 会起真的 dtmrs TC + 真 MySQL，对四个语言各跑三个场景
+（正常提交 / 逆序补偿 / 幂等），**断言账户余额**——CI 里每次都跑。
 
-发布用 [`publish.sh`](publish.sh)。
+用的是各语言的标准库 HTTP 服务，没有框架依赖。换成 Spring / Gin / Flask / Express
+时，屏障那部分代码一个字都不用改，只是取参数的方式不同。
 
-### SSH 环境怎么认证（没法弹浏览器）
-
-`npm login` 在 npm 9+ 默认走 web 流程要开浏览器。SSH 上三选一：
-
-**① 用 token（推荐）** —— 在浏览器（你本机）打开
-[npmjs.com Access Tokens](https://www.npmjs.com/settings/~/tokens) 生成一个
-**Granular Access Token**（权限选 Read and write，范围可以只给这一个包），然后：
-
-```bash
-echo '//registry.npmjs.org/:_authToken=npm_你的token' >> ~/.npmrc
-chmod 600 ~/.npmrc
-npm whoami --registry https://registry.npmjs.org/   # 验证
-```
-
-token 可以限定权限、随时吊销，比存登录态安全。
-
-**② 终端登录**（不开浏览器，走用户名密码 + OTP）：
-
-```bash
-npm login --auth-type=legacy --registry https://registry.npmjs.org/
-```
-
-**③ web 流程 —— SSH 下走不通，别试了**
-
-`npm login` 会打印登录 URL，但 **npm 把 URL 里的会话 ID 当密钥脱敏成了 `***`**
-（调试日志里也是 `***`，捞不出来），所以那条链接复制出去必然 404。
-加 `--browser false` 能避免 `xdg-open` 报错，但 URL 照样是脱敏的 —— 这条路
-在无浏览器环境下等于自己把自己堵死。**用方式 ① 的 token。**
-
-### 开了 2FA 怎么发布
-
-token 认证通过不代表能发布。如果账号开了 2FA 而 token 没勾
-**Bypass two-factor authentication**，`npm publish` 会报：
+### 共同结构
 
 ```
-403 Two-factor authentication or granular access token with bypass 2fa enabled is required
+取出 TC 传来的 gid / trans_type / branch_id / op
+  ↓
+开事务
+  ↓
+barrier.decide(tx)
+  ├─ Execute          → 执行业务 SQL（必须用同一个 tx）
+  ├─ NullCompensation → 什么都不做
+  └─ Duplicated       → 什么都不做
+  ↓
+提交 → 200 SUCCESS
 ```
 
-两条路：
+### Go
 
-```bash
-# ① 发布时补一个动态码（推荐，token 权限更小）
-NPM_OTP=123456 ./publish.sh node
-
-# ② 或者重新生成 token 时勾上 "Bypass two-factor authentication"
-#    ⚠ npm 正在收紧这类 token，长期看方式 ① 更稳
-```
-
-### 推荐：Trusted Publishing（OIDC），不存任何 token
-
-仓库里有现成的工作流 [`.github/workflows/publish-clients.yml`](../.github/workflows/publish-clients.yml)，
-GitHub Actions 用 OIDC 直接向 registry 证明身份，**不需要任何长期 token，也不需要 2FA 交互**。
-
-一次性配置：
-
-**npm** —— 到 npmjs.com 的**包设置页** → Trusted Publisher → 填：
-
-| 字段 | 值 |
-|---|---|
-| Organization or user | `jackwangfeng` |
-| Repository | `dtmrs` |
-| Workflow filename | `publish-clients.yml` |
-| Allowed actions | 勾 `npm publish` |
-
-> ⚠ npm 的信任发布是在**包的设置页**里配的，所以包**得先存在**。全新的包需要
-> 先手动发一次（`NPM_OTP=xxxxxx ./publish.sh node`），之后就能全走 OIDC。
->
-> ⚠ 工作流**文件名**是配置的一部分，改名会导致发布失败。
->
-> ⚠ **Environment name 必须留空**（除非工作流的 npm job 里也设了同名 environment）——
-> 填了但对不上会一直报 `OIDC token exchange error - package not found`，
-> 而这个报错措辞有误导性，看着像包不存在。
->
-> ⚠ setup-node 的 `registry-url` **必须保留**。去掉会直接 ENEEDAUTH ——
-> npm 靠它知道跟哪个 registry 做 OIDC 交换。它写的 NODE_AUTH_TOKEN 占位符无害。
-
-**PyPI** —— PyPI 支持 *pending publisher*，**全新项目也能直接走 OIDC**，不用先手动发：
-[Publishing → Add a new pending publisher](https://pypi.org/manage/account/publishing/)，填项目名
-`dtmrs-barrier`、owner `jackwangfeng`、repo `dtmrs`、workflow `publish-clients.yml`、
-environment `pypi`。
-
-配好之后在 Actions 页手动触发这个工作流，选 target 和是否 dry_run。
-**默认是 dry_run=true**，确认输出没问题再关掉重跑。
-
-> ⚠ **如果你的 npm registry 指向淘宝等镜像**（`npm config get registry` 看一下），
-> 那是**只读镜像，发布会失败**。认证和发布都必须对着 `registry.npmjs.org`。
-> `package.json` 里的 `publishConfig` 已经把发布目标钉死了，但**认证仍需
-> 显式带 `--registry`**，否则 `npm whoami` 查的是镜像。
-
-## 用法
-
-四个语言形状一致，以 Go 为例：
+完整文件：[`go/example/main.go`](go/example/main.go)
 
 ```go
-// 启动时建表一次
-dtmrs.Migrate(db, dtmrs.MySQL)
+func branch(sign int) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        q := r.URL.Query()
 
-// 每次处理分支请求（gid / branchID / op / transType 由 TC 传进来）
-tx, _ := db.Begin()
-defer tx.Rollback()
+        tx, err := db.Begin()
+        if err != nil {
+            w.WriteHeader(500) // 结果未知 → TC 重试
+            return
+        }
+        defer tx.Rollback() // commit 之后再 rollback 是空操作，安全
 
-b := dtmrs.NewBarrier(dtmrs.MySQL, transType, gid, branchID, op)
-dec, err := b.Decide(tx)
-if dec == dtmrs.Execute {
-    // 业务 SQL —— 必须用这个 tx
-    tx.Exec("UPDATE account SET balance = balance - ? WHERE id = ?", amt, uid)
+        b := dtmrs.NewBarrier(dtmrs.MySQL, q.Get("trans_type"),
+            q.Get("gid"), q.Get("branch_id"), q.Get("op"))
+
+        dec, err := b.Decide(tx)
+        if err != nil {
+            w.WriteHeader(500) // 屏障本身出错也算「未知」
+            return
+        }
+
+        if dec == dtmrs.Execute && sign != 0 {
+            res, err := tx.Exec(
+                "UPDATE ex_account SET balance = balance + ? WHERE id = 1 AND balance + ? >= 0",
+                int64(sign)*amount, int64(sign)*amount)
+            if err != nil {
+                w.WriteHeader(500)
+                return
+            }
+            if n, _ := res.RowsAffected(); n == 0 {
+                // 余额不足 = 业务**明确**拒绝 → 409，TC 会逆序补偿
+                w.WriteHeader(409)
+                fmt.Fprint(w, `{"dtm_result":"FAILURE"}`)
+                return
+            }
+        }
+        // 空回滚 / 重复请求走到这里，什么都没做，同样返回成功
+        if err := tx.Commit(); err != nil {
+            w.WriteHeader(500)
+            return
+        }
+        fmt.Fprint(w, `{"dtm_result":"SUCCESS"}`)
+    }
 }
-tx.Commit()   // 原子性的来源：屏障记录与业务变更同生共死
 ```
 
-三种判定：
+### Java
+
+完整文件：[`java/example/Service.java`](java/example/Service.java)
+
+```java
+static void branch(HttpExchange e, int sign) {
+    Map<String, String> q = query(e);
+
+    try (Connection c = DriverManager.getConnection(JDBC)) {
+        c.setAutoCommit(false);
+        try {
+            Barrier b = new Barrier(Dialect.MYSQL,
+                    q.get("trans_type"), q.get("gid"), q.get("branch_id"), q.get("op"));
+
+            if (b.decide(c) == Decision.EXECUTE && sign != 0) {
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE ex_account SET balance = balance + ? "
+                      + "WHERE id = 1 AND balance + ? >= 0")) {
+                    ps.setLong(1, sign * amount);
+                    ps.setLong(2, sign * amount);
+                    if (ps.executeUpdate() == 0) {
+                        c.rollback();
+                        reply(e, 409, "FAILURE");   // 余额不足 = 业务明确拒绝
+                        return;
+                    }
+                }
+            }
+            // 空回滚 / 重复请求走到这里，什么都没做，同样返回成功
+            c.commit();
+            reply(e, 200, "SUCCESS");
+        } catch (Exception ex) {
+            c.rollback();
+            throw ex;
+        }
+    } catch (Exception ex) {
+        // 异常 = 结果**未知** → 5xx 让 TC 重试。绝不能返回 409
+        reply(e, 500, "ONGOING");
+    }
+}
+```
+
+Spring Boot 里就是把 `HttpExchange` 换成 `@RequestParam`、`DriverManager` 换成
+注入的 `DataSource`，中间那段一模一样。
+
+### Python
+
+完整文件：[`python/example/service.py`](python/example/service.py)
+
+```python
+conn = pymysql.connect(**CONN)
+try:
+    b = Barrier(MYSQL, q["trans_type"], q["gid"], q["branch_id"], q["op"])
+    cur = conn.cursor()
+    if b.decide(cur) == Decision.EXECUTE and sign != 0:
+        n = cur.execute(
+            "UPDATE ex_account SET balance = balance + %s "
+            "WHERE id = 1 AND balance + %s >= 0",
+            (sign * amount, sign * amount))
+        if n == 0:
+            conn.rollback()
+            return self.reply(409, "FAILURE")   # 余额不足 = 业务明确拒绝
+    # 空回滚 / 重复请求走到这里，什么都没做，同样返回成功
+    conn.commit()
+    self.reply(200, "SUCCESS")
+except Exception:
+    conn.rollback()
+    # 异常 = 结果**未知** → 5xx 让 TC 重试。绝不能返回 409
+    self.reply(500, "ONGOING")
+finally:
+    conn.close()
+```
+
+### Node
+
+完整文件：[`node/example/service.js`](node/example/service.js)
+
+```js
+// ⚠ 必须拿独占连接：事务要在同一个连接上跑完。
+//   直接用 pool 的话每条语句可能落到不同连接，事务就散了
+const conn = await pool.getConnection();
+try {
+  await conn.query('BEGIN');
+  const b = new Barrier(MYSQL, q.trans_type, q.gid, q.branch_id, q.op);
+
+  if (await b.decide(conn) === Decision.EXECUTE && sign !== 0) {
+    const [r] = await conn.query(
+      'UPDATE ex_account SET balance = balance + ? WHERE id = 1 AND balance + ? >= 0',
+      [sign * amount, sign * amount]);
+    if (r.affectedRows === 0) {
+      await conn.query('ROLLBACK');
+      return reply(res, 409, 'FAILURE');   // 余额不足 = 业务明确拒绝
+    }
+  }
+  // 空回滚 / 重复请求走到这里，什么都没做，同样返回成功
+  await conn.query('COMMIT');
+  reply(res, 200, 'SUCCESS');
+} catch (e) {
+  await conn.query('ROLLBACK').catch(() => {});
+  // 异常 = 结果**未知** → 5xx 让 TC 重试。绝不能返回 409
+  reply(res, 500, 'ONGOING');
+} finally {
+  conn.release();
+}
+```
+
+### Rust
+
+Rust 侧的屏障用法见 [docs/integration.md](../docs/integration.md#二子事务屏障一张表解决三个问题)，
+或者直接用嵌入式形态（分支就是进程内函数，连 HTTP 都不需要）：
+[`cargo run --example embedded -p dtmrs-server`](../crates/dtmrs-server/examples/embedded.rs)。
+
+### gRPC 分支怎么取参数
+
+上面都是 HTTP（参数在 query string）。gRPC 分支的四个值在 **metadata** 里：
+
+```
+dtm-gid  /  dtm-trans_type  /  dtm-branch_id  /  dtm-op
+```
+
+请求体是**空字节**，所以你**不需要为 dtmrs 改接口**——任何已有的 gRPC 方法都能
+直接当分支。屏障部分的代码完全一样，只是参数来源不同。
+
+---
+
+## 自己跑一遍例子
+
+```bash
+# 需要真 MySQL（默认连 127.0.0.1:33306）和编译好的 dtmrs 二进制
+cargo build --release -p dtmrs
+cd clients && ./verify-examples.sh all      # 或 go / python / node / java
+```
+
+输出长这样：
+
+```
+--- go ---
+  ✓ 正常提交后事务成功（succeed）
+  ✓ 扣款生效（900）
+  ✓ 第二步拒绝后事务失败（failed）
+  ✓ 补偿把钱退回来了（900）
+  ✓ 重复调用没有扣第二次（幂等）（900）
+```
+
+---
+
+## 三种判定，两种要返回成功
 
 | 判定 | 你该做什么 |
 |---|---|
 | `Execute` | 执行业务逻辑 |
-| `NullCompensation` | **空回滚**——正向从没跑过，补偿空转，**接口返回成功** |
-| `Duplicated` | **重复或悬挂**——已处理过，跳过，**接口返回成功** |
+| `NullCompensation` | **空回滚**——正向从没跑过，补偿空转，**返回成功** |
+| `Duplicated` | **重复或悬挂**——已处理过，跳过，**返回成功** |
 
-后两种是正常路径，返回失败会让 TC 以为分支出错了。
+后两种是**正常路径**，返回失败会让 TC 以为分支出错了、一直重试。
+
+## 返回值语义（写错就会数据不一致）
+
+| 你的返回 | HTTP | gRPC | TC 的动作 |
+|---|---|---|---|
+| 成功 | 200 | `OK` | 推进下一个分支 |
+| **业务明确拒绝** | **409** | **`ABORTED`** | **逆序补偿** |
+| 还在处理中 | 425 | `FAILED_PRECONDITION` | 下轮再来 |
+| **结果未知** | 5xx / 超时 | 其它任何码 | **重试，绝不回滚** |
+
+**只有你确定业务规则不允许时**才返回 409。库存不足、余额不够、风控拒绝 → 409；
+数据库超时、调下游超时、自己抛异常 → **5xx**。
+
+因为**超时的时候你可能已经执行成功了**。返回 409 会让 TC 去补偿，而如果那笔
+操作其实没执行，你就凭空退了一笔钱出去。
 
 ## ⚠ 三条不能违反的
 
@@ -174,7 +279,7 @@ tx.Commit()   // 原子性的来源：屏障记录与业务变更同生共死
 方案直接失效。这不是实现限制，是它成立的根本条件。
 
 **2. 业务 SQL 必须用传给 `decide` 的那个连接/事务。** 用另一个连接执行等于白做——
-崩在中间会出现「业务改了但屏障没记」。
+崩在中间会出现「业务改了但屏障没记」，重试就再执行一遍。
 
 **3. MySQL 上绝不能用 `ON DUPLICATE KEY UPDATE`。** 整个算法依赖「冲突时影响行数
 必须是 0」，而它在重复时返回的是 **1**。必须用 `INSERT IGNORE`。
@@ -186,10 +291,20 @@ tx.Commit()   // 原子性的来源：屏障记录与业务变更同生共死
 ✓ 对照：ON DUPLICATE KEY UPDATE 重复时返回 1（≠0，所以绝不能用它做幂等判断）
 ```
 
+## 算法是怎么回事
+
+一句话：**补偿方先去正向分支的位置上占个坑。占成功了说明正向从没来过（空回滚）；
+占失败了说明正向真跑过（是真补偿）。而这个坑一旦被占，迟到的正向分支就再也
+插不进来（悬挂被丢弃）。**
+
+一个 `INSERT IGNORE` 的返回值同时回答了「对方来过没有」和「我处理过没有」
+两个问题——这就是它只要十几行的原因。完整推演见
+[docs/integration.md](../docs/integration.md)。
+
 ## 跑测试
 
 每个实现都有一套**相同的**五场景测试：首次执行、幂等、空回滚、悬挂、真补偿。
-四个语言 × Postgres / MySQL 都实跑通过。
+四个语言 × Postgres / MySQL 都实跑通过（CI 里每次都跑）。
 
 ```bash
 # Java
@@ -213,10 +328,7 @@ DTMRS_TEST_MYSQL_NODE='mysql://root:pw@127.0.0.1:3306/dtmrs' node test.js
 
 **没配环境变量就是没测，不是通过**——每个测试在跳过时都会打印醒目提示。
 
-## 算法是怎么回事
+## 发布
 
-一句话：**补偿方先去正向分支的位置上占个坑。占成功了说明正向从没来过（空回滚）；
-占失败了说明正向真跑过（是真补偿）。而这个坑一旦被占，迟到的正向分支就再也
-插不进来（悬挂被丢弃）。**
-
-完整推演见 [docs/integration.md](../docs/integration.md)。
+见 [PUBLISHING.md](PUBLISHING.md)——npm 和 PyPI 走 OIDC 零 token，Maven Central
+还得靠 GPG + token。踩过的坑都记在那儿了。

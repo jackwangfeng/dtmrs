@@ -24,3 +24,5 @@ clients/python/pymysql/
 clients/python/*.dist-info/
 clients/python/bin/
 clients/python/__pycache__/
+clients/*/example/out/
+clients/go/example/example

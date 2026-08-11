@@ -138,6 +138,22 @@ jobs:
           DTMRS_TEST_MYSQL_NODE: mysql://root:dtmrs@127.0.0.1:3306/dtmrs
         run: npm install --no-audit --no-fund && node test.js
 
+      # 文档里的例子必须真能跑 —— 起真 TC + 真 MySQL，四个语言各走
+      # 正常提交/逆序补偿/幂等三个场景，断言的是**账户余额**不是"没报错"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 编 TC 二进制
+        run: cargo build --release -p dtmrs
+      - name: 验证各语言示例端到端
+        env:
+          MYSQL_PORT: '3306'
+        run: |
+          cd clients/node && npm install --no-audit --no-fund && cd ../..
+          cd clients/python && pip install --quiet pymysql && cd ../..
+          # 脚本里用 docker exec 查库，CI 里容器名是 my
+          sed -i 's/docker exec dtmrs-my/docker exec my/' clients/verify-examples.sh
+          clients/verify-examples.sh all
+
   # 四个语言绑定都得能实际跑起来，不是编过就算
   bindings:
     name: 语言绑定（C / Python / Node / JVM）
