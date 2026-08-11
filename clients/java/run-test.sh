@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
+# 用 javac 直接编译跑测试，不依赖 maven —— CI 里更轻
 set -euo pipefail
 cd "$(dirname "$0")"
 CP="lib/postgresql-42.7.4.jar:lib/mysql-connector-j-8.4.0.jar"
 mkdir -p out
-javac -encoding UTF-8 -cp "$CP" -d out Barrier.java BarrierTest.java
+javac -encoding UTF-8 -cp "$CP" -d out src/main/java/dtmrs/Barrier.java src/test/java/BarrierTest.java
 java -cp "$CP:out" BarrierTest

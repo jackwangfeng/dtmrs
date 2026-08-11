@@ -1,8 +1,17 @@
 {
   "name": "dtmrs-barrier",
   "version": "0.2.0",
-  "description": "dtmrs sub-transaction barrier for business services (RM side)",
+  "description": "Sub-transaction barrier for dtmrs: idempotence, empty rollback and suspension in one table",
   "main": "barrier.js",
+  "types": "barrier.d.ts",
   "license": "Apache-2.0",
+  "author": "jackwangfeng",
+  "homepage": "https://github.com/jackwangfeng/dtmrs/tree/master/clients/node",
+  "repository": { "type": "git", "url": "git+https://github.com/jackwangfeng/dtmrs.git", "directory": "clients/node" },
+  "bugs": { "url": "https://github.com/jackwangfeng/dtmrs/issues" },
+  "keywords": ["distributed-transaction", "saga", "tcc", "idempotence", "barrier", "dtm", "dtmrs"],
+  "engines": { "node": ">=14" },
+  "files": ["barrier.js", "barrier.d.ts", "README.md", "LICENSE"],
+  "scripts": { "test": "node test.js" },
   "devDependencies": { "pg": "^8.11.0", "mysql2": "^3.9.0" }
 }

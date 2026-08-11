@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dtmrs-barrier"
+version = "0.2.0"
+description = "Sub-transaction barrier for dtmrs: idempotence, empty rollback and suspension in one table"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.8"
+authors = [{ name = "jackwangfeng" }]
+keywords = ["distributed-transaction", "saga", "tcc", "idempotence", "dtm", "dtmrs"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Database",
+  "Topic :: Software Development :: Libraries",
+]
+# 刻意零运行时依赖：只用 DB-API 2.0 的游标，你用哪个驱动都行
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/jackwangfeng/dtmrs"
+Repository = "https://github.com/jackwangfeng/dtmrs"
+Documentation = "https://github.com/jackwangfeng/dtmrs/tree/master/docs"
+Changelog = "https://github.com/jackwangfeng/dtmrs/blob/master/CHANGELOG.md"
+
+[tool.setuptools]
+# 只打这一个模块，别把测试和 pip --target 装下来的驱动卷进去
+py-modules = ["dtmrs_barrier"]
+
+[tool.setuptools.package-data]
+"*" = ["README.md"]

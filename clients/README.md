@@ -20,14 +20,33 @@
 
 | 语言 | 文件 | 依赖 |
 |---|---|---|
-| Java | [`java/Barrier.java`](java/Barrier.java) | 只要 JDBC，无第三方依赖 |
+| Java | [`java/src/main/java/dtmrs/Barrier.java`](java/src/main/java/dtmrs/Barrier.java) | 只要 JDBC，无第三方依赖 |
 | Go | [`go/barrier.go`](go/barrier.go) | 只要 `database/sql`，无第三方依赖 |
 | Python | [`python/dtmrs_barrier.py`](python/dtmrs_barrier.py) | 只要 DB-API 2.0 游标 |
 | Node | [`node/barrier.js`](node/barrier.js) | 无（适配 pg / mysql2 的返回格式） |
 | Rust | [`dtmrs-barrier`](https://crates.io/crates/dtmrs-barrier) | 已发布到 crates.io |
 
-**都是单文件、零框架依赖，直接复制进你的项目就行**（Rust 那个除外，走 cargo）。
-目前没有发布到 Maven / npm / PyPI——等有人真的用起来、反馈说抄文件麻烦了再说。
+都是**零框架依赖**的小库，也可以直接把单个文件复制进项目。
+
+```xml
+<!-- Maven -->
+<dependency>
+  <groupId>io.github.jackwangfeng</groupId>
+  <artifactId>dtmrs-barrier</artifactId>
+  <version>0.2.0</version>
+</dependency>
+```
+
+```bash
+pip install dtmrs-barrier
+npm install dtmrs-barrier
+cargo add dtmrs --features barrier
+```
+
+Go 走 `go get github.com/jackwangfeng/dtmrs/clients/go`（Go 的模块机制不需要中心
+仓库，打了 tag 就能拉）。
+
+发布用 [`publish.sh`](publish.sh)。
 
 ## 用法
 

@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- io.github.<用户名> 这个 namespace 归 GitHub 账号所有，
+       在 Sonatype Central 门户上通过 GitHub 验证即可拿到 -->
+  <groupId>io.github.jackwangfeng</groupId>
+  <artifactId>dtmrs-barrier</artifactId>
+  <version>0.2.0</version>
+  <packaging>jar</packaging>
+
+  <name>dtmrs-barrier</name>
+  <description>Sub-transaction barrier for dtmrs: idempotence, empty rollback and suspension in one table</description>
+  <url>https://github.com/jackwangfeng/dtmrs</url>
+
+  <!-- 下面这三段（licenses / developers / scm）是 Maven Central 的**硬性要求**，
+       缺任何一段都会在校验阶段被拒 -->
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>jackwangfeng</id>
+      <name>jackwangfeng</name>
+      <url>https://github.com/jackwangfeng</url>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/jackwangfeng/dtmrs.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/jackwangfeng/dtmrs.git</developerConnection>
+    <url>https://github.com/jackwangfeng/dtmrs</url>
+    <tag>v0.2.0</tag>
+  </scm>
+
+  <properties>
+    <maven.compiler.source>8</maven.compiler.source>
+    <maven.compiler.target>8</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <!-- 运行时零依赖：只用 JDK 自带的 JDBC。
+       驱动是测试用的，scope=test 不会传染给使用者 -->
+  <dependencies>
+    <dependency>
+      <groupId>org.postgresql</groupId><artifactId>postgresql</artifactId>
+      <version>42.7.4</version><scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.mysql</groupId><artifactId>mysql-connector-j</artifactId>
+      <version>8.4.0</version><scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Central 要求同时提供 sources 和 javadoc jar -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-source-plugin</artifactId><version>3.3.1</version>
+        <executions><execution><id>attach-sources</id>
+          <goals><goal>jar-no-fork</goal></goals></execution></executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId><version>3.10.1</version>
+        <executions><execution><id>attach-javadocs</id>
+          <goals><goal>jar</goal></goals></execution></executions>
+        <configuration>
+          <doclint>none</doclint>
+          <!-- 源码注释是中文，不指定编码在非 UTF-8 环境会乱码 -->
+          <charset>UTF-8</charset><encoding>UTF-8</encoding><docencoding>UTF-8</docencoding>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!-- 发布时才启用签名和上传：mvn -Prelease deploy
+         Central 要求所有构件都有 GPG 签名 -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId><version>3.2.7</version>
+            <executions><execution><id>sign-artifacts</id><phase>verify</phase>
+              <goals><goal>sign</goal></goals></execution></executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId><version>0.7.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <!-- 上传后停在门户等人点发布，不自动上线 -->
+              <autoPublish>false</autoPublish>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

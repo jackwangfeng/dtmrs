@@ -12,6 +12,11 @@ bindings/python/__pycache__/
 
 # 业务侧客户端的构建产物 / 依赖
 clients/java/out/
+clients/java/target/
+clients/python/dist/
+clients/python/build/
+clients/python/*.egg-info/
+clients/node/*.tgz
 clients/java/lib/*.jar
 clients/node/node_modules/
 clients/python/psycopg2*/
