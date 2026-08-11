@@ -239,7 +239,7 @@ impl RedisStore {
         }
         let t = crate::now();
 
-        let script = redis::Script::new(
+        let script = redis::Script::new(&format!(
             r#"
             if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
             redis.call('HSET', KEYS[1],
@@ -258,13 +258,18 @@ impl RedisStore {
                 redis.call('ZADD', KEYS[3], ARGV[5], ARGV[1])
             end
             redis.call('ZADD', KEYS[4], ARGV[8], ARGV[1])
-            -- ⚠ 这里**不做**裁剪。原来每建一笔就跟一条 ZREMRANGEBYRANK，
-            -- 等于每笔事务为管理台的「最近事务」列表多付一条命令。
-            -- 裁剪挪到 list_recent 里 —— 那是控制台翻页时才走的路径，
-            -- 频率比写路径低几个数量级，效果完全一样
+            -- ⚠ 裁剪**必须留在写路径上**。
+            --
+            -- 曾经为了省一条命令把它挪去 list_recent，结果是：没人打开管理台
+            -- 就永远不裁剪。实测跑 5000 笔之后索引里就是 5000 个成员（上限本该
+            -- 是 1000）—— 每笔事务留一个成员且永不回收，跑久了必然撑爆内存。
+            -- 而它本身极便宜：索引已经在上限内时删 0 个成员，只是一次 O(log N)。
+            -- 省 4% 的命令数换一个无界增长，不划算
+            redis.call('ZREMRANGEBYRANK', KEYS[4], 0, -{cap})
             return 1
             "#,
-        );
+            cap = RECENT_CAP + 1
+        ));
 
         let mut inv = script.prepare_invoke();
         inv.key(self.gkey(&g.gid))
@@ -471,22 +476,31 @@ impl RedisStore {
         payload: &str,
     ) -> Result<()> {
         check_len("payload", payload, MID).map_err(|e| err(&e.to_string()))?;
-        // payload 属于「定义」那一格，所以要连 url 一起重写 —— 先读回来。
-        // 这条路径只有 workflow 用（记忆化要存返回值），不在推进热路上
+        // ⚠ 必须走脚本。payload 在「定义」那一格里，改它是**读-改-写**，
+        // 拆成 HGET + HSET 两次往返的话中间会有窗口。曾经这么写过 ——
+        // 实际用它的只有 workflow（持租约，单写者），撞不上，但那是「碰巧安全」，
+        // 不是结构上安全，不值得为一条不在热路上的语句冒这个险。
+        //
+        // 状态和 payload 在同一条 HSET 里落盘也是必须的：分两步写，中间崩了
+        // 会出现「标了成功但结果丢了」，workflow 重放时就拿不到返回值。
+        let script = redis::Script::new(
+            r#"
+            local cur = redis.call('HGET', KEYS[1], ARGV[1])
+            if not cur then return 0 end
+            local v = cjson.decode(cur)
+            v['payload'] = ARGV[3]
+            redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(v), ARGV[4], ARGV[2])
+            return 1
+            "#,
+        );
         let mut c = self.conn.clone();
-        let cur: Option<String> = c.hget(self.bkey(gid), Self::bfield(branch_id, op)).await?;
-        let Some(cur) = cur else { return Ok(()) };
-        let mut v: serde_json::Value = serde_json::from_str(&cur).unwrap_or(serde_json::json!({}));
-        v["payload"] = serde_json::Value::String(payload.to_string());
-        // 一条 HSET 写两个字段 —— 单条命令天然原子，不需要 MULTI 或脚本
-        let _: () = c
-            .hset_multiple(
-                self.bkey(gid),
-                &[
-                    (Self::bfield(branch_id, op), v.to_string()),
-                    (Self::sfield(branch_id, op), status.as_str().to_string()),
-                ],
-            )
+        let _: i64 = script
+            .key(self.bkey(gid))
+            .arg(Self::bfield(branch_id, op))
+            .arg(status.as_str())
+            .arg(payload)
+            .arg(Self::sfield(branch_id, op))
+            .invoke_async(&mut c)
             .await?;
         Ok(())
     }
@@ -646,10 +660,6 @@ impl RedisStore {
     /// 最近的事务，按创建时间倒序。**只有最近 [`RECENT_CAP`] 笔**，不是全量历史
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<GlobalRow>> {
         let mut c = self.conn.clone();
-        // 顺手裁掉超出上限的旧成员。**故意放在读这一侧** ——
-        // 放在 create_global 里的话每笔事务都要多一条命令，而那是热路径；
-        // 这里是控制台翻页才走的，频率低几个数量级，控住内存的效果一样
-        let _: i64 = c.zremrangebyrank(self.akey(), 0, -(RECENT_CAP + 1)).await?;
         let gids: Vec<String> = c
             .zrevrange(self.akey(), 0, (limit.max(1) - 1) as isize)
             .await?;
