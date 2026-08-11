@@ -1,0 +1,8 @@
+{
+  "name": "dtmrs-barrier",
+  "version": "0.2.0",
+  "description": "dtmrs sub-transaction barrier for business services (RM side)",
+  "main": "barrier.js",
+  "license": "Apache-2.0",
+  "devDependencies": { "pg": "^8.11.0", "mysql2": "^3.9.0" }
+}

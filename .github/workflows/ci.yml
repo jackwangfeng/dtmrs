@@ -84,6 +84,60 @@ jobs:
         # 开 redis feature —— 它默认是关的，不开等于没测
         run: cargo test --workspace --features dtmrs/redis,dtmrs-server/redis,dtmrs-store/redis
 
+  # 业务侧客户端（子事务屏障）：四个语言 × 两种数据库，同一套五场景断言。
+  # 算法写错不会报错，是静默的重复扣款 —— 所以每个语言都得对着真库验。
+  clients:
+    name: 业务侧客户端（Java / Go / Python / Node）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.21' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: 起 Postgres 和 MySQL
+        run: |
+          docker run -d --name pg -p 5432:5432 -e POSTGRES_PASSWORD=dtmrs -e POSTGRES_DB=dtmrs postgres:16-alpine
+          docker run -d --name my -p 3306:3306 -e MYSQL_ROOT_PASSWORD=dtmrs -e MYSQL_DATABASE=dtmrs mysql:8.0
+          for i in $(seq 1 60); do docker exec pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 2; done
+          for i in $(seq 1 60); do docker exec my mysqladmin ping -uroot -pdtmrs >/dev/null 2>&1 && break; sleep 2; done
+
+      - name: Java
+        working-directory: clients/java
+        env:
+          DTMRS_TEST_PG: jdbc:postgresql://127.0.0.1:5432/dtmrs?user=postgres&password=dtmrs
+          DTMRS_TEST_MYSQL: jdbc:mysql://127.0.0.1:3306/dtmrs?user=root&password=dtmrs
+        run: |
+          mkdir -p lib && cd lib
+          curl -sSLO https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar
+          curl -sSLO https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.4.0/mysql-connector-j-8.4.0.jar
+          cd .. && ./run-test.sh
+
+      - name: Go
+        working-directory: clients/go
+        env:
+          DTMRS_TEST_PG_GO: postgres://postgres:dtmrs@127.0.0.1:5432/dtmrs?sslmode=disable
+          DTMRS_TEST_MYSQL_GO: root:dtmrs@tcp(127.0.0.1:3306)/dtmrs
+        run: go test -v ./...
+
+      - name: Python
+        working-directory: clients/python
+        env:
+          DTMRS_TEST_PG_PY: postgresql://postgres:dtmrs@127.0.0.1:5432/dtmrs
+          DTMRS_TEST_MYSQL_PY: 127.0.0.1|3306|root|dtmrs|dtmrs
+        run: |
+          pip install --quiet psycopg2-binary pymysql
+          python3 test_barrier.py
+
+      - name: Node
+        working-directory: clients/node
+        env:
+          DTMRS_TEST_PG_NODE: postgresql://postgres:dtmrs@127.0.0.1:5432/dtmrs
+          DTMRS_TEST_MYSQL_NODE: mysql://root:dtmrs@127.0.0.1:3306/dtmrs
+        run: npm install --no-audit --no-fund && node test.js
+
   # 四个语言绑定都得能实际跑起来，不是编过就算
   bindings:
     name: 语言绑定（C / Python / Node / JVM）

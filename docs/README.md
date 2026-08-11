@@ -15,6 +15,7 @@
 | 出问题了 | [排错](troubleshooting.md) |
 | 了解协议和内部设计 | [DESIGN.md](../DESIGN.md) |
 | 查 Rust 库 API | [docs.rs/dtmrs](https://docs.rs/dtmrs) |
+| 非 Rust 服务要接入 | [各语言屏障实现](../clients/) |
 
 ## 如果只读两篇
 

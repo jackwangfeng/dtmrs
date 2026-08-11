@@ -141,7 +141,7 @@ query 参数：
 
 ### 远端服务（HTTP / gRPC）
 
-上面的屏障用法是 Rust。其它语言目前需要自己实现屏障算法（一张表 + `INSERT IGNORE`，算法见 [DESIGN.md](../DESIGN.md#四子事务屏障最值钱的部分)）。这块的多语言客户端还没做。
+各语言的屏障实现见 [`clients/`](../clients/)：**Java / Go / Python / Node 各一份单文件、零框架依赖的参考实现**，直接复制进你的项目即可。四个语言 × Postgres / MySQL 都对着真库跑过同一套五场景测试。
 
 ### 进程内分支（嵌入式）
 
