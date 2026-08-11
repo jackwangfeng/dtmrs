@@ -5,7 +5,7 @@
 ## 这是什么
 
 dtmrs：Rust 写的分布式事务管理器（对标 Go 的 [DTM](https://github.com/dtm-labs/dtm)）。
-支持 SAGA / TCC / 二阶段消息 / XA / workflow 五种模式，存储可跑 sqlite / postgres / mysql。
+支持 SAGA / TCC / 二阶段消息 / XA / workflow 五种模式，存储可跑 sqlite / postgres / mysql / redis。
 对外有 HTTP 和 gRPC 两套等价接口。
 除了独立部署的 TC 二进制，还有 DTM 没有的**嵌入式形态**：TC 当库链进宿主进程，
 分支可以是进程内函数；再往外通过 C ABI 给任何语言用。
@@ -16,7 +16,7 @@ Apache-2.0。只实现 DTM 的协议，不抄它的代码。
 
 ```bash
 cargo build --release                 # 二进制在 target/release/dtmrs
-cargo test --workspace                # 126 个测试（真库那部分会被跳过，见下）
+cargo test --workspace                # 139 个测试（真库那部分会被跳过，见下）
 cargo run --example embedded -p dtmrs-server   # 嵌入式模式的可运行示例
 cargo run --example workflow -p dtmrs-server   # workflow 模式（重放/断点续跑）
 
@@ -50,7 +50,8 @@ DTMRS_TEST_PG='postgres://postgres:pw@127.0.0.1:5432/dtmrs' \
 DTMRS_TEST_MYSQL='mysql://root:pw@127.0.0.1:3306/dtmrs' \
 DTMRS_TEST_XA_PG='postgres://postgres:pw@127.0.0.1:5432/dtmrs' \
 DTMRS_TEST_XA_MYSQL='mysql://root:pw@127.0.0.1:3306/dtmrs' \
-cargo test --workspace
+DTMRS_TEST_REDIS='redis://127.0.0.1:6379/0' \
+cargo test --workspace --features dtmrs/redis,dtmrs-server/redis,dtmrs-store/redis
 ```
 
 改动 `dtmrs-store` / `dtmrs-barrier` / `dtmrs-xa` / dialect 层的话，**必须对着真
@@ -80,7 +81,9 @@ crates/
   dtmrs/          门面 crate：重新导出各层 + dtmrs 二进制（main.rs 在这儿）。
                   feature 切分：server(默认) / grpc / barrier / xa / full
   dtmrs-core/     状态机 + 类型，纯逻辑无 I/O。dialect.rs 是 SQL 方言渲染
-  dtmrs-store/    存储 + 租约抢占（sqlx::Any，一套 SQL 跑三种库）
+  dtmrs-store/    存储 + 租约抢占。Store 是个 enum 分发器：
+                  SQL 后端(sqlx::Any 跑三种库) / Redis 后端(redis_store.rs，
+                  要开 redis feature)
   dtmrs-server/   TC：api.rs(协议无关的操作层，HTTP 与 gRPC 共用)
                   main.rs(axum HTTP) / grpc/(tonic，调分支 + 提供 API)
                   driver.rs(推进器) / registry.rs(进程内分支表)
@@ -170,6 +173,10 @@ crates/
   `workflow.rs` 时记住两条不变量：补偿必须**先于**正向动作登记（否则动作超时
   或崩溃会漏掉补偿）；分岔检测发现名字对不上时**既不能成功也不能回滚**，
   只能停下等人。
+- **Redis 后端的行为必须跟 SQL 后端一致**。`schedulable()` 在 Rust 和 Lua 里
+  各有一份（后者防索引腐烂），改调度条件要**两处同时改**，否则同一笔事务
+  在两种后端上的推进行为会不一样。Redis 测试必须串行（`REDIS_LOCK`）——
+  `lock_one_due` 是全局扫描，且每个测试开头会清前缀。
 - gRPC 分支调用用自定义 `BytesCodec` 做动态转发，**不需要业务方的 proto**。
   改 `grpc/client.rs` 时注意：请求体发空字节是刻意的（空 protobuf 消息对任何
   message 类型都合法），分支身份走 metadata。

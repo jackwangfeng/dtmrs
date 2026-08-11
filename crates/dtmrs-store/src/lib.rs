@@ -76,14 +76,14 @@ pub struct BranchRow {
 }
 
 #[derive(Clone)]
-pub struct Store {
+pub struct SqlStore {
     pool: AnyPool,
     be: Backend,
 }
 
 static DRIVERS: Once = Once::new();
 
-impl Store {
+impl SqlStore {
     /// `url` 可以是：
     /// - `sqlite:dtmrs.db` / `sqlite::memory:`
     /// - `postgres://user:pass@host:5432/db`
@@ -530,11 +530,14 @@ fn global_from_row(r: AnyRow) -> GlobalRow {
 mod tests {
     use super::*;
 
-    /// 每个测试都在两种后端上跑一遍。
+    /// 每个测试都在**所有可用后端**上跑一遍：sqlite / postgres / mysql / redis。
     ///
-    /// postgres 靠环境变量开启（`DTMRS_TEST_PG=postgres://...`）——
+    /// 真库靠环境变量开启（`DTMRS_TEST_PG` / `DTMRS_TEST_MYSQL` / `DTMRS_TEST_REDIS`）——
     /// 没配就只跑 sqlite，这样没数据库的机器也能 `cargo test`。
-    /// 但**别把这当成"postgres 也过了"** —— 没配就是没测。
+    /// 但**别把这当成"它们也过了"** —— 没配就是没测。
+    ///
+    /// Redis 跟另外三个不是同一类东西（不是 SQL），能共用这一套断言恰恰是
+    /// 我们要的证据：两种后端的**行为**必须一致，哪怕实现天差地别。
     /// Postgres 测试必须串行 —— `lock_one_due` 和 `list_recent` 是**全局查询**，
     /// 并行跑会互相看见对方的事务，断言就没意义了。
     /// （光给各测试不同的 gid 不够：捞待办是不按 gid 过滤的。）
@@ -558,12 +561,25 @@ mod tests {
                     .unwrap_or_else(|e| panic!("连不上 {env}: {e}"));
                 for t in ["trans_branch_op", "trans_global"] {
                     sqlx::query(&format!("DELETE FROM {t}"))
-                        .execute(s.pool())
+                        .execute(s.pool().expect("SQL 后端才有连接池"))
                         .await
                         .expect("清表");
                 }
                 v.push((name, s));
             }
+        }
+        #[cfg(feature = "redis")]
+        if let Ok(url) = std::env::var("DTMRS_TEST_REDIS") {
+            let s = Store::open(&url)
+                .await
+                .unwrap_or_else(|e| panic!("连不上 DTMRS_TEST_REDIS: {e}"));
+            // 每次进来清干净。Redis 没有"表"，按前缀删
+            s.as_redis()
+                .unwrap()
+                .flush_prefix()
+                .await
+                .expect("清 redis");
+            v.push(("redis", s));
         }
         (guard, v)
     }
@@ -722,4 +738,162 @@ mod tests {
             );
         }
     }
+}
+
+// ==================== 后端分发 ====================
+
+#[cfg(feature = "redis")]
+pub mod redis_store;
+#[cfg(feature = "redis")]
+pub use redis_store::RedisStore;
+
+/// 存储后端。
+///
+/// # 为什么现在才抽这一层
+///
+/// 这个项目原本**刻意没有抽 `Store` trait**，理由写在 DESIGN.md 里：
+/// sqlite / postgres / mysql 的差异小到一层 SQL 模板就能吸收，抽象是过早的。
+/// 那个判断在当时是对的。
+///
+/// **Redis 让前提不成立了** —— 它根本不是 SQL，没有表、没有事务、没有 WHERE，
+/// 模板吸收不了。所以这里加了一层分发。
+///
+/// 用 enum 而不是 trait：调用方拿到的还是同一个 `Store` 具体类型，
+/// 四十多个调用点一行都不用改，也不用到处写泛型或 `dyn`。
+#[derive(Clone)]
+enum Inner {
+    Sql(SqlStore),
+    #[cfg(feature = "redis")]
+    Redis(RedisStore),
+}
+
+/// 存储层的统一入口。按 URL 前缀自动选后端：
+///
+/// ```text
+/// sqlite:...     / postgres://...  / mysql://...   → SQL 后端
+/// redis://...    / rediss://...                    → Redis 后端（要开 redis feature）
+/// ```
+///
+/// ⚠ Redis 后端跟 SQL 后端有**实打实的语义差异**（持久性更弱、终态会过期），
+/// 用之前务必读 [`redis_store`] 的模块说明。
+#[derive(Clone)]
+pub struct Store {
+    inner: Inner,
+}
+
+/// 存储层的错误。
+///
+/// 两种后端的原生错误类型不同，统一收口到这里；`sqlx::Error` 仍然直接透出，
+/// 免得改动现有调用方对错误的处理。
+pub type StoreError = sqlx::Error;
+
+#[cfg(feature = "redis")]
+fn redis_err(e: redis::RedisError) -> sqlx::Error {
+    sqlx::Error::Configuration(Box::new(e))
+}
+
+/// 这个 URL 是不是要走 Redis
+pub fn is_redis_url(url: &str) -> bool {
+    let u = url.trim().to_ascii_lowercase();
+    u.starts_with("redis://") || u.starts_with("rediss://") || u.starts_with("redis+unix:")
+}
+
+impl Store {
+    /// 按 URL 选后端并连上。
+    pub async fn open(url: &str) -> Result<Self> {
+        if is_redis_url(url) {
+            #[cfg(feature = "redis")]
+            {
+                let r = RedisStore::open(url).await.map_err(redis_err)?;
+                return Ok(Self {
+                    inner: Inner::Redis(r),
+                });
+            }
+            #[cfg(not(feature = "redis"))]
+            {
+                // 明确报错，而不是把 redis:// 当成 sqlite 文件名去建库 ——
+                // 那会静默跑起来然后数据全落在一个叫 "redis:" 的文件里
+                return Err(sqlx::Error::Configuration(
+                    "这个 URL 要 Redis 后端，但构建时没开 dtmrs-store 的 `redis` feature".into(),
+                ));
+            }
+        }
+        Ok(Self {
+            inner: Inner::Sql(SqlStore::open(url).await?),
+        })
+    }
+
+    /// 底层是不是 Redis
+    pub fn is_redis(&self) -> bool {
+        match &self.inner {
+            Inner::Sql(_) => false,
+            #[cfg(feature = "redis")]
+            Inner::Redis(_) => true,
+        }
+    }
+
+    /// SQL 后端的连接池。Redis 后端返回 `None` ——
+    /// 调用方（主要是测试和屏障）要自己处理这种情况
+    pub fn pool(&self) -> Option<&AnyPool> {
+        match &self.inner {
+            Inner::Sql(s) => Some(s.pool()),
+            #[cfg(feature = "redis")]
+            Inner::Redis(_) => None,
+        }
+    }
+
+    /// SQL 方言。Redis 后端没有方言可言，返回 `None`
+    pub fn backend(&self) -> Option<Backend> {
+        match &self.inner {
+            Inner::Sql(s) => Some(s.backend()),
+            #[cfg(feature = "redis")]
+            Inner::Redis(_) => None,
+        }
+    }
+
+    /// 拿底层的 Redis store（比如为了调 `with_ttl`）
+    #[cfg(feature = "redis")]
+    pub fn as_redis(&self) -> Option<&RedisStore> {
+        match &self.inner {
+            Inner::Redis(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+/// 把 13 个方法逐个手写分发太啰嗦，而且漏一个编译器不会提醒 ——
+/// 用宏保证两边签名严格一致
+macro_rules! dispatch {
+    ($( $(#[$m:meta])* fn $name:ident (&self $(, $arg:ident : $ty:ty)* ) -> $ret:ty; )*) => {
+        impl Store {
+            $(
+                $(#[$m])*
+                pub async fn $name(&self $(, $arg: $ty)*) -> Result<$ret> {
+                    match &self.inner {
+                        Inner::Sql(s) => s.$name($($arg),*).await,
+                        #[cfg(feature = "redis")]
+                        Inner::Redis(r) => r.$name($($arg),*).await.map_err(redis_err),
+                    }
+                }
+            )*
+        }
+    };
+}
+
+dispatch! {
+    /// 建表（Redis 后端是空操作）
+    fn migrate(&self) -> ();
+    /// 建全局事务 + 分支。已存在返回 `false`，**不覆盖**
+    fn create_global(&self, g: &GlobalRow, branches: &[BranchRow]) -> bool;
+    fn get_global(&self, gid: &str) -> Option<GlobalRow>;
+    fn list_branches(&self, gid: &str) -> Vec<BranchRow>;
+    /// 抢一个到期事务。多实例不重复推进就靠它的原子性
+    fn lock_one_due(&self, owner: &str, lease: i64) -> Option<GlobalRow>;
+    fn set_global_status(&self, gid: &str, status: GlobalStatus, reason: &str) -> ();
+    fn set_branch_result(&self, gid: &str, branch_id: &str, op: BranchOp, status: BranchStatus, payload: &str) -> ();
+    fn set_branch_status(&self, gid: &str, branch_id: &str, op: BranchOp, status: BranchStatus) -> ();
+    fn schedule_retry(&self, gid: &str, interval: i64) -> ();
+    fn schedule_now(&self, gid: &str) -> ();
+    fn register_branch(&self, gid: &str, branch_id: &str, ops: &[(BranchOp, String)]) -> ();
+    fn list_recent(&self, limit: i64) -> Vec<GlobalRow>;
 }

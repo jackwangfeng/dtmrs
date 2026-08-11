@@ -31,13 +31,15 @@ server = [
 ]
 # TC 的 gRPC 接口 + 调 grpc:// 分支
 grpc = ["server", "dep:tonic", "dtmrs-server/grpc"]
+# Redis 存储后端 —— 秒杀那类流量尖峰用。⚠ 持久性弱于 SQL，见文档
+redis = ["server", "dtmrs-server/redis"]
 # 业务侧（RM）要的子事务屏障 —— 只接入不部署 TC 的话，单开这个就够
 barrier = ["dep:dtmrs-barrier"]
 # 业务侧（RM）的 XA 助手
 xa = ["dep:dtmrs-xa"]
 
 # 全都要
-full = ["server", "grpc", "barrier", "xa"]
+full = ["server", "grpc", "barrier", "xa", "redis"]
 
 [dependencies]
 dtmrs-core = { path = "../dtmrs-core", version = "0.1.0" }

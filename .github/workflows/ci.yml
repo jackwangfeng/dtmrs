@@ -35,9 +35,10 @@ jobs:
       - run: cargo test --workspace
 
   # 真库测试。**这个 job 不能省** —— 存储 / 屏障 / XA 那几层的差异
-  # 只有对着真 Postgres 和真 MySQL 才验得出来，sqlite 全绿不代表它们没问题。
+  # 只有对着真 Postgres / MySQL / Redis 才验得出来，sqlite 全绿不代表它们没问题。
+  # Redis 尤其如此：它连 SQL 都不是，原子性靠的是完全不同的机制（Lua 脚本）。
   test-real-db:
-    name: 测试（真 Postgres + 真 MySQL）
+    name: 测试（真 Postgres + 真 MySQL + 真 Redis）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +57,8 @@ jobs:
           docker run -d --name my -p 3306:3306 \
             -e MYSQL_ROOT_PASSWORD=dtmrs -e MYSQL_DATABASE=dtmrs \
             mysql:8.0
+      - name: 起 Redis
+        run: docker run -d --name rd -p 6379:6379 redis:7-alpine
       - name: 等数据库就绪
         run: |
           for i in $(seq 1 60); do
@@ -66,6 +69,10 @@ jobs:
             docker exec my mysqladmin ping -uroot -pdtmrs >/dev/null 2>&1 && break
             sleep 2
           done
+          for i in $(seq 1 30); do
+            docker exec rd redis-cli ping >/dev/null 2>&1 && break
+            sleep 1
+          done
 
       - name: cargo test（配上全部四个真库开关）
         env:
@@ -73,7 +80,9 @@ jobs:
           DTMRS_TEST_MYSQL: mysql://root:dtmrs@127.0.0.1:3306/dtmrs
           DTMRS_TEST_XA_PG: postgres://postgres:dtmrs@127.0.0.1:5432/dtmrs
           DTMRS_TEST_XA_MYSQL: mysql://root:dtmrs@127.0.0.1:3306/dtmrs
-        run: cargo test --workspace
+          DTMRS_TEST_REDIS: redis://127.0.0.1:6379/0
+        # 开 redis feature —— 它默认是关的，不开等于没测
+        run: cargo test --workspace --features dtmrs/redis,dtmrs-server/redis,dtmrs-store/redis
 
   # 四个语言绑定都得能实际跑起来，不是编过就算
   bindings:

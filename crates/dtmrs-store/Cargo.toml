@@ -13,8 +13,16 @@ description = "Storage layer for dtmrs: one set of SQL across sqlite / postgres 
 
 readme = "README.md"
 
+[features]
+# Redis 后端。默认关 —— 它跟 SQL 后端有实打实的语义差异（持久性、终态会过期），
+# 不该让不需要的人默认背上这条依赖，也不该让人无意中用上
+default = []
+redis = ["dep:redis", "dep:serde_json"]
+
 [dependencies]
 dtmrs-core = { path = "../dtmrs-core", version = "0.1.0" }
+redis = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 

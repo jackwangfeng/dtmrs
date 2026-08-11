@@ -177,6 +177,7 @@ TC 崩溃后重启，所有未终结事务会被 cron 重新捞起继续推进�
 | **MySQL 存储 + MySQL XA** | ✅ 第三版 |
 | **gRPC（分支调用 + TC 服务端 API）** | ✅ 第四版 |
 | **Node / JVM 绑定** | ✅ 第四版 |
+| **Redis 存储（秒杀类尖峰）** | ✅ 第五版 |
 | **workflow 模式（重放 + 结果记忆化）** | ✅ 第五版 |
 
 ## 七、工程结构
@@ -185,9 +186,12 @@ TC 崩溃后重启，所有未终结事务会被 cron 重新捞起继续推进�
 dtmrs/
   crates/
     dtmrs-core/      类型 + 状态机（纯逻辑，无 I/O，好测）+ SQL 方言层
-    dtmrs-store/     存储层（sqlx::Any + 方言渲染，一套 SQL 跑
-                     sqlite / postgres / mysql）。**没有抽 Store trait** ——
-                     三种库的差异小到一层模板就能吸收，抽 trait 是过早抽象
+    dtmrs-store/     存储层。SQL 后端：sqlx::Any + 方言渲染，一套 SQL 跑
+                     sqlite / postgres / mysql。
+                     ⚠ 原先这里写着「没有抽 Store trait —— 三种库的差异小到
+                     一层模板就能吸收」。**加 Redis 之后这个前提不成立了**
+                     （它不是 SQL，模板吸收不了），现在有一层 enum 分发。
+                     用 enum 不用 trait：调用方仍是同一个具体类型，调用点没改
     dtmrs-server/    api.rs（协议无关的操作层，HTTP 与 gRPC 共用）
                      axum HTTP + tonic gRPC + cron 调度器 + 嵌入式门面
     dtmrs-barrier/   客户端子事务屏障库

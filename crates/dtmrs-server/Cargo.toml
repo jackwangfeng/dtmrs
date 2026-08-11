@@ -18,6 +18,8 @@ readme = "README.md"
 # 那边要的是尽量小的 .so，而嵌入式宿主基本用 local:// 分支。
 default = ["grpc"]
 grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
+# Redis 存储后端。语义跟 SQL 有差异，见 dtmrs-store::redis_store
+redis = ["dtmrs-store/redis"]
 
 [dependencies]
 dtmrs-core = { path = "../dtmrs-core", version = "0.1.0" }
@@ -52,6 +54,7 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
 tokio-stream = { workspace = true }
+redis = { workspace = true }
 
 [package.metadata.docs.rs]
 # 默认就带 grpc；protoc 由 build.rs 兜底，docs.rs 上不需要额外装

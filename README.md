@@ -238,10 +238,11 @@ restart you must register a handler under the same name.
 | **XA (native two-phase commit on Postgres + MySQL)** | ✅ |
 | **gRPC (branch calls + TC server API)** | ✅ |
 | **workflow mode (write the flow as a function, resume after a crash)** | ✅ |
+| **Redis storage (flash-sale spikes, ⚠ weaker durability than SQL)** | ✅ |
 
-**126 tests, all green**: 33 state-machine/dialect unit tests + 7 storage + 10 barrier
+**139 tests, all green**: 33 state-machine/dialect unit tests + 7 storage + 10 barrier
 + 6 XA helper + 8 C ABI + 13 server unit + 6 SAGA e2e + 12 TCC/msg + 5 embedded
-+ 6 XA e2e + 8 gRPC e2e + 12 workflow e2e.
++ 6 XA e2e + 8 gRPC e2e + 12 workflow e2e + 10 Redis.
 The 17 storage and barrier tests each run against **sqlite, real Postgres and real MySQL**;
 the 6 XA tests require a real Postgres or MySQL (both configured → both run).
 The Python, Node, Java and C examples all actually run.
@@ -254,7 +255,8 @@ DTMRS_TEST_PG='postgres://postgres:pw@127.0.0.1:5432/dtmrs' \
 DTMRS_TEST_MYSQL='mysql://root:pw@127.0.0.1:3306/dtmrs' \
 DTMRS_TEST_XA_PG='postgres://postgres:pw@127.0.0.1:5432/dtmrs' \
 DTMRS_TEST_XA_MYSQL='mysql://root:pw@127.0.0.1:3306/dtmrs' \
-cargo test --workspace
+DTMRS_TEST_REDIS='redis://127.0.0.1:6379/0' \
+cargo test --workspace --features dtmrs/redis,dtmrs-server/redis,dtmrs-store/redis
 ```
 
 ## Storage: one set of SQL for sqlite / Postgres / MySQL
@@ -673,6 +675,66 @@ awkward.
 
 Submitting `trans_type=workflow` over HTTP or gRPC is explicitly rejected rather than
 silently accepted.
+
+## Redis backend: built for flash-sale traffic spikes
+
+```bash
+DTMRS_DB='redis://127.0.0.1:6379/0' ./dtmrs
+```
+
+Requires the feature (off by default): `cargo build --features redis`.
+
+When a huge number of transactions arrive in a short window, a SQL database's writes and
+row locks become the bottleneck — the same reason DTM supports Redis.
+
+### ⚠ Three semantics that differ from the SQL backends
+
+**1. Weaker durability.** Redis defaults to `appendfsync everysec`, so a crash can lose the
+last second of writes. For a coordinator what you lose is **transaction state**: you can end
+up with "the business side already deducted money, but the TC has no record of that
+transaction". The SQL backends don't have this (committed means on disk).
+
+Either accept it (often acceptable for flash sales, with reconciliation as a backstop) or
+configure `appendfsync always` — slower, but still faster than SQL. **Do not run
+money-critical strong-consistency workloads on the default configuration.**
+
+**2. Finished transactions expire** (7-day TTL by default). Otherwise memory is gone after a
+few tens of millions of flash-sale transactions. The SQL backends keep them forever. Archive
+elsewhere if you need long-term audit records.
+
+**3. `list_recent` keeps only the most recent 1000** — it is an admin view, not full history.
+
+### Atomicity comes from Lua, not row locks
+
+When several instances race for the same transaction, the SQL backends use a
+SELECT-then-conditional-UPDATE pair plus row locks. Redis runs the whole thing inside one
+Lua script — script execution is **single-threaded and uninterruptible**, so "find a due
+transaction and claim it" is atomic by construction, which is more direct than the SQL
+version.
+
+The script also evicts index members that are no longer schedulable, so the index cannot rot
+if some other code path forgets to maintain it.
+
+Measured (3 TC instances, 20 transactions, business side sleeping 30 ms each to widen the
+race window):
+
+```
+per-instance counts: [(0, 9), (1, 6), (2, 5)]   ← work really was spread across instances
+duplicately driven branches: none ✓             ← each branch called exactly once
+```
+
+(Test: `redis_多实例并发不重复推进`)
+
+### This overturned an earlier design decision
+
+DESIGN.md explicitly stated that there is **no `Store` trait**, on the grounds that "the
+differences between the three SQL databases are small enough for one template layer to
+absorb; abstracting would be premature". That was correct at the time.
+
+**Redis invalidates the premise** — it isn't SQL: no tables, no transactions, no WHERE
+clause, nothing a template can absorb. So there is now a backend dispatch layer. It uses an
+enum rather than a trait: callers still get the same concrete `Store` type, none of the
+40-odd call sites changed, and there are no generics or `dyn` sprinkled around.
 
 ## Installing
 

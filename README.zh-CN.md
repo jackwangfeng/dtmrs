@@ -258,10 +258,11 @@ TC 在进程里，但状态在 DB 里。进程死了事务不丢 —— 新进�
 | **XA（Postgres + MySQL 两阶段提交）** | ✅ 可用 |
 | **gRPC（分支调用 + TC 服务端 API）** | ✅ 可用 |
 | **workflow 模式（流程写成函数，崩溃后断点续跑）** | ✅ 可用 |
+| **Redis 存储（秒杀类尖峰，⚠ 持久性弱于 SQL）** | ✅ 可用 |
 
-**126 个测试全绿**：33 个状态机/方言单测 + 7 个存储 + 10 个屏障 + 6 个 XA 工具
+**139 个测试全绿**：33 个状态机/方言单测 + 7 个存储 + 10 个屏障 + 6 个 XA 工具
 + 8 个 C ABI + 13 个服务端单元 + 6 个 SAGA 端到端 + 12 个 TCC/msg + 5 个嵌入式
-+ 6 个 XA 端到端 + 8 个 gRPC 端到端 + **12 个 workflow 端到端**。
++ 6 个 XA 端到端 + 8 个 gRPC 端到端 + 12 个 workflow 端到端 + **10 个 Redis**。
 存储和屏障的 17 个会在 sqlite / 真 Postgres / 真 MySQL 上**各跑一遍**；
 XA 那 6 个必须有真 Postgres 或真 MySQL（两个都配就都跑）。
 Python、Node、Java、C 四个示例都实际跑通（CI 里每次都跑）。
@@ -273,7 +274,8 @@ DTMRS_TEST_PG='postgres://postgres:pw@127.0.0.1:5432/dtmrs' \
 DTMRS_TEST_MYSQL='mysql://root:pw@127.0.0.1:3306/dtmrs' \
 DTMRS_TEST_XA_PG='postgres://postgres:pw@127.0.0.1:5432/dtmrs' \
 DTMRS_TEST_XA_MYSQL='mysql://root:pw@127.0.0.1:3306/dtmrs' \
-cargo test --workspace
+DTMRS_TEST_REDIS='redis://127.0.0.1:6379/0' \
+cargo test --workspace --features dtmrs/redis,dtmrs-server/redis,dtmrs-store/redis
 ```
 
 ## 存储：sqlite / Postgres / MySQL 一套 SQL
@@ -650,6 +652,56 @@ tc.submit_workflow("order-1001", "下单", r#"{"amount":100}"#).await?;
 的函数体在客户端进程里，TC 只存状态。我们把 TC 也放在同一个进程里，这件事反而更自然。
 
 HTTP / gRPC 提交 `trans_type=workflow` 会被明确拒绝，而不是假装受理。
+
+## Redis 后端：为秒杀那类流量尖峰而生
+
+```bash
+DTMRS_DB='redis://127.0.0.1:6379/0' ./dtmrs
+```
+
+需要开 feature（默认是关的）：`cargo build --features redis`。
+
+短时间涌进海量事务时，SQL 库的写入和行锁扛不住 —— DTM 支持 Redis 也是这个动机。
+
+### ⚠ 三条跟 SQL 后端不一样的语义，用之前必须知道
+
+**1. 持久性弱一档。** Redis 默认 `appendfsync everysec`，崩溃可能丢掉最后一秒的写入。
+对协调器来说丢的是**事务状态**：可能出现「业务侧已经扣了款，但 TC 这边没有这笔事务」
+的悬挂。SQL 后端不会（提交即落盘）。
+
+要么接受它（秒杀场景常常能接受，且有对账兜底），要么配 `appendfsync always`
+（吞吐会掉，但仍比 SQL 快）。**别在默认配置下跑资金类强一致场景。**
+
+**2. 终态事务会过期消失**（默认 7 天 TTL）。不然秒杀几千万笔之后内存就没了。
+SQL 后端里已完成的事务是永久留着的。要长期审计记录得自己往别处归档。
+
+**3. `list_recent` 只保留最近 1000 笔**，是管理视图不是全量历史。
+
+### 原子性靠 Lua，不靠行锁
+
+多实例抢同一笔事务时，SQL 那边靠「先 SELECT 再带条件 UPDATE」两步法 + 行锁；
+Redis 这边整段逻辑在一个 Lua 脚本里跑完 —— Redis 执行脚本**单线程且不可打断**，
+所以「找到到期事务 + 抢占它」天然原子，反而比 SQL 那套更直接。
+
+脚本里还会顺手清掉索引中已经不该调度的成员，索引不会因为别处漏维护而慢慢腐烂。
+
+实测（3 个 TC 实例、20 笔事务、业务端故意每次 sleep 30ms 制造撞车窗口）：
+
+```
+各实例处理数: [(0, 9), (1, 6), (2, 5)]    ← 活确实分散在三个实例上
+重复推进的分支: 无 ✓                        ← 每个分支正好被调用 1 次
+```
+
+（测试：`redis_多实例并发不重复推进`）
+
+### 这件事推翻了一个原先写下的设计决定
+
+DESIGN.md 里原本明确写着**不抽 `Store` trait**，理由是「三种库的差异小到一层模板
+就能吸收，抽 trait 是过早抽象」。那个判断在当时是对的。
+
+**Redis 让前提不成立了** —— 它不是 SQL，没有表、没有事务、没有 WHERE，模板吸收不了。
+所以现在有了一层后端分发。用的是 enum 而不是 trait：调用方拿到的还是同一个 `Store`
+具体类型，四十多个调用点一行没改，也不用到处写泛型或 `dyn`。
 
 ## 安装
 
