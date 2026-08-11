@@ -12,9 +12,9 @@ on:
       target:
         description: 发哪个
         required: true
-        default: both
+        default: all
         type: choice
-        options: [npm, pypi, both]
+        options: [npm, pypi, maven, all]
       dry_run:
         description: 只演练不真发
         required: false
@@ -23,7 +23,7 @@ on:
 
 jobs:
   npm:
-    if: inputs.target == 'npm' || inputs.target == 'both'
+    if: inputs.target == 'npm' || inputs.target == 'all'
     runs-on: ubuntu-latest
     permissions:
       # OIDC 就靠它 —— 没有这条，npm 拿不到身份令牌
@@ -78,7 +78,7 @@ jobs:
         run: npm publish
 
   pypi:
-    if: inputs.target == 'pypi' || inputs.target == 'both'
+    if: inputs.target == 'pypi' || inputs.target == 'all'
     runs-on: ubuntu-latest
     # PyPI 的信任发布可以绑定到环境，加一层人工审批（可选）
     environment: pypi
@@ -107,3 +107,72 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: clients/python/dist
+
+  # Maven Central 没有 OIDC，只能用 GPG 私钥 + user token。
+  #
+  # 挪进 CI 的理由：本地签名要 pinentry，而 pinentry 要真终端 ——
+  # 在没有 TTY 的环境里（CI、远程 shell、各种 agent）必然
+  # `Inappropriate ioctl for device`，每次发版都要人去某个终端里解锁一次。
+  # CI 里走 loopback pinentry + 环境变量密码，彻底绕开这个问题。
+  #
+  # ⚠ 仍然保留 pom 里的 autoPublish=false：构件只上传到门户并校验，
+  # **最后一下要人去点**。Maven Central 发布后永远删不掉。
+  maven:
+    if: inputs.target == 'maven' || inputs.target == 'all'
+    runs-on: ubuntu-latest
+    # 建议在仓库设置里给这个 environment 配上人工审批
+    environment: maven
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          # setup-java 会生成 ~/.m2/settings.xml，server id 必须是 central ——
+          # pom 里的 publishingServerId 写死了这个名字
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          # 私钥交给 setup-java 导入，它会顺带配好 loopback pinentry
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: 确认 secrets 齐全
+        env:
+          U: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          P: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          K: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+        run: |
+          # 早失败好过传一半再报错
+          : "${U:?缺 MAVEN_CENTRAL_USERNAME}"
+          : "${P:?缺 MAVEN_CENTRAL_PASSWORD}"
+          : "${K:?缺 MAVEN_GPG_PRIVATE_KEY}"
+          echo "secrets 齐了"
+
+      - name: 演练（只构建和签名，不上传）
+        if: inputs.dry_run
+        working-directory: clients/java
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: |
+          mvn -B -Prelease verify -DskipTests
+          echo "--- 构件和签名 ---"
+          ls -1 target/*.jar target/*.asc
+          # 没有 .asc 就说明签名没生效，那样 deploy 到 Central 一定被拒
+          test -f target/dtmrs-barrier-*.jar.asc || { echo "❌ 签名没生成"; exit 1; }
+
+      - name: 上传到 Central（停在门户等人点发布）
+        if: ${{ !inputs.dry_run }}
+        working-directory: clients/java
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: mvn -B -Prelease deploy -DskipTests
+
+      - name: 提醒
+        if: ${{ !inputs.dry_run }}
+        run: |
+          echo "构件已上传并校验。**最后一步要人工确认**："
+          echo "https://central.sonatype.com/publishing/deployments"
+

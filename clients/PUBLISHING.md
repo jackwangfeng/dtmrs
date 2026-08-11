@@ -6,7 +6,7 @@
 |---|---|---|
 | **PyPI** | OIDC（trusted publishing） | 零 token，全自动 |
 | **npm** | OIDC（trusted publishing） | 零 token，自带 provenance |
-| **Maven Central** | GPG 签名 + user token | 没有 OIDC，只能这样 |
+| **Maven Central** | GPG 签名 + user token（存在仓库 secrets） | 没有 OIDC，只能这样 |
 
 ## 日常发版（npm / PyPI）
 
@@ -84,6 +84,33 @@ NPM_OTP=123456 ./publish.sh node     # 账号开了 2FA 就要带动态码
   Portal 给的模板里是 `${server}`，**那是占位符**，照抄会连不上
 - `autoPublish=false`：上传后停在 Portal 等人确认。
   **Maven Central 发布后永远删不掉**，别跳过这步
+
+## Maven 走 CI 要配的 4 个 secret
+
+Maven 是唯一没有 OIDC 的，只能把凭据存成仓库 secret。在
+**Settings → Secrets and variables → Actions** 里加：
+
+| Secret | 怎么拿 |
+|---|---|
+| `MAVEN_CENTRAL_USERNAME` | central.sonatype.com → Account → Generate User Token 的 username |
+| `MAVEN_CENTRAL_PASSWORD` | 同上的 password |
+| `MAVEN_GPG_PRIVATE_KEY` | `gpg --export-secret-keys --armor <KEYID>` 的**完整输出**（含 BEGIN/END 行） |
+| `MAVEN_GPG_PASSPHRASE` | 私钥密码 |
+
+建议再建一个叫 `maven` 的 environment 并配上人工审批（workflow 里已经绑了）。
+
+配好之后：Actions → publish-clients → Run workflow，target 选 `maven`
+（或 `all` 三个一起），**先用 dry_run 演练一次**再真发。
+
+### 为什么要挪进 CI
+
+本地签名要 pinentry，而 pinentry 要**真终端**。在没有 TTY 的环境里
+（CI、远程 shell、各种 agent）必然报 `Inappropriate ioctl for device`，
+每次发版都得找个真终端手动解锁一次 gpg-agent。CI 里用 loopback pinentry +
+环境变量密码，彻底绕开。
+
+⚠ **`autoPublish=false` 仍然保留**：CI 只负责上传和校验，
+最后那一下还是要人去门户点。Maven Central 发布后永远删不掉。
 
 ## 手动发布（不走 CI）
 
