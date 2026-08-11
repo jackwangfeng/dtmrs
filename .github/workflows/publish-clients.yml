@@ -149,6 +149,30 @@ jobs:
           : "${K:?缺 MAVEN_GPG_PRIVATE_KEY}"
           echo "secrets 齐了"
 
+      # 把「Bad passphrase」从 maven 构建深处提到最前面，并且直接指出最常见的原因。
+      # 不这么做的话，要跑完一轮 20 秒的构建才在 gpg 插件里报错，而那条错误
+      # 不会告诉你「你的 secret 尾部多了个换行」
+      - name: 自检 GPG 密码
+        env:
+          PASS: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: |
+          sign() { echo t | gpg --batch --yes --pinentry-mode loopback \
+                     --passphrase "$1" --clearsign >/dev/null 2>&1; }
+          if sign "$PASS"; then
+            echo "✓ GPG 密码可用"
+            exit 0
+          fi
+          # 去掉首尾空白再试一次 —— 能过就说明 secret 里混进了换行/空格
+          if sign "$(printf '%s' "$PASS" | tr -d '\r\n' | sed 's/[[:space:]]*$//')"; then
+            echo "❌ 密码本身是对的，但 secret 里混进了换行或尾部空格。"
+            echo "   多半是用 echo 管道设的（echo 会补 \\n）。重设一次："
+            echo "     printf '%s' '你的密码' | gh secret set MAVEN_GPG_PASSPHRASE"
+            exit 1
+          fi
+          echo "❌ MAVEN_GPG_PASSPHRASE 跟 MAVEN_GPG_PRIVATE_KEY 对不上。"
+          echo "   注意这两个必须是同一把钥匙的 —— 换过密钥就要一起换。"
+          exit 1
+
       - name: 演练（只构建和签名，不上传）
         if: inputs.dry_run
         working-directory: clients/java
