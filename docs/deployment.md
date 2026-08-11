@@ -155,9 +155,12 @@ postgres -c max_prepared_transactions=32     # MySQL 8.0 默认就行
 
 ## 重试行为
 
-分支返回「结果未知」时，TC 按**指数退避**重试：10s → 20s → 40s → … 上限 300s。
+分支返回「结果未知」时，TC 按**指数退避**重试：默认 10s → 20s → 40s → … 上限 300s，
+用 `DTMRS_RETRY_INTERVAL` / `DTMRS_RETRY_MAX_INTERVAL` 调。
 
-这个策略目前不可配置。如果你的分支耗时很长，注意 TC 的分支调用超时是 **10 秒**——超过这个时间应该让分支立刻返回 `ONGOING`（HTTP 425），而不是让 TC 干等。
+分支调用超时默认 **10 秒**（`DTMRS_BRANCH_TIMEOUT`）。分支耗时长的话有两个选择：
+调大这个值，或者让分支立刻返回 `ONGOING`（HTTP 425）让 TC 下轮再来 —— 后者更好，
+因为占着连接干等会拖慢整个推进器。
 
 ## 升级
 

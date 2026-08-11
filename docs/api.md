@@ -231,6 +231,7 @@ service Tc {
   rpc RegisterBranch(RegisterBranchRequest) returns (Empty);
   rpc Submit(SubmitRequest) returns (Empty);
   rpc Abort(AbortRequest) returns (Empty);
+  rpc Retry(RetryRequest) returns (Empty);
   rpc Query(QueryRequest) returns (TransView);
 }
 ```
