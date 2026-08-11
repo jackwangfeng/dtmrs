@@ -6,7 +6,10 @@
 #
 # 凭据从各工具自己的位置读，本脚本不碰、不打印：
 #   PyPI   ~/.pypirc 或 TWINE_USERNAME=__token__ TWINE_PASSWORD=pypi-xxx
-#   npm    ~/.npmrc（npm login 生成）
+#   npm    ~/.npmrc 里的 //registry.npmjs.org/:_authToken=
+#          ⚠ SSH 环境下别用 `npm login`（默认要弹浏览器），见 README 的说明。
+#          ⚠ 本机 registry 若指向淘宝等镜像不影响发布 —— package.json 里
+#             publishConfig 已经把目标钉死在官方源，镜像是只读的发不上去
 #   Maven  ~/.m2/settings.xml 里 id=central 的 server + GPG 密钥
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -25,8 +28,16 @@ fi
 
 if [ "$ONLY" = all ] || [ "$ONLY" = node ]; then
   echo "=== Node (npm) ==="
-  ( cd node && npm pack --dry-run
-    confirm "发布 dtmrs-barrier@$VERSION 到 npm？" && npm publish --access public )
+  ( cd node
+    # 发布前先确认认证是对着**官方源**的，而不是镜像
+    who=$(npm whoami --registry https://registry.npmjs.org/ 2>/dev/null || true)
+    if [ -z "$who" ]; then
+      echo "  ✗ 未登录官方 npm 源。见 clients/README.md 的「SSH 环境怎么认证」"
+      exit 1
+    fi
+    echo "  当前 npm 账号: $who"
+    npm pack --dry-run
+    confirm "发布 dtmrs-barrier@$VERSION 到 npm？" && npm publish )
 fi
 
 if [ "$ONLY" = all ] || [ "$ONLY" = java ]; then

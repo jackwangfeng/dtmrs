@@ -48,6 +48,36 @@ Go 走 `go get github.com/jackwangfeng/dtmrs/clients/go`（Go 的模块机制不
 
 发布用 [`publish.sh`](publish.sh)。
 
+### SSH 环境怎么认证（没法弹浏览器）
+
+`npm login` 在 npm 9+ 默认走 web 流程要开浏览器。SSH 上三选一：
+
+**① 用 token（推荐）** —— 在浏览器（你本机）打开
+[npmjs.com Access Tokens](https://www.npmjs.com/settings/~/tokens) 生成一个
+**Granular Access Token**（权限选 Read and write，范围可以只给这一个包），然后：
+
+```bash
+echo '//registry.npmjs.org/:_authToken=npm_你的token' >> ~/.npmrc
+chmod 600 ~/.npmrc
+npm whoami --registry https://registry.npmjs.org/   # 验证
+```
+
+token 可以限定权限、随时吊销，比存登录态安全。
+
+**② 终端登录**（不开浏览器，走用户名密码 + OTP）：
+
+```bash
+npm login --auth-type=legacy --registry https://registry.npmjs.org/
+```
+
+**③ web 流程但手动开链接** —— `npm login --registry https://registry.npmjs.org/`
+会打印一个 URL，复制到你本机浏览器打开完成授权，CLI 那边会轮询到。
+
+> ⚠ **如果你的 npm registry 指向淘宝等镜像**（`npm config get registry` 看一下），
+> 那是**只读镜像，发布会失败**。认证和发布都必须对着 `registry.npmjs.org`。
+> `package.json` 里的 `publishConfig` 已经把发布目标钉死了，但**认证仍需
+> 显式带 `--registry`**，否则 `npm whoami` 查的是镜像。
+
 ## 用法
 
 四个语言形状一致，以 Go 为例：
