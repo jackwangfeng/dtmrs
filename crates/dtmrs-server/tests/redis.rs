@@ -1,5 +1,9 @@
 //! Redis 后端端到端。
 //!
+//! ⚠ 整个文件挂在 `redis` feature 下 —— 集成测试文件**不管 feature 开没开都会
+//! 被编译**，不加 cfg 的话，关掉 feature 的构建会因为找不到 `redis_store`
+//! 而直接编译失败（CI 上撞过）。
+//!
 //! ```bash
 //! docker run -d --rm -p 16379:6379 redis:7-alpine
 //! export DTMRS_TEST_REDIS='redis://127.0.0.1:16379/0'
@@ -16,6 +20,8 @@
 //! 2. **状态机行为跟 SQL 后端一致** —— 正向、补偿、超时不回滚。
 //!
 //! 外加一条 Redis 独有的：终态事务会挂 TTL（不然秒杀几千万笔会撑爆内存）。
+
+#![cfg(feature = "redis")]
 
 use dtmrs_core::{BranchResult, GlobalStatus, SagaStep};
 use dtmrs_server::driver::Driver;
