@@ -16,7 +16,7 @@ Apache-2.0。只实现 DTM 的协议，不抄它的代码。
 
 ```bash
 cargo build --release                 # 二进制在 target/release/dtmrs
-cargo test --workspace                # 146 个测试（真库那部分会被跳过，见下）
+cargo test --workspace                # 156 个测试（真库那部分会被跳过，见下）
 cargo run --example embedded -p dtmrs-server   # 嵌入式模式的可运行示例
 cargo run --example workflow -p dtmrs-server   # workflow 模式（重放/断点续跑）
 
@@ -51,7 +51,7 @@ DTMRS_TEST_MYSQL='mysql://root:pw@127.0.0.1:3306/dtmrs' \
 DTMRS_TEST_XA_PG='postgres://postgres:pw@127.0.0.1:5432/dtmrs' \
 DTMRS_TEST_XA_MYSQL='mysql://root:pw@127.0.0.1:3306/dtmrs' \
 DTMRS_TEST_REDIS='redis://127.0.0.1:6379/0' \
-cargo test --workspace --features dtmrs/redis,dtmrs-server/redis,dtmrs-store/redis
+cargo test --workspace --features dtmrs/redis,dtmrs/barrier-redis,dtmrs-server/redis,dtmrs-store/redis,dtmrs-barrier/redis
 ```
 
 改动 `dtmrs-store` / `dtmrs-barrier` / `dtmrs-xa` / dialect 层的话，**必须对着真
@@ -88,7 +88,9 @@ crates/
                   main.rs(axum HTTP) / grpc/(tonic，调分支 + 提供 API)
                   driver.rs(推进器) / registry.rs(进程内分支表)
                   workflow.rs(workflow 模式) / embedded.rs(嵌入式门面)
-  dtmrs-barrier/  客户端子事务屏障
+  dtmrs-barrier/  客户端子事务屏障。SQL 版靠「加入业务的本地事务」，
+                  Redis 版（redis feature）靠「屏障判定和业务操作同一个 Lua 脚本」，
+                  判定语义两边必须逐条一致，测试用例名一一对应
   dtmrs-xa/       业务方(RM)的 XA 助手，pg / mysql 两套语法
   dtmrs-ffi/      C ABI（cdylib + staticlib，产物名 libdtmrs）
 ```

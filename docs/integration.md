@@ -67,6 +67,41 @@ tx.commit().await?;   // 原子性的来源：屏障记录与业务变更同生�
 
 不是同一个库就没法共用一个本地事务，屏障记录和业务变更就不再原子——这个方案直接失效。这不是实现限制，是它成立的根本条件。
 
+### 业务数据在 Redis 里怎么办（秒杀）
+
+上面那两条前提有个直接后果：**库存在 Redis 里的话，这套屏障用不了**——
+根本没有 SQL 本地事务可以加入。而秒杀恰恰就是这个形状。
+
+开 `barrier-redis` feature，换成 `RedisBarrier`：原子性来源从「同一个本地事务」
+变成「**同一个 Lua 脚本**」（Redis 执行脚本单线程且不可打断）。
+
+```rust
+use dtmrs::barrier::{RedisBarrier, RedisOutcome};
+
+// 从 TC 传来的 query 参数构造，跟 SQL 版一样
+let mut bb = RedisBarrier::new(trans_type, gid, branch_id, op)?;
+
+// 检查库存够不够，够就扣 —— 屏障判定和扣减在同一个脚本里
+match bb.check_adjust_amount(&mut conn, "stock:1001", -1).await? {
+    RedisOutcome::Executed         => Ok(()),           // 扣成功
+    RedisOutcome::Failure          => Err(失败),        // 库存不足 → 让 TC 回滚
+    RedisOutcome::NullCompensation => Ok(()),           // 空回滚，正常路径
+    RedisOutcome::Duplicated       => Ok(()),           // 重复/悬挂，正常路径
+}
+```
+
+不是加减法的业务用 `call()` 传自己的 Lua（`KEYS`/`ARGV` 编号从 1 开始，
+屏障自己的键追加在后面，不打乱你的编号）。
+
+判定语义跟 SQL 版**逐条一致**，测试用例名都是一一对应的。但有两处
+**介质决定的行为差异**：
+
+- **屏障键会过期**（默认 7 天）。SQL 版的屏障行是永久的，Redis 里不挂 TTL
+  内存会撑爆。⚠ **TTL 必须长于事务可能的最大生命周期**（含重试退避）——
+  短了的话正向分支的键先过期，补偿再来会以为「正向没跑过」而空转，副作用就漏补了。
+- **业务失败要由脚本自己表达**。SQL 版里业务失败是你自己的事（不提交就行）；
+  这里业务跑在我们的脚本内，约定 `return 'FAILURE'` 表示拒绝。
+
 **2. 业务 SQL 必须在 `decide` 拿到的那个事务里。**
 
 写成这样就白做了：

@@ -26,6 +26,17 @@
 //!
 //! **前提：barrier 表必须和业务表在同一个数据库实例**，才能共用一个本地事务。
 //! 这不是实现限制，是这个方案成立的根本条件。
+//!
+//! # 业务数据在 Redis 里怎么办
+//!
+//! 秒杀那类场景库存本身就在 Redis，没有 SQL 本地事务可加入。开 `redis`
+//! feature 用 [`RedisBarrier`]：原子性来源换成「屏障判定和业务操作在同一个
+//! Lua 脚本里」，判定语义跟这里逐条一致。
+
+#[cfg(feature = "redis")]
+mod redis_barrier;
+#[cfg(feature = "redis")]
+pub use redis_barrier::{RedisBarrier, RedisOutcome, DEFAULT_BARRIER_TTL};
 
 use dtmrs_core::dialect::{check_len, TooLong};
 use dtmrs_core::{Backend, BranchOp};
@@ -39,6 +50,10 @@ pub enum Error {
     TooLong(#[from] TooLong),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
+    /// Redis 屏障（`redis` feature）用。不直接包 redis::RedisError，
+    /// 免得这个类型的形状随 feature 变化
+    #[error("redis: {0}")]
+    Redis(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

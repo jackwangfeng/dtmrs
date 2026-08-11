@@ -35,11 +35,14 @@ grpc = ["server", "dep:tonic", "dtmrs-server/grpc"]
 redis = ["server", "dtmrs-server/redis"]
 # 业务侧（RM）要的子事务屏障 —— 只接入不部署 TC 的话，单开这个就够
 barrier = ["dep:dtmrs-barrier"]
+# 业务数据在 Redis 里（秒杀库存那类）时的屏障。没有 SQL 本地事务可加入，
+# 原子性改由 Lua 脚本提供
+barrier-redis = ["barrier", "dtmrs-barrier/redis"]
 # 业务侧（RM）的 XA 助手
 xa = ["dep:dtmrs-xa"]
 
 # 全都要
-full = ["server", "grpc", "barrier", "xa", "redis"]
+full = ["server", "grpc", "barrier", "barrier-redis", "xa", "redis"]
 
 [dependencies]
 dtmrs-core = { path = "../dtmrs-core", version = "0.2.0" }

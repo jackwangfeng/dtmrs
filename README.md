@@ -983,7 +983,8 @@ dtmrs = { version = "0.2", default-features = false, features = ["barrier"] }
 |---|---|
 | `server` *(default)* | the coordinator, `Embedded`, the `dtmrs` binary |
 | `grpc` | gRPC server API + calling `grpc://` branches |
-| `barrier` | sub-transaction barrier — required for any business service |
+| `barrier` | sub-transaction barrier, SQL business database — required for any business service |
+| `barrier-redis` | the barrier for business data **living in Redis** (flash-sale stock) |
 | `xa` | XA helper for the resource-manager side |
 | `full` | all of the above |
 

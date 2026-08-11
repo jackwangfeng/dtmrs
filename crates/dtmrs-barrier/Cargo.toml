@@ -13,8 +13,14 @@ description = "Sub-transaction barrier: one table solving idempotence, empty rol
 
 readme = "README.md"
 
+[features]
+default = []
+# 业务数据在 Redis 里（秒杀库存那类）时用。原子性来自 Lua 脚本而不是 SQL 事务
+redis = ["dep:redis"]
+
 [dependencies]
 dtmrs-core = { path = "../dtmrs-core", version = "0.2.0" }
+redis = { workspace = true, optional = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 

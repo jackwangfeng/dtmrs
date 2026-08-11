@@ -347,6 +347,7 @@ name = "dtmrs-barrier"
 version = "0.2.0"
 dependencies = [
  "dtmrs-core",
+ "redis",
  "sqlx",
  "thiserror",
  "tokio",

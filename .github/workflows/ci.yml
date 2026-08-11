@@ -82,7 +82,7 @@ jobs:
           DTMRS_TEST_XA_MYSQL: mysql://root:dtmrs@127.0.0.1:3306/dtmrs
           DTMRS_TEST_REDIS: redis://127.0.0.1:6379/0
         # 开 redis feature —— 它默认是关的，不开等于没测
-        run: cargo test --workspace --features dtmrs/redis,dtmrs-server/redis,dtmrs-store/redis
+        run: cargo test --workspace --features dtmrs/redis,dtmrs/barrier-redis,dtmrs-server/redis,dtmrs-store/redis,dtmrs-barrier/redis
 
   # 业务侧客户端（子事务屏障）：四个语言 × 两种数据库，同一套五场景断言。
   # 算法写错不会报错，是静默的重复扣款 —— 所以每个语言都得对着真库验。
