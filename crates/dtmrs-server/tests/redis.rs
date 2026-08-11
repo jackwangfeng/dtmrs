@@ -119,14 +119,8 @@ async fn redis_正向提交与逆序补偿() {
 
     // ① 正常提交
     let steps = vec![
-        SagaStep {
-            action: "local://扣款".into(),
-            compensate: "local://退款".into(),
-        },
-        SagaStep {
-            action: "local://发货".into(),
-            compensate: "local://退货".into(),
-        },
+        SagaStep::new("local://扣款", "local://退款"),
+        SagaStep::new("local://发货", "local://退货"),
     ];
     let (g, br) = saga_rows("r-ok", &steps);
     st.create_global(&g, &br).await.unwrap();
@@ -162,10 +156,7 @@ async fn redis_超时不能触发回滚() {
     reg.register("补偿", |_| async { BranchResult::Success });
     let d = Driver::new(st.clone(), "tc-1".into()).with_registry(Arc::new(reg));
 
-    let steps = vec![SagaStep {
-        action: "local://超时".into(),
-        compensate: "local://补偿".into(),
-    }];
+    let steps = vec![SagaStep::new("local://超时", "local://补偿")];
     let (g, br) = saga_rows("r-timeout", &steps);
     st.create_global(&g, &br).await.unwrap();
     d.process(&g).await.unwrap();
@@ -193,10 +184,7 @@ async fn redis_多实例并发不重复推进() {
     let names = ["扣款", "退款"];
 
     // 先塞 N 笔待办
-    let steps = vec![SagaStep {
-        action: "local://扣款".into(),
-        compensate: "local://退款".into(),
-    }];
+    let steps = vec![SagaStep::new("local://扣款", "local://退款")];
     for i in 0..N {
         let (g, br) = saga_rows(&format!("r-race-{i:02}"), &steps);
         st.create_global(&g, &br).await.unwrap();
@@ -272,10 +260,7 @@ async fn redis_终态会挂ttl() {
     reg.register("好", |_| async { BranchResult::Success });
     let d = Driver::new(st.clone(), "tc-1".into()).with_registry(Arc::new(reg));
 
-    let steps = vec![SagaStep {
-        action: "local://好".into(),
-        compensate: "local://好".into(),
-    }];
+    let steps = vec![SagaStep::new("local://好", "local://好")];
     let (g, br) = saga_rows("r-ttl", &steps);
     st.create_global(&g, &br).await.unwrap();
 
@@ -313,10 +298,7 @@ async fn redis_终态不再被调度() {
     let Some((_guard, st)) = store("终态不调度").await else {
         return;
     };
-    let steps = vec![SagaStep {
-        action: "local://x".into(),
-        compensate: "local://y".into(),
-    }];
+    let steps = vec![SagaStep::new("local://x", "local://y")];
     let (g, br) = saga_rows("r-final", &steps);
     st.create_global(&g, &br).await.unwrap();
     st.set_global_status("r-final", GlobalStatus::Succeed, "")
@@ -334,10 +316,7 @@ async fn redis_租约到期后别的实例能接手() {
     let Some((_guard, st)) = store("租约接手").await else {
         return;
     };
-    let steps = vec![SagaStep {
-        action: "local://x".into(),
-        compensate: "local://y".into(),
-    }];
+    let steps = vec![SagaStep::new("local://x", "local://y")];
     let (g, br) = saga_rows("r-lease", &steps);
     st.create_global(&g, &br).await.unwrap();
 

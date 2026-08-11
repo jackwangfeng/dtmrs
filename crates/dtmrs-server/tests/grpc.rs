@@ -138,14 +138,14 @@ async fn store() -> Store {
 
 fn steps(host: &str) -> Vec<SagaStep> {
     vec![
-        SagaStep {
-            action: format!("grpc://{host}/busi.v1.Busi/Deduct"),
-            compensate: format!("grpc://{host}/busi.v1.Busi/DeductUndo"),
-        },
-        SagaStep {
-            action: format!("grpc://{host}/busi.v1.Busi/Shipment"),
-            compensate: format!("grpc://{host}/busi.v1.Busi/ShipmentUndo"),
-        },
+        SagaStep::new(
+            &format!("grpc://{host}/busi.v1.Busi/Deduct"),
+            &format!("grpc://{host}/busi.v1.Busi/DeductUndo"),
+        ),
+        SagaStep::new(
+            &format!("grpc://{host}/busi.v1.Busi/Shipment"),
+            &format!("grpc://{host}/busi.v1.Busi/ShipmentUndo"),
+        ),
     ]
 }
 
@@ -291,14 +291,14 @@ async fn grpc与http分支可以混用() {
     let st = store().await;
     let d = Driver::new(st.clone(), "tc-1".into());
     let mixed = vec![
-        SagaStep {
-            action: format!("grpc://{host}/busi.v1.Busi/Deduct"),
-            compensate: format!("grpc://{host}/busi.v1.Busi/DeductUndo"),
-        },
-        SagaStep {
-            action: format!("http://{http_addr}/act"),
-            compensate: format!("http://{http_addr}/act"),
-        },
+        SagaStep::new(
+            &format!("grpc://{host}/busi.v1.Busi/Deduct"),
+            &format!("grpc://{host}/busi.v1.Busi/DeductUndo"),
+        ),
+        SagaStep::new(
+            &format!("http://{http_addr}/act"),
+            &format!("http://{http_addr}/act"),
+        ),
     ];
     let (g, br) = saga_rows("grpc-mixed", &mixed);
     st.create_global(&g, &br).await.unwrap();
@@ -333,9 +333,11 @@ async fn tc的grpc_api与http同源() {
     cli.submit(pb::SubmitRequest {
         gid: gid.clone(),
         trans_type: String::new(), // 留空按 saga
+        // pb::SagaStep 是 proto 生成的类型，没有 new()
         steps: vec![pb::SagaStep {
             action: "http://x/a".into(),
             compensate: "http://x/c".into(),
+            payload: String::new(),
         }],
     })
     .await

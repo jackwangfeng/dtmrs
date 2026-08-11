@@ -133,8 +133,12 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("DTMRS_OWNER").unwrap_or_else(|_| format!("tc-{}", std::process::id()));
 
     let store = Store::open(&db).await?;
-    let driver = Driver::new(store.clone(), owner.clone());
-    info!(db = %db, http = %addr, grpc = %grpc_addr, owner = %owner, "dtmrs 启动");
+    // 按环境变量配超时/租约/退避，非法值退回默认
+    let driver = Driver::from_env(store.clone(), owner.clone());
+    info!(db = %db, http = %addr, grpc = %grpc_addr, owner = %owner,
+          branch_timeout = driver.http_timeout_secs(), lease = driver.lease,
+          retry_initial = driver.retry.initial, retry_max = driver.retry.max,
+          "dtmrs 启动");
 
     // 常驻推进器。崩溃恢复就靠它：重启后未终结的事务会被重新捞起
     tokio::spawn(driver.clone().run_forever(Duration::from_secs(1)));

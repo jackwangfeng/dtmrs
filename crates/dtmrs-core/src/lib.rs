@@ -246,11 +246,38 @@ impl BranchOp {
     }
 }
 
-/// 一个 SAGA 步骤：正向动作 + 对应补偿
+/// 一个 SAGA 步骤：正向动作 + 对应补偿 + 这一步的业务数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SagaStep {
     pub action: String,
     pub compensate: String,
+    /// 发给这一步分支的请求体。**每步各自独立** ——
+    /// 扣款那步要金额，发货那步要地址，它们本来就不该收到同一份数据。
+    ///
+    /// 留空则发 `{}`。`#[serde(default)]` 保证 0.2 及更早版本落库的
+    /// payload（没有这个字段）仍然能解出来，不会让老事务推不动。
+    #[serde(default)]
+    pub payload: String,
+}
+
+impl SagaStep {
+    /// 不带业务数据的一步（分支只靠 gid/branch_id/op 做幂等就够时用）
+    pub fn new(action: &str, compensate: &str) -> Self {
+        Self {
+            action: action.to_string(),
+            compensate: compensate.to_string(),
+            payload: String::new(),
+        }
+    }
+
+    /// 带业务数据的一步
+    pub fn with_payload(action: &str, compensate: &str, payload: &str) -> Self {
+        Self {
+            action: action.to_string(),
+            compensate: compensate.to_string(),
+            payload: payload.to_string(),
+        }
+    }
 }
 
 /// 推进全局事务后，状态机给出的下一步指令
@@ -314,13 +341,60 @@ pub fn saga_advance(
     }
 }
 
-/// 指数退避：10s → 20s → 40s → … → 上限 300s
-pub fn next_interval(cur: i64) -> i64 {
-    const MAX: i64 = 300;
-    if cur <= 0 {
-        return 10;
+/// 重试退避策略。
+///
+/// 原来这两个值是写死的（10s 起、300s 封顶）。真实业务差异很大：
+/// 秒杀场景希望几百毫秒就重试，跨境对接可能希望几分钟才重试一次。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// 第一次重试等多久（秒）
+    pub initial: i64,
+    /// 退避上限（秒）。每次翻倍，到这里为止
+    pub max: i64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        // 保持跟 0.2 一致的默认值，不配置的人行为不变
+        Self {
+            initial: 10,
+            max: 300,
+        }
     }
-    (cur * 2).min(MAX)
+}
+
+impl RetryPolicy {
+    /// 从环境变量读，非法值一律退回默认 —— **绝不能因为配置写错就让推进器起不来**
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let get = |k: &str, fallback: i64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(fallback)
+        };
+        let initial = get("DTMRS_RETRY_INTERVAL", d.initial);
+        let max = get("DTMRS_RETRY_MAX_INTERVAL", d.max);
+        // 上限比初始值还小是配置错误，取两者较大的，别让退避反向增长
+        Self {
+            initial,
+            max: max.max(initial),
+        }
+    }
+}
+
+/// 指数退避：`initial` → ×2 → … → 封顶 `max`
+pub fn next_interval_with(cur: i64, p: RetryPolicy) -> i64 {
+    if cur <= 0 {
+        return p.initial;
+    }
+    (cur * 2).min(p.max)
+}
+
+/// 用默认策略退避（10s 起、300s 封顶）
+pub fn next_interval(cur: i64) -> i64 {
+    next_interval_with(cur, RetryPolicy::default())
 }
 
 #[cfg(test)]
@@ -487,6 +561,49 @@ mod tests {
         assert_eq!(next_interval(10), 20);
         assert_eq!(next_interval(200), 300);
         assert_eq!(next_interval(300), 300);
+    }
+
+    #[test]
+    fn 退避策略可配且默认值不变() {
+        // 不配置的人行为必须跟 0.2 完全一致
+        let d = RetryPolicy::default();
+        assert_eq!((d.initial, d.max), (10, 300));
+
+        // 秒杀那种想快速重试的
+        let fast = RetryPolicy { initial: 1, max: 5 };
+        assert_eq!(next_interval_with(0, fast), 1);
+        assert_eq!(next_interval_with(1, fast), 2);
+        assert_eq!(next_interval_with(4, fast), 5, "封顶");
+        assert_eq!(next_interval_with(5, fast), 5);
+    }
+
+    #[test]
+    fn 上限小于初始值时不让退避反向增长() {
+        // 配置写反了（max < initial）不能导致「重试间隔越来越短」
+        let p = RetryPolicy {
+            initial: 60,
+            max: 10,
+        };
+        let fixed = RetryPolicy {
+            initial: p.initial,
+            max: p.max.max(p.initial),
+        };
+        assert_eq!(next_interval_with(0, fixed), 60);
+        assert_eq!(next_interval_with(60, fixed), 60, "不该缩到 10");
+    }
+
+    #[test]
+    fn 步骤的payload默认为空且能带数据() {
+        let a = SagaStep::new("http://a", "http://c");
+        assert_eq!(a.payload, "");
+        let b = SagaStep::with_payload("http://a", "http://c", r#"{"amount":100}"#);
+        assert_eq!(b.payload, r#"{"amount":100}"#);
+
+        // **老数据必须还能解**：0.2 落库的 payload 里没有 payload 字段
+        let old: SagaStep =
+            serde_json::from_str(r#"{"action":"http://a","compensate":"http://c"}"#)
+                .expect("老格式必须能解，否则升级后存量事务全推不动");
+        assert_eq!(old.payload, "");
     }
 }
 

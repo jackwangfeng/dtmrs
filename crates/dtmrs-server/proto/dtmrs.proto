@@ -40,6 +40,8 @@ message NewGidReply {
 message SagaStep {
   string action = 1;
   string compensate = 2;
+  // 这一步自己的业务数据（发给分支的请求体）。留空则发 {}
+  string payload = 3;
 }
 
 message SubmitRequest {

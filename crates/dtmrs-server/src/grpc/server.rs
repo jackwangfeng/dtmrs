@@ -98,6 +98,7 @@ impl pb::tc_server::Tc for TcService {
             .map(|s| SagaStep {
                 action: s.action,
                 compensate: s.compensate,
+                payload: s.payload,
             })
             .collect();
         self.api.submit(&r.gid, tt, &steps).await?;

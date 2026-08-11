@@ -20,6 +20,10 @@ pub struct Driver {
     pub owner: String,
     /// 租约时长（秒）。持租约的实例崩了，这么久之后别的实例接手
     pub lease: i64,
+    /// 重试退避策略。默认 10s 起、300s 封顶，可用环境变量改
+    pub retry: dtmrs_core::RetryPolicy,
+    /// 分支调用超时（秒），只为可观测性保留一份
+    branch_timeout_secs: u64,
     /// 进程内分支注册表。嵌入式模式用，纯 HTTP 部署时是空表
     pub registry: Arc<Registry>,
     /// gRPC 分支调用器（带 channel 缓存）
@@ -30,20 +34,49 @@ pub struct Driver {
 }
 
 impl Driver {
+    /// 默认配置的推进器。分支超时 10s、租约 30s、退避 10s→300s。
+    /// 想按环境变量配就用 [`Driver::from_env`]
     pub fn new(store: Store, owner: String) -> Self {
+        Self::with_config(store, owner, DriverConfig::default())
+    }
+
+    /// 按环境变量配置：
+    ///
+    /// | 变量 | 默认 | 说明 |
+    /// |---|---|---|
+    /// | `DTMRS_BRANCH_TIMEOUT` | 10 | 调一个分支最多等几秒 |
+    /// | `DTMRS_LEASE` | 30 | 租约时长（秒） |
+    /// | `DTMRS_RETRY_INTERVAL` | 10 | 首次重试间隔（秒） |
+    /// | `DTMRS_RETRY_MAX_INTERVAL` | 300 | 退避上限（秒） |
+    ///
+    /// **非法值一律退回默认**，绝不因为配置写错就让推进器起不来
+    pub fn from_env(store: Store, owner: String) -> Self {
+        Self::with_config(store, owner, DriverConfig::from_env())
+    }
+
+    pub fn with_config(store: Store, owner: String, cfg: DriverConfig) -> Self {
         Self {
             store,
             http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(cfg.branch_timeout_secs.max(1) as u64))
                 .build()
                 .expect("build http client"),
             owner,
-            lease: 30,
+            lease: cfg.lease_secs,
+            retry: cfg.retry,
+            branch_timeout_secs: cfg.branch_timeout_secs.max(1) as u64,
             registry: Arc::new(Registry::new()),
             #[cfg(feature = "grpc")]
-            grpc: crate::grpc::client::GrpcCaller::new(Duration::from_secs(10)),
+            grpc: crate::grpc::client::GrpcCaller::new(Duration::from_secs(
+                cfg.branch_timeout_secs.max(1) as u64,
+            )),
             workflows: Arc::new(crate::workflow::WorkflowRegistry::new()),
         }
+    }
+
+    /// 当前的分支调用超时（秒），启动日志里打出来方便确认配置生效
+    pub fn http_timeout_secs(&self) -> u64 {
+        self.branch_timeout_secs
     }
 
     /// 挂上进程内分支注册表 —— 嵌入式模式的入口
@@ -170,7 +203,8 @@ impl Driver {
                         self.retry_later(g).await?;
                         return Ok(());
                     };
-                    match self.call_branch(g, &bid, op, &url).await {
+                    let bp = payload_of(&rows, &bid, op);
+                    match self.call_branch(g, &bid, op, &url, &bp).await {
                         BranchResult::Success => {
                             self.store
                                 .set_branch_status(&g.gid, &bid, op, BranchStatus::Succeed)
@@ -229,7 +263,10 @@ impl Driver {
                         BranchOp::Action => &steps[index].action,
                         _ => &steps[index].compensate,
                     };
-                    match self.call_branch(g, &branch_id, op, url).await {
+                    match self
+                        .call_branch(g, &branch_id, op, url, &steps[index].payload)
+                        .await
+                    {
                         BranchResult::Success => {
                             self.store
                                 .set_branch_status(&g.gid, &branch_id, op, BranchStatus::Succeed)
@@ -350,7 +387,8 @@ impl Driver {
                         self.retry_later(g).await?;
                         return Ok(());
                     };
-                    match self.call_branch(g, &bid, op, &url).await {
+                    let bp = payload_of(&rows, &bid, op);
+                    match self.call_branch(g, &bid, op, &url, &bp).await {
                         BranchResult::Success => {
                             self.store
                                 .set_branch_status(&g.gid, &bid, op, BranchStatus::Succeed)
@@ -397,7 +435,7 @@ impl Driver {
             }
             // 借用分支调用的通道做回查，branch_id 用 "00" 跟真实分支区分开
             match self
-                .call_branch(g, "00", BranchOp::Action, &g.query_prepared)
+                .call_branch(g, "00", BranchOp::Action, &g.query_prepared, "")
                 .await
             {
                 BranchResult::Success => {
@@ -452,7 +490,10 @@ impl Driver {
                 }
                 Advance::Call { index, op } => {
                     let bid = branch_id(index);
-                    match self.call_branch(g, &bid, op, &steps[index].action).await {
+                    match self
+                        .call_branch(g, &bid, op, &steps[index].action, &steps[index].payload)
+                        .await
+                    {
                         BranchResult::Success => {
                             self.store
                                 .set_branch_status(&g.gid, &bid, op, BranchStatus::Succeed)
@@ -470,7 +511,7 @@ impl Driver {
     }
 
     async fn retry_later(&self, g: &GlobalRow) -> anyhow::Result<()> {
-        let iv = dtmrs_core::next_interval(g.next_cron_interval);
+        let iv = dtmrs_core::next_interval_with(g.next_cron_interval, self.retry);
         self.store.schedule_retry(&g.gid, iv).await?;
         Ok(())
     }
@@ -509,10 +550,11 @@ impl Driver {
         branch_id: &str,
         op: BranchOp,
         url: &str,
+        payload: &str,
     ) -> BranchResult {
         match parse_target(url) {
             Target::Local(name) => self.call_local(g, branch_id, op, &name).await,
-            Target::Http(u) => self.call_http(g, branch_id, op, &u).await,
+            Target::Http(u) => self.call_http(g, branch_id, op, &u, payload).await,
             #[cfg(feature = "grpc")]
             Target::Grpc(t) => {
                 self.grpc
@@ -570,6 +612,7 @@ impl Driver {
         branch_id: &str,
         op: BranchOp,
         url: &str,
+        payload: &str,
     ) -> BranchResult {
         let req = self
             .http
@@ -581,7 +624,7 @@ impl Driver {
                 ("op", op.as_str()),
             ])
             .header("content-type", "application/json")
-            .body(branch_payload(&g.payload));
+            .body(branch_payload(payload));
         match req.send().await {
             Ok(resp) => {
                 let code = resp.status().as_u16();
@@ -661,16 +704,70 @@ fn compensate_states(rows: &[dtmrs_store::BranchRow]) -> Vec<BranchStatus> {
     v
 }
 
+/// 取某个分支行上存的 payload（TCC / XA / workflow 的分支是动态登记的，
+/// 业务数据跟着行走，不在全局 payload 里）
+fn payload_of(rows: &[dtmrs_store::BranchRow], branch_id: &str, op: BranchOp) -> String {
+    rows.iter()
+        .find(|r| r.branch_id == branch_id && r.op == op)
+        .map(|r| r.payload.clone())
+        .unwrap_or_default()
+}
+
 fn url_of(rows: &[dtmrs_store::BranchRow], branch_id: &str, op: BranchOp) -> Option<String> {
     rows.iter()
         .find(|r| r.branch_id == branch_id && r.op == op)
         .map(|r| r.url.clone())
 }
 
-/// MVP 阶段各分支共用同一份请求体。真实场景应该每步独立 payload，
-/// 那是第二版的事（见 DESIGN.md 范围表）。
-fn branch_payload(_global_payload: &str) -> String {
-    "{}".to_string()
+/// 这一步要发给分支的请求体。
+///
+/// 每步各自独立 —— 扣款那步要金额、发货那步要地址，本来就不该收到同一份数据。
+/// 步骤没写 payload 就发 `{}`（很多分支只靠 gid/branch_id/op 做幂等，不需要请求体）。
+fn branch_payload(step_payload: &str) -> String {
+    if step_payload.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        step_payload.to_string()
+    }
+}
+
+/// 推进器的可配置项
+#[derive(Debug, Clone, Copy)]
+pub struct DriverConfig {
+    /// 调一个分支最多等几秒
+    pub branch_timeout_secs: i64,
+    /// 租约时长（秒）
+    pub lease_secs: i64,
+    pub retry: dtmrs_core::RetryPolicy,
+}
+
+impl Default for DriverConfig {
+    fn default() -> Self {
+        // 跟 0.2 的写死值一致，不配置的人行为不变
+        Self {
+            branch_timeout_secs: 10,
+            lease_secs: 30,
+            retry: dtmrs_core::RetryPolicy::default(),
+        }
+    }
+}
+
+impl DriverConfig {
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let get = |k: &str, fallback: i64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(fallback)
+        };
+        Self {
+            branch_timeout_secs: get("DTMRS_BRANCH_TIMEOUT", d.branch_timeout_secs),
+            lease_secs: get("DTMRS_LEASE", d.lease_secs),
+            retry: dtmrs_core::RetryPolicy::from_env(),
+        }
+    }
 }
 
 #[cfg(test)]

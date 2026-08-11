@@ -48,7 +48,9 @@ pub fn saga_rows(gid: &str, steps: &[SagaStep]) -> (GlobalRow, Vec<BranchRow>) {
                 branch_id: bid.clone(),
                 op,
                 url: url.clone(),
-                payload: String::new(),
+                // 每步自己的业务数据。正向和补偿共用同一份 ——
+                // 补偿需要知道当初做了什么才能撤销
+                payload: s.payload.clone(),
                 status: BranchStatus::Prepared,
             });
         }
@@ -72,6 +74,7 @@ pub fn msg_rows(
         .map(|a| SagaStep {
             action: a.clone(),
             compensate: String::new(),
+            payload: String::new(),
         })
         .collect();
     let payload = serde_json::to_string(&steps).unwrap_or_else(|_| "[]".into());

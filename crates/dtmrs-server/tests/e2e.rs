@@ -91,14 +91,8 @@ async fn spawn_busi(busi: Arc<Busi>, a2_mode: &'static str) -> String {
 
 fn steps(base: &str) -> Vec<SagaStep> {
     vec![
-        SagaStep {
-            action: format!("{base}/a1"),
-            compensate: format!("{base}/c1"),
-        },
-        SagaStep {
-            action: format!("{base}/a2"),
-            compensate: format!("{base}/c2"),
-        },
+        SagaStep::new(&format!("{base}/a1"), &format!("{base}/c1")),
+        SagaStep::new(&format!("{base}/a2"), &format!("{base}/c2")),
     ]
 }
 
@@ -241,4 +235,108 @@ async fn 主动中止会触发补偿() {
     assert_eq!((a1, a2), (0, 0), "还没跑正向就中止了");
     // 正向没跑过也要发补偿：可能正在飞行中。空转由屏障负责
     assert_eq!((c1, c2), (1, 1));
+}
+
+/// 记录「哪个路径收到了什么请求体」。抽成别名是 clippy 要求的
+type SeenBodies = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+/// 只记请求体
+type SeenOne = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// 每步的 payload 必须**各自独立**地送到对应分支。
+///
+/// 这条以前是坏的：`branch_payload()` 硬编码返回 `{}`，所有分支收到的请求体
+/// 一模一样，真实业务（扣款要金额、发货要地址）根本用不了。
+#[tokio::test]
+async fn 每步的payload各自独立送达() {
+    // 记录每个路径收到的请求体
+    let seen: SeenBodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let s = seen.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use axum::extract::State;
+        use axum::routing::post;
+        let app = axum::Router::new()
+            .route(
+                "/a1",
+                post(|State(s): State<SeenBodies>, body: String| async move {
+                    s.lock().unwrap().push(("a1".into(), body));
+                    "ok"
+                }),
+            )
+            .route(
+                "/a2",
+                post(|State(s): State<SeenBodies>, body: String| async move {
+                    s.lock().unwrap().push(("a2".into(), body));
+                    "ok"
+                }),
+            )
+            .with_state(s);
+        axum::serve(listener, app).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let store = Store::open("sqlite::memory:").await.unwrap();
+    let d = Driver::new(store.clone(), "tc-1".into());
+    let steps = vec![
+        SagaStep::with_payload(
+            &format!("http://{addr}/a1"),
+            &format!("http://{addr}/a1"),
+            r#"{"amount":100}"#,
+        ),
+        SagaStep::with_payload(
+            &format!("http://{addr}/a2"),
+            &format!("http://{addr}/a2"),
+            r#"{"address":"北京"}"#,
+        ),
+    ];
+    let (g, br) = saga_rows("payload-1", &steps);
+    store.create_global(&g, &br).await.unwrap();
+    d.process(&g).await.unwrap();
+
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got.len(), 2, "两步各调一次");
+    assert_eq!(got[0], ("a1".to_string(), r#"{"amount":100}"#.to_string()));
+    assert_eq!(
+        got[1],
+        ("a2".to_string(), r#"{"address":"北京"}"#.to_string()),
+        "第二步必须收到自己的 payload，不能是第一步的、也不能是 {{}}"
+    );
+}
+
+/// 没写 payload 的步骤仍然发 `{}` —— 保持跟 0.2 一致，不破坏现有分支
+#[tokio::test]
+async fn 没写payload的步骤发空对象() {
+    let seen: SeenOne = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let s = seen.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use axum::extract::State;
+        use axum::routing::post;
+        let app = axum::Router::new()
+            .route(
+                "/a",
+                post(|State(s): State<SeenOne>, body: String| async move {
+                    s.lock().unwrap().push(body);
+                    "ok"
+                }),
+            )
+            .with_state(s);
+        axum::serve(listener, app).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let store = Store::open("sqlite::memory:").await.unwrap();
+    let d = Driver::new(store.clone(), "tc-1".into());
+    let steps = vec![SagaStep::new(
+        &format!("http://{addr}/a"),
+        &format!("http://{addr}/a"),
+    )];
+    let (g, br) = saga_rows("payload-empty", &steps);
+    store.create_global(&g, &br).await.unwrap();
+    d.process(&g).await.unwrap();
+
+    assert_eq!(seen.lock().unwrap().clone(), vec!["{}".to_string()]);
 }

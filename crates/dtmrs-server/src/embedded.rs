@@ -206,10 +206,16 @@ pub struct SagaBuilder<'a> {
 impl SagaBuilder<'_> {
     /// 加一步。两个参数都可以是 `local://名字` 或 `http://...`，可混用。
     pub fn step(mut self, action: &str, compensate: &str) -> Self {
-        self.steps.push(SagaStep {
-            action: action.to_string(),
-            compensate: compensate.to_string(),
-        });
+        self.steps.push(SagaStep::new(action, compensate));
+        self
+    }
+
+    /// 加一步，并带上**这一步自己的**业务数据（发给分支的请求体）。
+    ///
+    /// 扣款那步要金额、发货那步要地址 —— 它们本来就不该收到同一份数据。
+    pub fn step_with(mut self, action: &str, compensate: &str, payload: &str) -> Self {
+        self.steps
+            .push(SagaStep::with_payload(action, compensate, payload));
         self
     }
 
