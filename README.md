@@ -751,6 +751,55 @@ clause, nothing a template can absorb. So there is now a backend dispatch layer.
 enum rather than a trait: callers still get the same concrete `Store` type, none of the
 40-odd call sites changed, and there are no generics or `dyn` sprinkled around.
 
+## Performance: measured numbers, and their limits
+
+**What these numbers cannot do**: there is no DTM control group on the same hardware,
+same business service and same storage configuration — so they **cannot be used to claim
+"faster than DTM"**. They only show dtmrs against itself across storage backends.
+
+Reproduce: `python3 bench/bench.py --db redis --n 1000 --concurrency 50`
+
+End-to-end: submit → TC calls two branches → final state. The business branch is a local
+no-op HTTP service, so the numbers mostly reflect TC + storage overhead.
+
+| Storage | Submit | End-to-end | Branch calls |
+|---|---|---|---|
+| Redis | 1567 tx/s | **480 tx/s** | 960 /s |
+| sqlite (WAL) | 2045 tx/s | **259 tx/s** | 518 /s |
+| Postgres | 1394 tx/s | **67 tx/s** | 135 /s |
+
+1000 two-step SAGAs, submit concurrency 50, driver tick 5 ms.
+Machine: 12th Gen Intel(R) Core(TM) i7-12700, 20 cores, Linux; databases in local docker.
+
+**Redis is ~7× faster than Postgres end-to-end**, which is the measured basis for the
+"Redis is for flash-sale spikes" claim. See the trade-offs above.
+
+### An honest bottleneck
+
+Submit throughput and end-to-end throughput differ by an order of magnitude (Redis:
+1567 vs 480). The reason is that **the driver is currently serial**: `lock_one_due` claims
+one transaction, drives it, then claims the next. Submission is concurrent; driving is not.
+
+So end-to-end throughput is roughly bounded by 1 / (time to drive one transaction), and
+extra cores go unused. Running several TC instances scales it linearly (leases prevent
+double-driving, with tests to prove it), but in-process parallel driving is **not
+implemented** — a known gap, not a solved problem.
+
+### A real bug the benchmark caught
+
+sqlite had no WAL, so it used the default rollback journal with `synchronous=FULL` —
+**one fsync per transaction**:
+
+| Concurrency | Before WAL | After |
+|---|---|---|
+| 1 | 13 tx/s | **541** |
+| 10 | 55 | **944** |
+| 20 | **broke** (`database is locked` → request timeouts) | **1162** |
+
+A 40× difference, and outright unusable at concurrency 20. This is the kind of thing that
+only benchmarking finds.
+
+
 ## Installing
 
 ```bash

@@ -132,16 +132,24 @@ async fn main() -> anyhow::Result<()> {
     let owner =
         std::env::var("DTMRS_OWNER").unwrap_or_else(|_| format!("tc-{}", std::process::id()));
 
+    // 推进器空闲时的轮询间隔。**直接决定单笔事务的调度延迟下限** ——
+    // 有积压时不受影响（driver 找到活会立刻接着推，不睡）
+    let tick_ms: u64 = std::env::var("DTMRS_TICK_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1000);
+
     let store = Store::open(&db).await?;
     // 按环境变量配超时/租约/退避，非法值退回默认
     let driver = Driver::from_env(store.clone(), owner.clone());
     info!(db = %db, http = %addr, grpc = %grpc_addr, owner = %owner,
           branch_timeout = driver.http_timeout_secs(), lease = driver.lease,
-          retry_initial = driver.retry.initial, retry_max = driver.retry.max,
+          retry_initial = driver.retry.initial, retry_max = driver.retry.max, tick_ms,
           "dtmrs 启动");
 
     // 常驻推进器。崩溃恢复就靠它：重启后未终结的事务会被重新捞起
-    tokio::spawn(driver.clone().run_forever(Duration::from_secs(1)));
+    tokio::spawn(driver.clone().run_forever(Duration::from_millis(tick_ms)));
 
     let api = Api::new(store);
 

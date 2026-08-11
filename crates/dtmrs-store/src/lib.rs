@@ -103,8 +103,36 @@ impl SqlStore {
         // 内存库必须单连接，否则每条连接看到的是各自独立的库
         let max = if url.contains(":memory:") { 1 } else { 8 };
         let be = Backend::from_url(&url);
+        let is_file_sqlite = be == Backend::Sqlite && !url.contains(":memory:");
         let pool = AnyPoolOptions::new()
             .max_connections(max)
+            .after_connect(move |conn, _| {
+                Box::pin(async move {
+                    if is_file_sqlite {
+                        // ⚠ **别去掉这两条。**
+                        //
+                        // sqlite 默认是 rollback journal + synchronous=FULL，
+                        // 每笔事务一次 fsync，而且写事务会锁住整个库 ——
+                        // 实测提交吞吐只有约 13 笔/秒，并发 20 就大量
+                        // `database is locked` 并把请求拖到超时。
+                        //
+                        // WAL 让读写不互斥、synchronous=NORMAL 把每事务 fsync
+                        // 降成 checkpoint 时才 fsync。代价是**断电可能丢最后
+                        // 几笔已提交事务**（进程崩溃不丢，WAL 还在）——
+                        // sqlite 后端本来就只建议单机/开发用，这个取舍是划算的。
+                        // 要严格持久性就用 Postgres。
+                        for pragma in [
+                            "PRAGMA journal_mode=WAL",
+                            "PRAGMA synchronous=NORMAL",
+                            // 拿不到锁时先自旋 5 秒再报错，别让偶发争用直接失败
+                            "PRAGMA busy_timeout=5000",
+                        ] {
+                            sqlx::query(pragma).execute(&mut *conn).await?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
             .connect(&url)
             .await?;
         let s = Self { pool, be };
