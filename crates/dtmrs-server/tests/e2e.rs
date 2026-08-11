@@ -3,7 +3,7 @@
 //!
 //! 每个断言都盯着一个具体的失效模式，不是"跑通了就行"。
 
-use dtmrs_core::{GlobalStatus, SagaStep};
+use dtmrs_core::{GlobalStatus, SagaStep, TransType};
 use dtmrs_server::api::Api;
 use dtmrs_server::driver::Driver;
 use dtmrs_server::saga_rows;
@@ -223,7 +223,12 @@ async fn 主动中止会触发补偿() {
     store.create_global(&g, &br).await.unwrap();
     // 调用方改主意了
     store
-        .set_global_status("aborted", GlobalStatus::Aborting, "调用方主动中止")
+        .set_global_status(
+            "aborted",
+            GlobalStatus::Aborting,
+            TransType::Saga,
+            "调用方主动中止",
+        )
         .await
         .unwrap();
 
@@ -374,7 +379,7 @@ async fn 立刻重试把事务排到队首() {
 
     // 终态不能重试 —— 那会让已完结的事务重新变成活跃事务
     store
-        .set_global_status("retry-1", GlobalStatus::Succeed, "")
+        .set_global_status("retry-1", GlobalStatus::Succeed, TransType::Saga, "")
         .await
         .unwrap();
     assert!(

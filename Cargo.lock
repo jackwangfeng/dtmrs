@@ -354,6 +354,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtmrs-bench"
+version = "0.3.0"
+dependencies = [
+ "axum",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "dtmrs-core"
 version = "0.3.0"
 dependencies = [

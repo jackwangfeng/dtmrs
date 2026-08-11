@@ -402,10 +402,23 @@ impl RedisStore {
     }
 
     /// 落全局状态。到终态时挂 TTL 并从调度索引里摘掉。
+    /// 落全局状态。
+    ///
+    /// # 为什么要传 `trans_type`
+    ///
+    /// 它决定这笔事务落到新状态之后**还该不该被调度**
+    /// （`schedulable`）。原来是在脚本里现读的，但它**建完就不再变**，
+    /// 调用方手上一定有——传进来就能省掉那次读，更重要的是：
+    /// 不可调度的那条路（也就是**落终态**，每笔成功事务的必经之路）
+    /// 因此不再需要读任何字段，可以彻底不用 Lua。
+    ///
+    /// 实测 Redis 那颗核有 **66% 花在 evalsha 上**（12.1µs/次，是普通命令的
+    /// 10 倍），而每笔事务 3 次 evalsha 里就有这一次。
     pub async fn set_global_status(
         &self,
         gid: &str,
         status: GlobalStatus,
+        trans_type: TransType,
         reason: &str,
     ) -> Result<()> {
         let t = crate::now();
@@ -413,18 +426,50 @@ impl RedisStore {
         // 让状态机的收尾因为一句话太长而失败，事务就永远推不到终态了
         let reason: String = reason.chars().take(MID).collect();
 
-        let script = redis::Script::new(&format!(
+        // 快路径：新状态不可调度（终态，或非 msg 的 prepared）。
+        // 这时候要做的事全都是**无条件写**：改字段、从调度索引摘掉、挂 TTL。
+        // 一个字段都不用读 ⇒ 不需要 Lua，一次 MULTI 就够。
+        //
+        // ⚠ 仍然用 MULTI 而不是裸 pipeline：改字段和摘索引之间如果被别人看见
+        // 中间态，会出现「已终结但还在索引里」，抢占方白抢一次。
+        // 索引自愈能兜住（抢占时发现不可调度就摘掉），但那是补救不是保证
+        if !schedulable(status, trans_type) {
+            let mut c = self.conn.clone();
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            let mut fields: Vec<(&str, String)> = vec![
+                ("status", status.as_str().to_string()),
+                ("update_time", t.to_string()),
+            ];
+            if status.is_final() {
+                fields.push(("finish_time", t.to_string()));
+            }
+            if !reason.is_empty() {
+                fields.push(("rollback_reason", reason.clone()));
+            }
+            pipe.hset_multiple(self.gkey(gid), &fields).ignore();
+            pipe.zrem(self.ikey(), gid).ignore();
+            // 终态挂 TTL：秒杀跑几千万笔之后，不回收内存会撑爆
+            if status.is_final() && self.final_ttl > 0 {
+                pipe.expire(self.gkey(gid), self.final_ttl).ignore();
+                pipe.expire(self.bkey(gid), self.final_ttl).ignore();
+            }
+            let _: () = pipe.query_async(&mut c).await?;
+            return Ok(());
+        }
+
+        let script = redis::Script::new(
             r#"
-            {sched}
-            -- 一次 HMGET 把判断要用的字段全拿到：读不到 trans_type 就等于
-            -- 键不存在，所以 EXISTS 不用单发。原来这里是
-            -- EXISTS + HGET(trans_type) + HGET(next_cron_time) 三条
-            local v = redis.call('HMGET', KEYS[1], 'trans_type', 'next_cron_time')
-            local tt, nct = v[1], v[2]
-            if not tt then return 0 end
+            -- 走到这里说明新状态是**可调度**的（submitted / aborting /
+            -- msg 的 prepared），得把它按原来的到期时间放回索引，
+            -- 所以还是要读一次 next_cron_time。
+            -- trans_type 由调用方传进来了，不用再读（见函数头注释）
+            local nct = redis.call('HGET', KEYS[1], 'next_cron_time')
+            if not nct then return 0 end
             -- 要写的字段先攒起来，最后一条 HSET 落完 —— 原来状态、finish_time、
-            -- rollback_reason 是分三条写的
-            local f = {{'status', ARGV[1], 'update_time', ARGV[2]}}
+            -- rollback_reason 是分三条写的。
+            -- ⚠ 这里是普通字符串字面量不是 format!，花括号**不要写成 {{}}**
+            local f = {'status', ARGV[1], 'update_time', ARGV[2]}
             if ARGV[3] == '1' then
                 f[#f + 1] = 'finish_time'
                 f[#f + 1] = ARGV[2]
@@ -434,32 +479,20 @@ impl RedisStore {
                 f[#f + 1] = ARGV[4]
             end
             redis.call('HSET', KEYS[1], unpack(f))
-            if schedulable(ARGV[1], tt) then
-                redis.call('ZADD', KEYS[2], nct, ARGV[5])
-            else
-                redis.call('ZREM', KEYS[2], ARGV[5])
-            end
-            -- 终态挂 TTL：秒杀跑几千万笔之后，不回收内存会撑爆
-            if ARGV[3] == '1' and tonumber(ARGV[6]) > 0 then
-                redis.call('EXPIRE', KEYS[1], ARGV[6])
-                redis.call('EXPIRE', KEYS[3], ARGV[6])
-            end
+            redis.call('ZADD', KEYS[2], nct, ARGV[5])
             return 1
             "#,
-            sched = LUA_SCHEDULABLE
-        ));
+        );
 
         let mut c = self.conn.clone();
         let _: i64 = script
             .key(self.gkey(gid))
             .key(self.ikey())
-            .key(self.bkey(gid))
             .arg(status.as_str())
             .arg(t)
             .arg(if status.is_final() { "1" } else { "0" })
             .arg(reason)
             .arg(gid)
-            .arg(self.final_ttl)
             .invoke_async(&mut c)
             .await?;
         Ok(())

@@ -4,7 +4,7 @@
 //! - TCC：**confirm 失败绝不能触发 cancel**（try 已成功、方向已定）
 //! - msg：**进程崩在 prepare 和 submit 之间，靠回查决断**（取代 MQ 事务消息）
 
-use dtmrs_core::{BranchOp, GlobalStatus};
+use dtmrs_core::{BranchOp, GlobalStatus, TransType};
 use dtmrs_server::driver::Driver;
 use dtmrs_server::{msg_rows, tcc_rows};
 use dtmrs_store::Store;
@@ -119,7 +119,7 @@ async fn tcc_全部try成功后confirm两个分支() {
     assert_eq!(h.confirm1.load(Ordering::SeqCst), 0);
 
     // 客户端 try 都成功了 → submit
-    s.set_global_status("tcc-1", GlobalStatus::Submitted, "")
+    s.set_global_status("tcc-1", GlobalStatus::Submitted, TransType::Tcc, "")
         .await
         .unwrap();
     let g = s.get_global("tcc-1").await.unwrap().unwrap();
@@ -145,7 +145,7 @@ async fn tcc_confirm失败只重试绝不转cancel() {
 
     s.create_global(&tcc_rows("tcc-2"), &[]).await.unwrap();
     client_try(&s, "tcc-2", &base, 2).await;
-    s.set_global_status("tcc-2", GlobalStatus::Submitted, "")
+    s.set_global_status("tcc-2", GlobalStatus::Submitted, TransType::Tcc, "")
         .await
         .unwrap();
 
@@ -181,9 +181,14 @@ async fn tcc_try失败则逆序cancel() {
     s.create_global(&tcc_rows("tcc-3"), &[]).await.unwrap();
     client_try(&s, "tcc-3", &base, 2).await;
     // 客户端发现某个 try 失败了 → abort
-    s.set_global_status("tcc-3", GlobalStatus::Aborting, "第 2 步 try 失败")
-        .await
-        .unwrap();
+    s.set_global_status(
+        "tcc-3",
+        GlobalStatus::Aborting,
+        TransType::Tcc,
+        "第 2 步 try 失败",
+    )
+    .await
+    .unwrap();
 
     let g = s.get_global("tcc-3").await.unwrap().unwrap();
     d.process(&g).await.unwrap();
@@ -204,7 +209,7 @@ async fn tcc_没登记分支的空事务直接落终态() {
     let s = store().await;
     let d = Driver::new(s.clone(), "tc".into());
     s.create_global(&tcc_rows("tcc-4"), &[]).await.unwrap();
-    s.set_global_status("tcc-4", GlobalStatus::Submitted, "")
+    s.set_global_status("tcc-4", GlobalStatus::Submitted, TransType::Tcc, "")
         .await
         .unwrap();
     let g = s.get_global("tcc-4").await.unwrap().unwrap();
@@ -233,7 +238,7 @@ async fn msg_正常提交后推进正向分支() {
     s.create_global(&g, &br).await.unwrap();
 
     // 客户端本地事务提交成功 → submit
-    s.set_global_status("msg-1", GlobalStatus::Submitted, "")
+    s.set_global_status("msg-1", GlobalStatus::Submitted, TransType::Msg, "")
         .await
         .unwrap();
     let g = s.get_global("msg-1").await.unwrap().unwrap();
@@ -417,7 +422,7 @@ async fn xa_分支不可达时只重试不改方向() {
     )
     .await
     .unwrap();
-    s.set_global_status("xa-unreach", GlobalStatus::Submitted, "")
+    s.set_global_status("xa-unreach", GlobalStatus::Submitted, TransType::Xa, "")
         .await
         .unwrap();
 

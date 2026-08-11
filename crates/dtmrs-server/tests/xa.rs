@@ -270,7 +270,7 @@ async fn xa_提交前改动不可见_提交后一起生效() {
         assert_eq!(hanging(&t, gid).await.len(), 2, "{}: 应有 2 个挂着", t.name);
 
         store
-            .set_global_status(gid, GlobalStatus::Submitted, "")
+            .set_global_status(gid, GlobalStatus::Submitted, TransType::Xa, "")
             .await
             .unwrap();
         let g = store.get_global(gid).await.unwrap().unwrap();
@@ -309,7 +309,12 @@ async fn xa_中止则全部回滚_余额不动() {
         prepare_branch(&t, &store, &base, gid, "02", 22, 100).await;
 
         store
-            .set_global_status(gid, GlobalStatus::Aborting, "某分支一阶段失败")
+            .set_global_status(
+                gid,
+                GlobalStatus::Aborting,
+                TransType::Xa,
+                "某分支一阶段失败",
+            )
             .await
             .unwrap();
         let g = store.get_global(gid).await.unwrap().unwrap();

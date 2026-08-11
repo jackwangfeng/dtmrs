@@ -343,7 +343,7 @@ impl Api {
         match self.store.get_global(gid).await {
             Ok(Some(g)) if !g.status.is_final() => {
                 self.store
-                    .set_global_status(gid, GlobalStatus::Aborting, "调用方主动中止")
+                    .set_global_status(gid, GlobalStatus::Aborting, g.trans_type, "调用方主动中止")
                     .await
                     .map_err(internal)?;
                 let _ = self.store.schedule_now(gid).await;

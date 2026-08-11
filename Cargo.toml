@@ -8,6 +8,8 @@ members = [
     "crates/dtmrs-barrier",
     "crates/dtmrs-ffi",
     "crates/dtmrs-xa",
+    # 压测工具，不发布
+    "bench/harness",
 ]
 
 [workspace.package]

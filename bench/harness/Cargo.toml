@@ -1,0 +1,15 @@
+[package]
+name = "dtmrs-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "dtmrs 的压测工具"
+# 这是内部工具，不发布
+publish = false
+
+[dependencies]
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

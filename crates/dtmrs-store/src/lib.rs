@@ -361,10 +361,15 @@ impl SqlStore {
             .collect())
     }
 
+    /// 落全局状态。
+    ///
+    /// `trans_type` 这一层用不上（UPDATE 不需要它），但 Redis 后端靠它把
+    /// 「落终态」这条热路径从 Lua 脚本降级成一次 MULTI —— 两边签名要一致
     pub async fn set_global_status(
         &self,
         gid: &str,
         status: GlobalStatus,
+        _trans_type: TransType,
         reason: &str,
     ) -> Result<()> {
         let t = now();
@@ -822,7 +827,7 @@ mod tests {
         let (_g, bes) = backends().await;
         for (name, s) in bes {
             s.create_global(&g("t3"), &[]).await.unwrap();
-            s.set_global_status("t3", GlobalStatus::Succeed, "")
+            s.set_global_status("t3", GlobalStatus::Succeed, TransType::Saga, "")
                 .await
                 .unwrap();
             assert!(s.lock_one_due("w", 60).await.unwrap().is_none(), "{name}");
@@ -864,9 +869,14 @@ mod tests {
             let mut row = g("t5");
             row.query_prepared = "http://busi/query".into();
             s.create_global(&row, &[]).await.unwrap();
-            s.set_global_status("t5", GlobalStatus::Aborting, "分支 02 返回 FAILURE")
-                .await
-                .unwrap();
+            s.set_global_status(
+                "t5",
+                GlobalStatus::Aborting,
+                TransType::Saga,
+                "分支 02 返回 FAILURE",
+            )
+            .await
+            .unwrap();
             let got = s.get_global("t5").await.unwrap().unwrap();
             assert_eq!(got.query_prepared, "http://busi/query", "{name}");
             assert_eq!(got.rollback_reason, "分支 02 返回 FAILURE", "{name}");
@@ -876,7 +886,7 @@ mod tests {
             );
 
             // 空 reason 不能把已有的原因冲掉
-            s.set_global_status("t5", GlobalStatus::Failed, "")
+            s.set_global_status("t5", GlobalStatus::Failed, TransType::Saga, "")
                 .await
                 .unwrap();
             let got = s.get_global("t5").await.unwrap().unwrap();
@@ -1082,7 +1092,7 @@ dispatch! {
     fn list_branches(&self, gid: &str) -> Vec<BranchRow>;
     /// 抢一个到期事务。多实例不重复推进就靠它的原子性
     fn lock_one_due(&self, owner: &str, lease: i64) -> Option<GlobalRow>;
-    fn set_global_status(&self, gid: &str, status: GlobalStatus, reason: &str) -> ();
+    fn set_global_status(&self, gid: &str, status: GlobalStatus, trans_type: TransType, reason: &str) -> ();
     /// 把 prepared 推成 submitted 并排进调度队列，一次调用做完。见 [`SubmitOutcome`]
     fn submit_prepared(&self, gid: &str, owner: &str, next_cron_time: i64) -> SubmitOutcome;
     fn set_branch_result(&self, gid: &str, branch_id: &str, op: BranchOp, status: BranchStatus, payload: &str) -> ();

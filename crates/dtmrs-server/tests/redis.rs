@@ -23,7 +23,7 @@
 
 #![cfg(feature = "redis")]
 
-use dtmrs_core::{BranchResult, GlobalStatus, SagaStep};
+use dtmrs_core::{BranchResult, GlobalStatus, SagaStep, TransType};
 use dtmrs_server::driver::Driver;
 use dtmrs_server::saga_rows;
 use dtmrs_store::Store;
@@ -301,7 +301,7 @@ async fn redis_终态不再被调度() {
     let steps = vec![SagaStep::new("local://x", "local://y")];
     let (g, br) = saga_rows("r-final", &steps);
     st.create_global(&g, &br).await.unwrap();
-    st.set_global_status("r-final", GlobalStatus::Succeed, "")
+    st.set_global_status("r-final", GlobalStatus::Succeed, TransType::Saga, "")
         .await
         .unwrap();
 

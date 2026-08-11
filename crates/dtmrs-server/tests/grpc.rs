@@ -7,7 +7,7 @@
 //!
 //! 每个断言都盯着一个具体的失效模式，不是「跑通了就行」。
 
-use dtmrs_core::{GlobalStatus, SagaStep};
+use dtmrs_core::{GlobalStatus, SagaStep, TransType};
 use dtmrs_server::api::Api;
 use dtmrs_server::driver::Driver;
 use dtmrs_server::grpc::busi_pb::busi_server::{Busi, BusiServer};
@@ -418,7 +418,7 @@ async fn grpc的错误映射到正确的状态码() {
     // 已终结的事务再 abort → FAILED_PRECONDITION（HTTP 那边是 200 + FAILURE 体）
     let (g, br) = saga_rows("done-1", &[]);
     st.create_global(&g, &br).await.unwrap();
-    st.set_global_status("done-1", GlobalStatus::Succeed, "")
+    st.set_global_status("done-1", GlobalStatus::Succeed, TransType::Saga, "")
         .await
         .unwrap();
     let e = cli

@@ -183,7 +183,9 @@ impl Driver {
             match dtmrs_core::workflow_advance(status, &compensates) {
                 Advance::Finish(s) => {
                     info!(gid = %g.gid, status = s.as_str(), "workflow 事务终结");
-                    self.store.set_global_status(&g.gid, s, "").await?;
+                    self.store
+                        .set_global_status(&g.gid, s, g.trans_type, "")
+                        .await?;
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
@@ -204,14 +206,19 @@ impl Driver {
                         Ok(()) => {
                             info!(gid = %g.gid, workflow = %name, "workflow 跑完");
                             self.store
-                                .set_global_status(&g.gid, GlobalStatus::Succeed, "")
+                                .set_global_status(&g.gid, GlobalStatus::Succeed, g.trans_type, "")
                                 .await?;
                             return Ok(());
                         }
                         Err(crate::workflow::WorkflowError::Rollback(reason)) => {
                             info!(gid = %g.gid, workflow = %name, %reason, "workflow 要求回滚");
                             self.store
-                                .set_global_status(&g.gid, GlobalStatus::Aborting, &reason)
+                                .set_global_status(
+                                    &g.gid,
+                                    GlobalStatus::Aborting,
+                                    g.trans_type,
+                                    &reason,
+                                )
                                 .await?;
                             status = GlobalStatus::Aborting;
                             continue;
@@ -272,7 +279,7 @@ impl Driver {
         let steps: Vec<SagaStep> = serde_json::from_str(&g.payload).unwrap_or_default();
         if steps.is_empty() {
             self.store
-                .set_global_status(&g.gid, GlobalStatus::Succeed, "")
+                .set_global_status(&g.gid, GlobalStatus::Succeed, g.trans_type, "")
                 .await?;
             return Ok(());
         }
@@ -286,12 +293,14 @@ impl Driver {
                         // 防御性分支：状态机发现有 failed 分支但全局还没转 aborting
                         status = s;
                         self.store
-                            .set_global_status(&g.gid, s, "分支已判失败")
+                            .set_global_status(&g.gid, s, g.trans_type, "分支已判失败")
                             .await?;
                         continue;
                     }
                     info!(gid = %g.gid, status = s.as_str(), "事务终结");
-                    self.store.set_global_status(&g.gid, s, "").await?;
+                    self.store
+                        .set_global_status(&g.gid, s, g.trans_type, "")
+                        .await?;
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
@@ -328,6 +337,7 @@ impl Driver {
                                     .set_global_status(
                                         &g.gid,
                                         GlobalStatus::Aborting,
+                                        g.trans_type,
                                         &format!("分支 {branch_id} 返回 FAILURE"),
                                     )
                                     .await?;
@@ -397,7 +407,9 @@ impl Driver {
             } else {
                 GlobalStatus::Succeed
             };
-            self.store.set_global_status(&g.gid, s, "").await?;
+            self.store
+                .set_global_status(&g.gid, s, g.trans_type, "")
+                .await?;
             return Ok(());
         }
 
@@ -413,7 +425,9 @@ impl Driver {
             match adv {
                 Advance::Finish(s) => {
                     info!(gid = %g.gid, status = s.as_str(), mode = label, "事务终结");
-                    self.store.set_global_status(&g.gid, s, "").await?;
+                    self.store
+                        .set_global_status(&g.gid, s, g.trans_type, "")
+                        .await?;
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
@@ -485,7 +499,7 @@ impl Driver {
                 BranchResult::Success => {
                     info!(gid = %g.gid, "回查：本地事务已提交 → 继续推进");
                     self.store
-                        .set_global_status(&g.gid, GlobalStatus::Submitted, "")
+                        .set_global_status(&g.gid, GlobalStatus::Submitted, g.trans_type, "")
                         .await?;
                     status = GlobalStatus::Submitted;
                 }
@@ -497,6 +511,7 @@ impl Driver {
                         .set_global_status(
                             &g.gid,
                             GlobalStatus::Failed,
+                            g.trans_type,
                             "回查得到 FAILURE：本地事务未提交",
                         )
                         .await?;
@@ -513,7 +528,7 @@ impl Driver {
         let steps: Vec<SagaStep> = serde_json::from_str(&g.payload).unwrap_or_default();
         if steps.is_empty() {
             self.store
-                .set_global_status(&g.gid, GlobalStatus::Succeed, "")
+                .set_global_status(&g.gid, GlobalStatus::Succeed, g.trans_type, "")
                 .await?;
             return Ok(());
         }
@@ -522,7 +537,9 @@ impl Driver {
             match msg_advance(status, &actions) {
                 Advance::Finish(s) => {
                     info!(gid = %g.gid, status = s.as_str(), "消息事务终结");
-                    self.store.set_global_status(&g.gid, s, "").await?;
+                    self.store
+                        .set_global_status(&g.gid, s, g.trans_type, "")
+                        .await?;
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
