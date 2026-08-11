@@ -70,8 +70,17 @@ token 可以限定权限、随时吊销，比存登录态安全。
 npm login --auth-type=legacy --registry https://registry.npmjs.org/
 ```
 
-**③ web 流程但手动开链接** —— `npm login --registry https://registry.npmjs.org/`
-会打印一个 URL，复制到你本机浏览器打开完成授权，CLI 那边会轮询到。
+**③ web 流程但手动开链接** —— 必须加 `--browser false`：
+
+```bash
+npm login --registry https://registry.npmjs.org/ --browser false
+```
+
+它会打印一个 URL，复制到你本机浏览器打开完成授权，CLI 这边轮询到就登录成功。
+
+> ⚠ **不加 `--browser false` 会失败**。npm 打印完 URL 会去调 `xdg-open`，
+> 服务器上没装任何浏览器 → `xdg-open: no method available` → npm 以 code 3 退出，
+> **轮询也跟着停了**，这时候你再去开那个链接也没用。
 
 > ⚠ **如果你的 npm registry 指向淘宝等镜像**（`npm config get registry` 看一下），
 > 那是**只读镜像，发布会失败**。认证和发布都必须对着 `registry.npmjs.org`。
