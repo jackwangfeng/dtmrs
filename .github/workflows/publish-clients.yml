@@ -156,6 +156,16 @@ jobs:
         env:
           PASS: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
         run: |
+          # ⚠ 先确认私钥真的导进来了。少了这步的话，「密钥没导入」会伪装成
+          # 「密码不对」—— 因为 gpg 找不到密钥时的报错也被 sign() 吞掉了
+          echo "--- CI 里的私钥（指纹是公开信息，可以打印）---"
+          gpg --list-secret-keys --keyid-format=long || true
+          if ! gpg --list-secret-keys --with-colons | grep -q '^sec'; then
+            echo "❌ CI 里一把私钥都没有 —— MAVEN_GPG_PRIVATE_KEY 的内容有问题。"
+            echo "   要的是 gpg --export-secret-keys --armor <KEYID> 的**完整输出**，"
+            echo "   含 -----BEGIN PGP PRIVATE KEY BLOCK----- 和 END 两行。"
+            exit 1
+          fi
           sign() { echo t | gpg --batch --yes --pinentry-mode loopback \
                      --passphrase "$1" --clearsign >/dev/null 2>&1; }
           if sign "$PASS"; then
