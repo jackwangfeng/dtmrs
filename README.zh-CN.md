@@ -726,32 +726,75 @@ DESIGN.md 里原本明确写着**不抽 `Store` trait**，理由是「三种库�
 配置的 DTM 对照组，所以**不能拿来说「比 DTM 快」**。这里只报 dtmrs 自己在不同
 存储上的相对表现和绝对量级。
 
-复现：`python3 bench/bench.py --db redis --n 1000 --concurrency 50`
+复现：`python3 bench/bench.py --db redis --n 3000 --concurrency 100 --workers 16`
 
 测的是**端到端**：提交 → TC 依次调两个分支 → 落终态。业务分支是本地零操作的
 HTTP 服务，所以数字基本反映 TC + 存储的开销。
 
-| 存储 | 提交吞吐 | 端到端完成 | 分支调用 |
+| 存储 | 串行推进（`workers=1`） | 默认（`workers=16`） | 调到最大 |
 |---|---|---|---|
-| Redis | 1567 笔/秒 | **480 笔/秒** | 960 次/秒 |
-| sqlite（WAL） | 2045 笔/秒 | **259 笔/秒** | 518 次/秒 |
-| Postgres | 1394 笔/秒 | **67 笔/秒** | 135 次/秒 |
+| Redis | 868 笔/秒 | **3885 笔/秒** | 4865（32 worker） |
+| sqlite（WAL） | 467 笔/秒 | **664 笔/秒** | 并行没有额外收益 |
+| Postgres | 62 笔/秒 | **777 笔/秒** | 2430（64 worker + `DTMRS_DB_POOL=64`） |
+| MySQL | 17 笔/秒 | **136 笔/秒** | 154（32 worker） |
 
-1000 笔两步 SAGA，提交并发 50，推进器 tick 5ms。
+3000 笔两步 SAGA，提交并发 100，推进器 tick 5ms，**取三次的中位数**——
+这台机器上还跑着别的东西，单次结果能差 ±20%，别把个位数当真。
 机器：12th Gen Intel(R) Core(TM) i7-12700，20 核，Linux；数据库都在本机 docker 里。
 
-**Redis 比 Postgres 快约 7 倍**，这实测支撑了「Redis 为秒杀那类尖峰而生」的说法。
-代价见上面 [Redis 的三条语义差异](#redis-的三条语义差异)。
+几点值得说明：
 
-### 一个诚实的瓶颈
+- **sqlite 从并行里拿不到额外收益**，因为它的写本来就是全库串行的。
+  它比 Postgres 快只是因为没有网络往返、也没有真正的 fsync（`synchronous=NORMAL`）。
+- **MySQL 慢是它自己的默认配置**：`innodb_flush_log_at_trx_commit=1` +
+  `sync_binlog=1`，每次提交两次 fsync，而推一笔事务要好几次提交。
+  把 `innodb_flush_log_at_trx_commit` 设成 2，同样的代码就从 123 涨到 341 笔/秒 ——
+  这是持久性取舍，不是 dtmrs 的开销。
+- **Postgres 不是 fsync 瓶颈**：关掉 `synchronous_commit` 只有 123 → 131，
+  几乎没变化。它的上限是连接池和 worker 数，两个一起调才涨。
 
-注意「提交吞吐」和「端到端完成」差了一个量级（比如 Redis 是 1567 vs 480）。
-原因是**推进器目前是串行的**：`lock_one_due` 一次抢一笔，推完再抢下一笔。
-提交侧是并发的，推进侧不是。
+### 想调快就同时调这两个
 
-所以现在的端到端吞吐上限约等于「单笔推进耗时的倒数」，多核用不满。
-多起几个 TC 实例可以线性放大（租约保证不重复推进，有测试钉着），
-但单实例内的并行推进还没做 —— 这是已知的优化空间，不是已经解决的问题。
+```bash
+DTMRS_WORKERS=64 DTMRS_DB_POOL=64 dtmrs
+```
+
+吞吐大约等于 **min(worker 数, 连接池大小)** 决定：64 个 worker 配 32 的池子
+只有 1292 笔/秒，池子也开到 64 才有 2430。只调一个会卡在另一个上。
+
+调大之前想清楚：TC 常常和业务共用一个数据库，而 Postgres 默认才 100 条连接。
+
+### 压测抓出来的三个真问题
+
+都是压测之前谁也没想到的：
+
+**① sqlite 没开 WAL —— 40 倍。** 默认的 rollback journal + `synchronous=FULL`
+是每笔事务一次 fsync：
+
+| 并发 | 开 WAL 前 | 开 WAL 后 |
+|---|---|---|
+| 1 | 13 笔/秒 | **541** |
+| 10 | 55 | **944** |
+| 20 | **崩溃**（`database is locked` → 请求超时） | **1162** |
+
+现在 sqlite 连接会自动设 `journal_mode=WAL` / `synchronous=NORMAL` /
+`busy_timeout=5000`。
+
+**② 抢占待办时的锁车队 —— Postgres 上并行度几乎为 0。**
+抢占是「SELECT 出最该跑的那笔 → UPDATE 占坑」。N 个 worker 的 SELECT
+会**全部选中同一行**，然后挤在 UPDATE 上排队，只有一个能成、其余白跑一轮。
+症状是加 worker 不涨：Postgres 1 个 worker 71 笔/秒，8 个也才 127。
+修法是 `FOR UPDATE SKIP LOCKED`（sqlite 没有行锁，那边是空串）。
+
+**③ 同一条 SQL 在 MySQL 上还要去掉 `ORDER BY`。**
+索引是 `(status, next_cron_time)`，而 WHERE 里 status 是个 IN 范围，
+所以按 `next_cron_time` 排序用不上索引 —— 执行计划里是 `Using filesort`，
+意味着 MySQL 要**把所有命中的行读出来并加锁**才能排序，然后才 `LIMIT 1`。
+结果第一个 worker 锁光全部待办，其余 worker 一笔都抢不到（6 并发只成 1 笔）。
+去掉 `ORDER BY` 走索引范围扫描，同一状态内仍然是最早到期的先跑，
+而且抢到的行会被推到队尾，不会饿死。
+
+这三条现在都有测试钉着（`并发抢占要各拿各的不能全挤在同一笔上`）。
 
 ### 顺带被压测抓出来的一个真问题
 

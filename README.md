@@ -757,38 +757,53 @@ enum rather than a trait: callers still get the same concrete `Store` type, none
 same business service and same storage configuration — so they **cannot be used to claim
 "faster than DTM"**. They only show dtmrs against itself across storage backends.
 
-Reproduce: `python3 bench/bench.py --db redis --n 1000 --concurrency 50`
+Reproduce: `python3 bench/bench.py --db redis --n 3000 --concurrency 100 --workers 16`
 
 End-to-end: submit → TC calls two branches → final state. The business branch is a local
 no-op HTTP service, so the numbers mostly reflect TC + storage overhead.
 
-| Storage | Submit | End-to-end | Branch calls |
+| Storage | Serial (`workers=1`) | Default (`workers=16`) | Tuned |
 |---|---|---|---|
-| Redis | 1567 tx/s | **480 tx/s** | 960 /s |
-| sqlite (WAL) | 2045 tx/s | **259 tx/s** | 518 /s |
-| Postgres | 1394 tx/s | **67 tx/s** | 135 /s |
+| Redis | 868 tx/s | **3885 tx/s** | 4865 (32 workers) |
+| sqlite (WAL) | 467 tx/s | **664 tx/s** | parallelism adds nothing |
+| Postgres | 62 tx/s | **777 tx/s** | 2430 (64 workers + `DTMRS_DB_POOL=64`) |
+| MySQL | 17 tx/s | **136 tx/s** | 154 (32 workers) |
 
-1000 two-step SAGAs, submit concurrency 50, driver tick 5 ms.
+3000 two-step SAGAs, submit concurrency 100, driver tick 5 ms, **median of three runs** —
+this machine runs other things too, single runs swing ±20%, so don't read the last digit.
 Machine: 12th Gen Intel(R) Core(TM) i7-12700, 20 cores, Linux; databases in local docker.
 
-**Redis is ~7× faster than Postgres end-to-end**, which is the measured basis for the
-"Redis is for flash-sale spikes" claim. See the trade-offs above.
+Worth spelling out:
 
-### An honest bottleneck
+- **sqlite gains nothing from parallelism** — its writes serialize across the whole
+  database anyway. It beats Postgres here only because there is no network round trip and
+  no real fsync (`synchronous=NORMAL`).
+- **MySQL is slow because of its own defaults**: `innodb_flush_log_at_trx_commit=1` plus
+  `sync_binlog=1` means two fsyncs per commit, and driving one transaction takes several
+  commits. Setting `innodb_flush_log_at_trx_commit=2` takes the same code from 123 to
+  341 tx/s — that is a durability trade-off, not dtmrs overhead.
+- **Postgres is not fsync-bound**: turning `synchronous_commit` off moved it from 123 to
+  131, i.e. nothing. Its ceiling is the worker count and the connection pool.
 
-Submit throughput and end-to-end throughput differ by an order of magnitude (Redis:
-1567 vs 480). The reason is that **the driver is currently serial**: `lock_one_due` claims
-one transaction, drives it, then claims the next. Submission is concurrent; driving is not.
+### To go faster, raise both knobs together
 
-So end-to-end throughput is roughly bounded by 1 / (time to drive one transaction), and
-extra cores go unused. Running several TC instances scales it linearly (leases prevent
-double-driving, with tests to prove it), but in-process parallel driving is **not
-implemented** — a known gap, not a solved problem.
+```bash
+DTMRS_WORKERS=64 DTMRS_DB_POOL=64 dtmrs
+```
 
-### A real bug the benchmark caught
+Throughput is roughly **min(workers, pool size)**: 64 workers against a pool of 32 gives
+1292 tx/s, and only raising the pool to 64 as well gets 2430. Raising one alone just moves
+the queue.
 
-sqlite had no WAL, so it used the default rollback journal with `synchronous=FULL` —
-**one fsync per transaction**:
+Think before turning it up: a TC often shares a database with the business, and Postgres
+ships with `max_connections=100`.
+
+### Three real bugs the benchmark caught
+
+None of them were visible without measuring:
+
+**① sqlite without WAL — 40×.** The default rollback journal with `synchronous=FULL` is
+one fsync per transaction:
 
 | Concurrency | Before WAL | After |
 |---|---|---|
@@ -796,8 +811,26 @@ sqlite had no WAL, so it used the default rollback journal with `synchronous=FUL
 | 10 | 55 | **944** |
 | 20 | **broke** (`database is locked` → request timeouts) | **1162** |
 
-A 40× difference, and outright unusable at concurrency 20. This is the kind of thing that
-only benchmarking finds.
+sqlite connections now set `journal_mode=WAL` / `synchronous=NORMAL` /
+`busy_timeout=5000` automatically.
+
+**② A lock convoy in the claim query — near-zero parallelism on Postgres.**
+Claiming is "SELECT the most-due transaction → UPDATE to take it". Every worker's SELECT
+picked **the same row**, so they queued on the UPDATE and only one won; the rest burned a
+round. The symptom is that adding workers does nothing: Postgres did 71 tx/s with one
+worker and 127 with eight. Fixed with `FOR UPDATE SKIP LOCKED` (empty string on sqlite,
+which has no row locks).
+
+**③ The same query also needed its `ORDER BY` removed, for MySQL.**
+The index is `(status, next_cron_time)` and the WHERE clause makes `status` a range, so
+ordering by `next_cron_time` cannot use the index — the plan says `Using filesort`, which
+means MySQL **reads and locks every matching row** to sort it before applying `LIMIT 1`.
+The first worker therefore locked every pending transaction and the others claimed nothing
+(6 concurrent claims, 1 succeeded). Without the `ORDER BY` it is an index range scan;
+within a status the earliest-due still goes first, and a claimed row gets pushed to the
+back of the queue, so nothing starves.
+
+All three are now pinned by tests (`并发抢占要各拿各的不能全挤在同一笔上`).
 
 
 ## Installing

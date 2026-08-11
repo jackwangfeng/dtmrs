@@ -101,7 +101,26 @@ impl SqlStore {
             });
         }
         // 内存库必须单连接，否则每条连接看到的是各自独立的库
-        let max = if url.contains(":memory:") { 1 } else { 8 };
+        //
+        // 非内存库默认 32：这个池子是**推进器和 HTTP/gRPC 接口共用**的，
+        // 而推进一笔事务要好几次往返。原来写死 8，比推进 worker 数还少，
+        // 于是提交请求和推进器互相抢连接。
+        //
+        // 实测（Postgres，8 个 worker）：池子 8 → 330 笔/秒，32 → 401。
+        // 真正的瓶颈是 **min(worker 数, 池子大小)** —— 64 个 worker 配 32 的
+        // 池子还是 1292 笔/秒，池子也开到 64 才上到 2430。两个一起调才有用。
+        //
+        // 后端连接数吃紧（比如和业务共用一个 Postgres，默认才 100 条）
+        // 就用 `DTMRS_DB_POOL` 调小
+        let max = if url.contains(":memory:") {
+            1
+        } else {
+            std::env::var("DTMRS_DB_POOL")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(32)
+        };
         let be = Backend::from_url(&url);
         let is_file_sqlite = be == Backend::Sqlite && !url.contains(":memory:");
         let pool = AnyPoolOptions::new()
@@ -415,11 +434,33 @@ impl SqlStore {
     pub async fn lock_one_due(&self, owner: &str, lease: i64) -> Result<Option<GlobalRow>> {
         let mut tx = self.pool.begin().await?;
         let t = now();
-        let gid: Option<String> = sqlx::query_scalar(&self.be.q("SELECT gid FROM trans_global
+        // ⚠ 两个细节都不能改，改了并行推进就退化成串行：
+        //
+        // 1. 结尾的 `FOR UPDATE SKIP LOCKED`（sqlite 上是空串）。没有它的话
+        //    每个 worker 都选中同一行，然后挤在下面那条 UPDATE 上排队，
+        //    只有一个能成。见 `Backend::skip_locked`
+        //
+        // 2. **不能加 `ORDER BY next_cron_time`。** 索引是
+        //    (status, next_cron_time)，而 WHERE 里 status 是个 IN 范围，
+        //    所以按 next_cron_time 排序用不上索引 —— MySQL 的执行计划里会
+        //    出现 `Using filesort`，意味着它要**把所有命中的行都读出来并加锁**
+        //    才能排序，然后才 LIMIT 1。于是第一个 worker 锁光全部待办，
+        //    其余 worker 全部 SKIP 掉、一笔都抢不到（实测 6 并发只成 1 笔）。
+        //
+        //    去掉 ORDER BY 后走索引范围扫描，天然就是按 (status, next_cron_time)
+        //    顺序取第一条：同一状态内仍然是**最早到期的先跑**，只是不再跨状态
+        //    全局排序。不会饿死 —— 抢到的行会把 next_cron_time 推到租约之后，
+        //    自动排到队尾。
+        //    （Redis 那边是 ZRANGEBYSCORE，严格按到期时间。可调度的**集合**
+        //    两边完全一致，只是取用顺序不同，这个差异是可以接受的。）
+        let gid: Option<String> = sqlx::query_scalar(&self.be.q(&format!(
+            "SELECT gid FROM trans_global
              WHERE (status IN ('submitted','aborting')
                     OR (status = 'prepared' AND trans_type = 'msg'))
                AND next_cron_time <= ?
-             ORDER BY next_cron_time LIMIT 1"))
+             LIMIT 1{}",
+            self.be.skip_locked()
+        )))
         .bind(t)
         .fetch_optional(&mut *tx)
         .await?;
@@ -649,6 +690,53 @@ mod tests {
             // 同一个事务不能被第二个实例同时抢到，否则会重复推进
             let b = s.lock_one_due("worker-b", 60).await.unwrap();
             assert!(b.is_none(), "{name}: 租约期内不能被别人抢走");
+        }
+    }
+
+    /// 并发抢占要抢到**不同的**事务，而不是全挤在同一笔上。
+    ///
+    /// 这条钉的是 `FOR UPDATE SKIP LOCKED`（见 `Backend::skip_locked`）。
+    /// 少了它，N 个 worker 的 SELECT 会同时选中队首那一行，然后在 UPDATE
+    /// 上排队，最后只有一个成功 —— 不会算错，但并行推进等于白做：
+    /// 实测 Postgres 上 8 个 worker 只跑出 1 个 worker 的 1.8 倍。
+    ///
+    /// sqlite 例外：它没有行锁，写本来就是全库串行的。所以那边只要求
+    /// 「不重复」（安全性），不要求「都能抢到」（并行度）。
+    #[tokio::test]
+    async fn 并发抢占要各拿各的不能全挤在同一笔上() {
+        const K: usize = 6;
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
+            for i in 0..K {
+                s.create_global(&g(&format!("par-{i}")), &[]).await.unwrap();
+            }
+
+            let mut hs = Vec::new();
+            for i in 0..K {
+                let s = s.clone();
+                hs.push(tokio::spawn(async move {
+                    s.lock_one_due(&format!("w-{i}"), 60).await.unwrap()
+                }));
+            }
+            let mut got: Vec<String> = Vec::new();
+            for h in hs {
+                if let Some(row) = h.await.unwrap() {
+                    got.push(row.gid);
+                }
+            }
+
+            // 安全性：所有后端都不能把同一笔交给两个 owner
+            let uniq: std::collections::HashSet<_> = got.iter().collect();
+            assert_eq!(uniq.len(), got.len(), "{name}: 同一笔被抢到了两次");
+
+            // 并行度：有行锁的后端应该 K 个各拿各的
+            if name != "sqlite" {
+                assert_eq!(
+                    got.len(),
+                    K,
+                    "{name}: 并发抢占退化成串行了（SKIP LOCKED 没生效？）"
+                );
+            }
         }
     }
 

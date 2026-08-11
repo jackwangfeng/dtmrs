@@ -26,3 +26,4 @@ clients/python/bin/
 clients/python/__pycache__/
 clients/*/example/out/
 clients/go/example/example
+bench/__pycache__/

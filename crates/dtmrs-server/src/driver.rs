@@ -24,6 +24,8 @@ pub struct Driver {
     pub retry: dtmrs_core::RetryPolicy,
     /// 分支调用超时（秒），只为可观测性保留一份
     branch_timeout_secs: u64,
+    /// 并行推进的 worker 数
+    pub workers: usize,
     /// 进程内分支注册表。嵌入式模式用，纯 HTTP 部署时是空表
     pub registry: Arc<Registry>,
     /// gRPC 分支调用器（带 channel 缓存）
@@ -48,6 +50,10 @@ impl Driver {
     /// | `DTMRS_LEASE` | 30 | 租约时长（秒） |
     /// | `DTMRS_RETRY_INTERVAL` | 10 | 首次重试间隔（秒） |
     /// | `DTMRS_RETRY_MAX_INTERVAL` | 300 | 退避上限（秒） |
+    /// | `DTMRS_WORKERS` | 16 | 并行推进的 worker 数 |
+    ///
+    /// 存储连接池另有 `DTMRS_DB_POOL`（默认 32），跟 worker 数**要一起调** ——
+    /// 池子小于 worker 数时，多出来的 worker 只会排队等连接
     ///
     /// **非法值一律退回默认**，绝不因为配置写错就让推进器起不来
     pub fn from_env(store: Store, owner: String) -> Self {
@@ -65,6 +71,7 @@ impl Driver {
             lease: cfg.lease_secs,
             retry: cfg.retry,
             branch_timeout_secs: cfg.branch_timeout_secs.max(1) as u64,
+            workers: cfg.workers.max(1),
             registry: Arc::new(Registry::new()),
             #[cfg(feature = "grpc")]
             grpc: crate::grpc::client::GrpcCaller::new(Duration::from_secs(
@@ -91,8 +98,45 @@ impl Driver {
         self
     }
 
-    /// 常驻循环：抢一个到期事务推一下，没活就睡
+    /// 常驻推进器。起 `workers` 个并行的抢占循环。
+    ///
+    /// # 为什么可以直接并行，不需要新的并发控制
+    ///
+    /// 每个 worker 都走 `lock_one_due` —— 那是一次**原子抢占**（SQL 靠带条件的
+    /// UPDATE，Redis 靠 Lua 脚本），抢到才推。所以进程内 N 个 worker
+    /// 跟部署 N 个实例是**完全相同的情形**，而后者的正确性已经有测试钉死了
+    /// （`两个实例并发不会重复推进` / `redis_多实例并发不重复推进`）。
+    ///
+    /// 换句话说：这里没有引入新的竞态，只是把「多实例才能用上的并行」
+    /// 在单进程内也用上。
+    ///
+    /// # 为什么不是把 process() 内部并行
+    ///
+    /// 一笔事务内部的分支**必须按序**（SAGA 就是顺序语义），并行只能跨事务。
+    ///
+    /// # ⚠ 为什么必须用 JoinSet 而不是 Vec<JoinHandle>
+    ///
+    /// 调用方是 `tokio::spawn(driver.run_forever(..))`，靠 **abort 这个外层
+    /// 任务**来停推进器（`Embedded` 的 Drop 就是这么干的）。
+    /// `tokio::spawn` 出来的子任务是**游离的**：外层被 abort 掉，它们照跑不误。
+    ///
+    /// 这个坑实测撞出来过：`跨进程重启_事务不丢且已完成的步骤不重做` 里
+    /// 第一个「进程」析构后，它那些僵尸 worker 还在抢同一笔事务，
+    /// 而它们的 handler 永远返回 Unknown —— 于是第二个「进程」怎么等都推不完。
+    ///
+    /// `JoinSet` 被 drop 时会把里面所有任务一并 abort，正好是我们要的语义。
     pub async fn run_forever(self, tick: Duration) {
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..self.workers.max(1) {
+            let d = self.clone();
+            set.spawn(async move { d.worker_loop(tick).await });
+        }
+        // 任一 worker 意外退出就整体结束 —— 静默少几个 worker 比直接挂更难查
+        set.join_next().await;
+    }
+
+    /// 单个 worker：抢一个到期事务推一下，没活就睡
+    async fn worker_loop(&self, tick: Duration) {
         loop {
             match self.store.lock_one_due(&self.owner, self.lease).await {
                 Ok(Some(g)) => {
@@ -739,6 +783,8 @@ pub struct DriverConfig {
     /// 租约时长（秒）
     pub lease_secs: i64,
     pub retry: dtmrs_core::RetryPolicy,
+    /// 并行推进的 worker 数。**一笔事务内部仍然按序**，并行只发生在事务之间
+    pub workers: usize,
 }
 
 impl Default for DriverConfig {
@@ -748,6 +794,18 @@ impl Default for DriverConfig {
             branch_timeout_secs: 10,
             lease_secs: 30,
             retry: dtmrs_core::RetryPolicy::default(),
+            // 推一笔事务的时间几乎全花在等 I/O（存储往返 + 分支调用）上，
+            // 所以 worker 数可以明显高于核数。
+            //
+            // 16 是个折中，不是最优：实测（20 核机器，bench/，三次取中位数）
+            //   Postgres  1→62 笔/秒  16→777  64→2430（池子也要开到 64）
+            //   Redis     1→868       16→3885  32→4865，再往上就是噪声了
+            //   sqlite    1→467       16→664 —— 它的写本来就是全库串行的，
+            //             并行拿不到什么收益
+            // SQL 后端一路涨到 64，但 worker 开多少就要占多少条数据库连接，
+            // 而 TC 常常和业务共用一个库。要吞吐就把 `DTMRS_WORKERS` 和
+            // `DTMRS_DB_POOL` **一起**调大（只调一个会卡在另一个上）
+            workers: 16,
         }
     }
 }
@@ -766,6 +824,7 @@ impl DriverConfig {
             branch_timeout_secs: get("DTMRS_BRANCH_TIMEOUT", d.branch_timeout_secs),
             lease_secs: get("DTMRS_LEASE", d.lease_secs),
             retry: dtmrs_core::RetryPolicy::from_env(),
+            workers: get("DTMRS_WORKERS", d.workers as i64) as usize,
         }
     }
 }

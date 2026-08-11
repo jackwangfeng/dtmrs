@@ -159,6 +159,28 @@ impl Backend {
             _ => String::new(),
         }
     }
+
+    /// 抢占待办事务时用的行锁后缀。
+    ///
+    /// # 为什么非要有这个
+    ///
+    /// 抢占是「先 SELECT 出最该跑的那笔，再 UPDATE 占坑」。不加锁的话，
+    /// N 个推进 worker 的 SELECT 会**全部选中同一行**，然后挤在 UPDATE
+    /// 上排队，最后只有一个成功、其余白跑一轮。实测 Postgres 上
+    /// 1 个 worker 71 笔/秒、8 个也才 127 笔/秒 —— 并行度基本没了。
+    ///
+    /// `FOR UPDATE SKIP LOCKED` 让每个 worker 自动跳过别人正在抢的行，
+    /// 各拿各的，这才是真并行。
+    ///
+    /// - Postgres 9.5+ / MySQL 8.0+ 都支持
+    /// - **sqlite 返回空串**：它没有行锁，写操作本来就是全库串行的，
+    ///   加了也没用（语法上还不认）
+    pub fn skip_locked(&self) -> &'static str {
+        match self {
+            Self::Sqlite => "",
+            _ => " FOR UPDATE SKIP LOCKED",
+        }
+    }
 }
 
 /// 值超过列宽

@@ -16,7 +16,7 @@ Apache-2.0。只实现 DTM 的协议，不抄它的代码。
 
 ```bash
 cargo build --release                 # 二进制在 target/release/dtmrs
-cargo test --workspace                # 139 个测试（真库那部分会被跳过，见下）
+cargo test --workspace                # 146 个测试（真库那部分会被跳过，见下）
 cargo run --example embedded -p dtmrs-server   # 嵌入式模式的可运行示例
 cargo run --example workflow -p dtmrs-server   # workflow 模式（重放/断点续跑）
 
@@ -151,6 +151,11 @@ crates/
   时间统一存 unix 秒（i64），不用数据库的 datetime 类型
 - 写库前必须用 `check_len` 挡超长值。MySQL 的 `INSERT IGNORE` 遇到超长会**静默截断**，
   gid 被截断会让两笔不相关的事务在屏障表里撞成同一行
+
+- 抢占待办的那条 SELECT（`lock_one_due`）有两条**性能正确性**约束，都有测试钉着
+  （`并发抢占要各拿各的不能全挤在同一笔上`）：必须带 `Backend::skip_locked()`，
+  且**不能加 `ORDER BY next_cron_time`**。少了前者所有 worker 抢同一行，
+  加了后者 MySQL 会 filesort、把全部待办行锁光。理由写在那个函数的注释里
 
 新增后端或改这层，先读 `crates/dtmrs-core/src/dialect.rs` 的模块头注释（有三家行为对照表）。
 
