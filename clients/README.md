@@ -19,7 +19,7 @@
 
 | 语言 | 安装 | 依赖 |
 |---|---|---|
-| Java | `io.github.jackwangfeng:dtmrs-barrier:0.2.0` | 只要 JDBC |
+| Java | `io.github.jackwangfeng:dtmrs-barrier:0.3.0` | 只要 JDBC |
 | Go | `go get github.com/jackwangfeng/dtmrs/clients/go` | 只要 `database/sql` |
 | Python | `pip install dtmrs-barrier` | 只要 DB-API 2.0 游标 |
 | Node | `npm install dtmrs-barrier` | 无（自带 TS 类型） |

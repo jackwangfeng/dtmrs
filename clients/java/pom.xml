@@ -8,7 +8,7 @@
        在 Sonatype Central 门户上通过 GitHub 验证即可拿到 -->
   <groupId>io.github.jackwangfeng</groupId>
   <artifactId>dtmrs-barrier</artifactId>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
   <packaging>jar</packaging>
 
   <name>dtmrs-barrier</name>

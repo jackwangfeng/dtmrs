@@ -1,6 +1,6 @@
 {
   "name": "dtmrs-barrier",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Sub-transaction barrier for dtmrs: idempotence, empty rollback and suspension in one table",
   "main": "barrier.js",
   "types": "barrier.d.ts",
