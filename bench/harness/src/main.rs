@@ -161,11 +161,31 @@ async fn spawn_busi(done: Arc<AtomicU64>, final_path: String) {
     });
 }
 
+/// 客户端一笔事务里要发的一个请求。
+///
+/// 分两类是因为**不是所有请求都打 TC**：XA 的一阶段和 TCC 的 try 都是
+/// 客户端直接打业务服务的，只有它们之间的登记/提交才走 TC。
+enum Call {
+    /// 打 TC：(路径, 报文)
+    Tc(&'static str, String),
+    /// 打业务服务：完整 URL
+    Busi(String),
+}
+
 /// 一笔事务客户端要按顺序发的请求。
 ///
-/// 两种模式的**客户端往返次数不一样**：saga 一次 submit 带上全部步骤；
-/// msg 是 prepare →（业务自己的本地事务）→ submit，两次。
-fn client_calls(mode: &str, gid: &str, steps: usize, target: &str) -> Vec<(&'static str, String)> {
+/// 各模式的**客户端往返次数不一样**，这是协议决定的，也是对比时最该盯的东西：
+///
+/// | 模式 | 客户端往返 | 说明 |
+/// |---|---|---|
+/// | saga | 1 | 一次 submit 带上全部步骤，TC 内联推进 |
+/// | msg  | 2 | prepare →（业务自己的本地事务）→ submit |
+/// | xa   | 2 + 每分支 1 | 中间那次打业务服务，分支自己 registerBranch + XA PREPARE |
+/// | tcc  | 2 + 每分支 2 | 每个分支要先 registerBranch（打 TC）再调 try（打业务） |
+///
+/// TCC 每个分支两次往返是**语义要求不是实现偷懒**：先登记再 try，
+/// 反过来会导致 try 成功但 TC 不知道有这个分支 —— 资源永久泄漏。
+fn client_calls(mode: &str, gid: &str, steps: usize, target: &str, rm_base: &str) -> Vec<Call> {
     let acts: Vec<String> = (1..=steps)
         .map(|i| format!("http://127.0.0.1:{BUSI_PORT}/a{i}"))
         .collect();
@@ -185,7 +205,7 @@ fn client_calls(mode: &str, gid: &str, steps: usize, target: &str) -> Vec<(&'sta
                     "compensate": format!("http://127.0.0.1:{BUSI_PORT}/c{}", i + 1)
                 }))
                 .collect::<Vec<_>>());
-            return vec![("/api/dtmsvr/submit", body.to_string())];
+            return vec![Call::Tc("/api/dtmsvr/submit", body.to_string())];
         }
         body["steps"] = serde_json::json!(acts
             .iter()
@@ -194,25 +214,57 @@ fn client_calls(mode: &str, gid: &str, steps: usize, target: &str) -> Vec<(&'sta
         body["query_prepared"] = serde_json::json!(format!("http://127.0.0.1:{BUSI_PORT}/query"));
         let raw = body.to_string();
         return vec![
-            ("/api/dtmsvr/prepare", raw.clone()),
-            ("/api/dtmsvr/submit", raw),
+            Call::Tc("/api/dtmsvr/prepare", raw.clone()),
+            Call::Tc("/api/dtmsvr/submit", raw),
         ];
     }
 
-    // XA 的三步跟别的模式不同：prepare（建空事务）→ 调业务分支做一阶段
-    // （分支自己去 registerBranch + XA PREPARE）→ submit。
-    // 中间那一步是打业务服务，不是打 TC，所以在 submit_one 里单独处理
+    // XA：prepare（建空事务）→ 调业务分支做一阶段（分支自己去
+    // registerBranch + XA PREPARE）→ submit
     if mode == "xa" {
-        return vec![
-            (
-                "/api/dtmsvr/prepare",
-                serde_json::json!({"gid": gid, "trans_type": "xa"}).to_string(),
-            ),
-            (
-                "/api/dtmsvr/submit",
-                serde_json::json!({"gid": gid, "trans_type": "xa"}).to_string(),
-            ),
-        ];
+        let mut calls = vec![Call::Tc(
+            "/api/dtmsvr/prepare",
+            serde_json::json!({"gid": gid, "trans_type": "xa"}).to_string(),
+        )];
+        for i in 1..=steps {
+            calls.push(Call::Busi(format!(
+                "{rm_base}/xa1?gid={gid}&branch_id={i:02}"
+            )));
+        }
+        calls.push(Call::Tc(
+            "/api/dtmsvr/submit",
+            serde_json::json!({"gid": gid, "trans_type": "xa"}).to_string(),
+        ));
+        return calls;
+    }
+
+    // TCC：prepare → 每个分支「registerBranch 再 try」→ submit，TC 随后回调 confirm。
+    // try 和 confirm 必须打**不同的路径**（/t1 vs /a1）—— 业务服务靠
+    // 命中 /a{steps} 计完成数，共用同一个路径会把 try 也算进去
+    if mode == "tcc" {
+        let mut calls = vec![Call::Tc(
+            "/api/dtmsvr/prepare",
+            serde_json::json!({"gid": gid, "trans_type": "tcc"}).to_string(),
+        )];
+        for i in 1..=steps {
+            calls.push(Call::Tc(
+                "/api/dtmsvr/registerBranch",
+                serde_json::json!({
+                    "gid": gid,
+                    "branch_id": format!("{:02}", i),
+                    "try": format!("http://127.0.0.1:{BUSI_PORT}/t{i}"),
+                    "confirm": format!("http://127.0.0.1:{BUSI_PORT}/a{i}"),
+                    "cancel": format!("http://127.0.0.1:{BUSI_PORT}/c{i}"),
+                })
+                .to_string(),
+            ));
+            calls.push(Call::Busi(format!("http://127.0.0.1:{BUSI_PORT}/t{i}")));
+        }
+        calls.push(Call::Tc(
+            "/api/dtmsvr/submit",
+            serde_json::json!({"gid": gid, "trans_type": "tcc"}).to_string(),
+        ));
+        return calls;
     }
 
     if mode == "saga" {
@@ -223,7 +275,7 @@ fn client_calls(mode: &str, gid: &str, steps: usize, target: &str) -> Vec<(&'sta
                 "compensate": format!("http://127.0.0.1:{BUSI_PORT}/c{}", i + 1)
             })).collect::<Vec<_>>(),
         });
-        return vec![("/api/dtmsvr/submit", body.to_string())];
+        return vec![Call::Tc("/api/dtmsvr/submit", body.to_string())];
     }
     let prepare = serde_json::json!({
         "gid": gid, "trans_type": "msg", "actions": acts,
@@ -231,8 +283,8 @@ fn client_calls(mode: &str, gid: &str, steps: usize, target: &str) -> Vec<(&'sta
         "query_prepared": format!("http://127.0.0.1:{BUSI_PORT}/query"),
     });
     vec![
-        ("/api/dtmsvr/prepare", prepare.to_string()),
-        (
+        Call::Tc("/api/dtmsvr/prepare", prepare.to_string()),
+        Call::Tc(
             "/api/dtmsvr/submit",
             serde_json::json!({"gid": gid, "trans_type": "msg"}).to_string(),
         ),
@@ -384,25 +436,24 @@ async fn main() {
             &format!("{prefix}-{i}"),
             args.steps,
             &args.target,
+            &rm_base,
         );
-        let (is_xa, rm, gid) = (args.mode == "xa", rm_base.clone(), format!("{prefix}-{i}"));
         tasks.push(tokio::spawn(async move {
             let _p = permit;
-            for (k, (path, body)) in calls.into_iter().enumerate() {
-                // XA：prepare 之后、submit 之前，要先让业务分支做完一阶段
-                // （分支自己去 registerBranch + XA PREPARE）
-                if is_xa && k == 1 {
-                    let _ = http
-                        .post(format!("{rm}/xa1?gid={gid}&branch_id=01"))
-                        .send()
-                        .await;
+            for call in calls {
+                match call {
+                    Call::Tc(path, body) => {
+                        let _ = http
+                            .post(format!("{tc_url}{path}"))
+                            .header("content-type", "application/json")
+                            .body(body)
+                            .send()
+                            .await;
+                    }
+                    Call::Busi(url) => {
+                        let _ = http.post(url).send().await;
+                    }
                 }
-                let _ = http
-                    .post(format!("{tc_url}{path}"))
-                    .header("content-type", "application/json")
-                    .body(body)
-                    .send()
-                    .await;
             }
         }));
     }
