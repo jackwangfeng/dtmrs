@@ -312,3 +312,41 @@ pub async fn clear_prepared(dsn: &str) -> String {
     }
     format!("清掉 {n} 笔残留的 prepared 事务")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uri(s: &str) -> axum::http::Uri {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn 从query里解析gid和分支号() {
+        assert_eq!(
+            gid_branch(&uri("/xa1?gid=abc-1&branch_id=02")),
+            ("abc-1".into(), "02".into())
+        );
+    }
+
+    #[test]
+    fn 没给分支号时默认01() {
+        // TC 回调 commit/rollback 时不一定带 branch_id
+        assert_eq!(gid_branch(&uri("/xa1?gid=g9")), ("g9".into(), "01".into()));
+    }
+
+    #[test]
+    fn 多余的query参数不影响解析() {
+        // TC 调分支时会带上 op=、trans_type= 等
+        assert_eq!(
+            gid_branch(&uri("/xa1?op=commit&gid=g10&trans_type=xa&branch_id=03")),
+            ("g10".into(), "03".into())
+        );
+    }
+
+    #[test]
+    fn 没有query时不panic() {
+        // 解析失败要退化成空 gid，而不是把压测进程搞崩
+        assert_eq!(gid_branch(&uri("/xa1")), (String::new(), "01".into()));
+    }
+}

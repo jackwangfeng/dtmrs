@@ -597,3 +597,164 @@ async fn verify(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 把 Call 列表压成便于断言的形状：("tc", 路径) 或 ("busi", url)
+    fn shape(calls: &[Call]) -> Vec<(&'static str, String)> {
+        calls
+            .iter()
+            .map(|c| match c {
+                Call::Tc(p, _) => ("tc", p.to_string()),
+                Call::Busi(u) => ("busi", u.clone()),
+            })
+            .collect()
+    }
+
+    fn body_of(calls: &[Call], path: &str) -> String {
+        calls
+            .iter()
+            .find_map(|c| match c {
+                Call::Tc(p, b) if *p == path => Some(b.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("没有打到 {path} 的请求"))
+    }
+
+    // ============ 协议形状 ============
+    //
+    // 这几个断言就是压测结论的地基：各模式的吞吐差异**主要来自客户端往返次数**，
+    // 数错一次往返，整篇对比文章的结论就是错的。
+
+    #[test]
+    fn saga只有一次往返() {
+        let c = client_calls("saga", "g1", 2, "dtmrs", "");
+        assert_eq!(shape(&c), vec![("tc", "/api/dtmsvr/submit".into())]);
+        let b = body_of(&c, "/api/dtmsvr/submit");
+        assert!(b.contains("\"action\""), "saga 要带 action: {b}");
+        assert!(b.contains("\"compensate\""), "saga 要带 compensate: {b}");
+    }
+
+    #[test]
+    fn msg是prepare加submit两次往返() {
+        let c = client_calls("msg", "g2", 1, "dtmrs", "");
+        assert_eq!(
+            shape(&c),
+            vec![
+                ("tc", "/api/dtmsvr/prepare".into()),
+                ("tc", "/api/dtmsvr/submit".into()),
+            ]
+        );
+        assert!(
+            body_of(&c, "/api/dtmsvr/prepare").contains("query_prepared"),
+            "msg 的 prepare 必须带回查地址 —— 客户端崩在中间时 TC 靠它决断"
+        );
+    }
+
+    #[test]
+    fn tcc每个分支都是先登记再try() {
+        // 顺序反了会导致 try 成功但 TC 不知道有这个分支 → 资源永久泄漏。
+        // 这是「绝对不能破坏的语义」第 5 条，压测工具也必须照做，
+        // 否则测出来的往返次数是假的。
+        let c = client_calls("tcc", "g3", 2, "dtmrs", "");
+        assert_eq!(
+            shape(&c),
+            vec![
+                ("tc", "/api/dtmsvr/prepare".into()),
+                ("tc", "/api/dtmsvr/registerBranch".into()),
+                ("busi", format!("http://127.0.0.1:{BUSI_PORT}/t1")),
+                ("tc", "/api/dtmsvr/registerBranch".into()),
+                ("busi", format!("http://127.0.0.1:{BUSI_PORT}/t2")),
+                ("tc", "/api/dtmsvr/submit".into()),
+            ],
+            "每个分支必须是「先 registerBranch 再打业务的 try」"
+        );
+    }
+
+    #[test]
+    fn tcc的try和confirm必须是不同路径() {
+        // ⚠ 这条不是洁癖：假业务服务靠**命中 /a{steps}** 数完成笔数。
+        // 如果 try 和 confirm 共用一个路径，try 会被算进完成数，
+        // 完成判定当场失效 —— 吞吐会虚高一倍且不报错。
+        let c = client_calls("tcc", "g4", 1, "dtmrs", "");
+        let rb = body_of(&c, "/api/dtmsvr/registerBranch");
+        let v: serde_json::Value = serde_json::from_str(&rb).unwrap();
+        let (t, cf) = (v["try"].as_str().unwrap(), v["confirm"].as_str().unwrap());
+        assert_ne!(t, cf, "try 和 confirm 共用路径会让完成判定失效");
+        assert!(cf.ends_with("/a1"), "confirm 必须落在计数路径 /a1 上: {cf}");
+        assert!(t.ends_with("/t1"), "try 必须避开计数路径: {t}");
+    }
+
+    #[test]
+    fn xa的一阶段打业务服务而不是tc() {
+        // XA 的一阶段是分支自己去 registerBranch + PREPARE TRANSACTION，
+        // 客户端只负责 prepare 和 submit
+        let c = client_calls("xa", "g5", 1, "dtmrs", "http://rm:9999");
+        assert_eq!(
+            shape(&c),
+            vec![
+                ("tc", "/api/dtmsvr/prepare".into()),
+                ("busi", "http://rm:9999/xa1?gid=g5&branch_id=01".into()),
+                ("tc", "/api/dtmsvr/submit".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn 分支号从01开始且补零() {
+        // branch_id 是 "{:02}"，跟 TC 侧的 branch_id() 一致。
+        // 不补零会让 "1" 和 "01" 变成两个分支
+        let c = client_calls("tcc", "g6", 3, "dtmrs", "");
+        let ids: Vec<String> = c
+            .iter()
+            .filter_map(|x| match x {
+                Call::Tc("/api/dtmsvr/registerBranch", b) => {
+                    let v: serde_json::Value = serde_json::from_str(b).unwrap();
+                    Some(v["branch_id"].as_str().unwrap().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["01", "02", "03"]);
+    }
+
+    // ============ DTM 的报文格式 ============
+
+    #[test]
+    fn dtm的saga要额外带等长的payloads() {
+        // DTM 的协议要求 payloads 跟 steps 等长，少了会被拒
+        let c = client_calls("saga", "g7", 3, "dtm", "");
+        assert_eq!(shape(&c), vec![("tc", "/api/dtmsvr/submit".into())]);
+        let v: serde_json::Value = serde_json::from_str(&body_of(&c, "/api/dtmsvr/submit")).unwrap();
+        assert_eq!(v["payloads"].as_array().unwrap().len(), 3);
+        assert_eq!(v["steps"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn dtm的msg两次发的是同一份报文() {
+        // DTM 的 msg 是 prepare 和 submit 发同样的 body
+        let c = client_calls("msg", "g8", 2, "dtm", "");
+        assert_eq!(shape(&c).len(), 2);
+        assert_eq!(
+            body_of(&c, "/api/dtmsvr/prepare"),
+            body_of(&c, "/api/dtmsvr/submit")
+        );
+    }
+
+    // ============ 端口选择 ============
+
+    #[test]
+    fn 监听端口必须避开临时端口范围() {
+        // 落在 ip_local_port_range（通常 32768-60999）里的服务端口会**偶发**
+        // 起不来，报 Address already in use 但 ss 显示没人在听 ——
+        // 那是某个出站连接临时占用了它。偶发性正是它难查的原因。
+        for (名字, 端口) in [("BUSI", BUSI_PORT), ("TC", TC_PORT), ("DTM", DTM_PORT)] {
+            assert!(
+                !(32768..=60999).contains(&端口),
+                "{名字} 端口 {端口} 落在临时端口范围里，会偶发起不来"
+            );
+        }
+    }
+}
