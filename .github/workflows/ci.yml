@@ -81,6 +81,11 @@ jobs:
           DTMRS_TEST_XA_PG: postgres://postgres:dtmrs@127.0.0.1:5432/dtmrs
           DTMRS_TEST_XA_MYSQL: mysql://root:dtmrs@127.0.0.1:3306/dtmrs
           DTMRS_TEST_REDIS: redis://127.0.0.1:6379/0
+          # ⚠ 这一条是这个 job 的意义所在。
+          # 真库测试没配环境变量时**直接返回但仍显示为 passed** —— 只要上面
+          # 某个容器没起来、或者哪个变量名打错一个字母，这个 job 会安安静静
+          # 地全绿，而真库那部分其实一行没跑。设了它就变成响亮地失败。
+          DTMRS_TEST_REQUIRE_REAL_DB: "1"
         # 开 redis feature —— 它默认是关的，不开等于没测
         run: cargo test --workspace --features dtmrs/redis,dtmrs/barrier-redis,dtmrs-server/redis,dtmrs-store/redis,dtmrs-barrier/redis
 

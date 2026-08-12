@@ -698,6 +698,23 @@ mod tests {
     ///
     /// 每次进来把 Postgres 的表清空（只 DELETE 不 DDL —— 并发 DDL 会撞上
     /// Postgres 的 `pg_type` 竞态，见 `migrate_racy`）。
+    /// 「跳过 ≠ 通过」的闸门。
+    ///
+    /// 这些测试没配环境变量时直接返回，**仍然显示为 passed**。所以只要 CI 里
+    /// 某个数据库容器没起来、或者环境变量名打错一个字母，那个 job 会
+    /// **安安静静地全绿** —— 而真库那部分其实一行没跑。
+    ///
+    /// CI 的真库 job 里设 `DTMRS_TEST_REQUIRE_REAL_DB=1`，把「悄悄没测」
+    /// 变成「响亮地失败」。本地开发不设这个变量，跳过行为不变。
+    fn require_real_db(缺的变量: &str) {
+        if std::env::var("DTMRS_TEST_REQUIRE_REAL_DB").is_ok() {
+            panic!(
+                "设了 DTMRS_TEST_REQUIRE_REAL_DB，却没有 {缺的变量} —— \
+                 这是 CI 配置坏了（容器没起来？变量名打错？），不是可以跳过的情况"
+            );
+        }
+    }
+
     async fn backends() -> (
         tokio::sync::MutexGuard<'static, ()>,
         Vec<(&'static str, Store)>,
@@ -706,6 +723,10 @@ mod tests {
         let mut v = vec![("sqlite", Store::open("sqlite::memory:").await.unwrap())];
         // 每种真数据库都配一个环境变量。**没配就是没测**，不是"通过"。
         for (name, env) in [("postgres", "DTMRS_TEST_PG"), ("mysql", "DTMRS_TEST_MYSQL")] {
+            if std::env::var(env).is_err() {
+                require_real_db(env);
+                continue;
+            }
             if let Ok(url) = std::env::var(env) {
                 let s = Store::open(&url)
                     .await
@@ -718,6 +739,10 @@ mod tests {
                 }
                 v.push((name, s));
             }
+        }
+        #[cfg(feature = "redis")]
+        if std::env::var("DTMRS_TEST_REDIS").is_err() {
+            require_real_db("DTMRS_TEST_REDIS");
         }
         #[cfg(feature = "redis")]
         if let Ok(url) = std::env::var("DTMRS_TEST_REDIS") {

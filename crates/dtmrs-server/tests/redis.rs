@@ -43,6 +43,7 @@ static REDIS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 async fn store(prefix_hint: &str) -> Option<(tokio::sync::MutexGuard<'static, ()>, Store)> {
     let guard = REDIS_LOCK.lock().await;
     let Ok(url) = std::env::var("DTMRS_TEST_REDIS") else {
+        require_real_db("DTMRS_TEST_REDIS");
         eprintln!(
             "\n⚠ 跳过 Redis 测试（{prefix_hint}）：DTMRS_TEST_REDIS 没配。\n  \
              这不等于 Redis 后端通过 —— 它只有对着真 Redis 才能验。\n"
@@ -336,4 +337,16 @@ async fn redis_租约到期后别的实例能接手() {
         "tc-2",
         "接手方要写上自己的 owner"
     );
+}
+
+/// 「跳过 ≠ 通过」的闸门。没配环境变量时测试直接返回、**仍显示为 passed**，
+/// 所以 CI 里容器没起来或变量名打错，job 会安安静静全绿。
+/// CI 的真库 job 设 `DTMRS_TEST_REQUIRE_REAL_DB=1`，把「悄悄没测」变成「响亮地失败」。
+fn require_real_db(缺的变量: &str) {
+    if std::env::var("DTMRS_TEST_REQUIRE_REAL_DB").is_ok() {
+        panic!(
+            "设了 DTMRS_TEST_REQUIRE_REAL_DB，却没有 {缺的变量} —— \
+             这是 CI 配置坏了（容器没起来？变量名打错？），不是可以跳过的情况"
+        );
+    }
 }

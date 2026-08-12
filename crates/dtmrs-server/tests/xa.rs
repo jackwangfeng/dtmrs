@@ -60,6 +60,7 @@ async fn targets(ids: &[(i32, i64)]) -> Vec<Target> {
         out.push(Target { name, pool, be, xa });
     }
     if out.is_empty() {
+        require_real_db("DTMRS_TEST_XA_PG / DTMRS_TEST_XA_MYSQL");
         eprintln!(
             "\n⚠ 跳过 XA 测试：DTMRS_TEST_XA_PG / DTMRS_TEST_XA_MYSQL 都没配。\n  \
              这不等于 XA 通过 —— XA 只有对着真数据库才能验。\n"
@@ -463,5 +464,17 @@ async fn xa_没解决的prepared事务会阻塞无关写入() {
             .await
             .unwrap_or_else(|e| panic!("{}: 解决之后应该能正常写: {e}", t.name));
         assert_eq!(bal(&t, &[61]).await, vec![999], "{}", t.name);
+    }
+}
+
+/// 「跳过 ≠ 通过」的闸门。没配环境变量时测试直接返回、**仍显示为 passed**，
+/// 所以 CI 里容器没起来或变量名打错，job 会安安静静全绿。
+/// CI 的真库 job 设 `DTMRS_TEST_REQUIRE_REAL_DB=1`，把「悄悄没测」变成「响亮地失败」。
+fn require_real_db(缺的变量: &str) {
+    if std::env::var("DTMRS_TEST_REQUIRE_REAL_DB").is_ok() {
+        panic!(
+            "设了 DTMRS_TEST_REQUIRE_REAL_DB，却没有 {缺的变量} —— \
+             这是 CI 配置坏了（容器没起来？变量名打错？），不是可以跳过的情况"
+        );
     }
 }

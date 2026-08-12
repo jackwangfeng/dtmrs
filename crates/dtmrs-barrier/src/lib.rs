@@ -238,6 +238,16 @@ mod tests {
         let mut v = vec![("sqlite", mem, Backend::Sqlite)];
         // 每种真库配一个环境变量。**没配就是没测。**
         for (name, env) in [("postgres", "DTMRS_TEST_PG"), ("mysql", "DTMRS_TEST_MYSQL")] {
+            if std::env::var(env).is_err() {
+                // 「跳过 ≠ 通过」的闸门，见 dtmrs-store 里同名函数的注释
+                if std::env::var("DTMRS_TEST_REQUIRE_REAL_DB").is_ok() {
+                    panic!(
+                        "设了 DTMRS_TEST_REQUIRE_REAL_DB，却没有 {env} —— \
+                         这是 CI 配置坏了，不是可以跳过的情况"
+                    );
+                }
+                continue;
+            }
             if let Ok(url) = std::env::var(env) {
                 let be = Backend::from_url(&url);
                 let p = AnyPoolOptions::new()
