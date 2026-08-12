@@ -85,7 +85,8 @@ crates/
                   SQL 后端(sqlx::Any 跑三种库) / Redis 后端(redis_store.rs，
                   要开 redis feature)
   dtmrs-server/   TC：api.rs(协议无关的操作层，HTTP 与 gRPC 共用)
-                  main.rs(axum HTTP) / grpc/(tonic，调分支 + 提供 API)
+                  http.rs(axum) / grpc/(tonic，调分支 + 提供 API)
+                  —— 两个协议层都在这儿，见下面第 2 条
                   driver.rs(推进器) / registry.rs(进程内分支表)
                   workflow.rs(workflow 模式) / embedded.rs(嵌入式门面)
   dtmrs-barrier/  客户端子事务屏障。SQL 版靠「加入业务的本地事务」，
@@ -103,9 +104,18 @@ crates/
    分布式事务的 bug 绝大多数就在状态迁移上。
    （workflow 是唯一的例外，而且是**受控的例外**：正向走向由用户函数决定，
    core 仍然拥有「何时跑函数、何时补偿、按什么顺序补」，见 `workflow_advance` 的文档。）
-2. HTTP（`main.rs`）和 gRPC（`grpc/server.rs`）都只做协议转换，业务判断只在
+2. HTTP（`http.rs`）和 gRPC（`grpc/server.rs`）都只做协议转换，业务判断只在
    `api.rs`。**别在任一协议层里加判断** —— 两边漂移的后果是「同一个请求走 HTTP
    被拒、走 gRPC 却受理了」。
+
+   两个协议层**都在 `dtmrs-server` 里，不在 bin crate**。这不是随意摆放：
+   HTTP 层原先写在 `crates/dtmrs/src/main.rs`，tests/ 够不着，覆盖率 0%，
+   而 gRPC 层有 86% —— 这条约束当时只有一半受测试保护。
+   加协议层或改现有的，用例加到 `tests/http.rs` 的「等价」那个 mod 里，
+   它对同一组请求分别打两个协议、断言**受理/拒绝的结论一致**。
+   ⚠ 比的是语义结论不是状态码：同样是 `ApiError::Conflict`，HTTP 返回
+   `200 + body FAILURE`（DTM 协议靠 body 表达结果），gRPC 返回
+   `FAILED_PRECONDITION`。拿状态码直接比会误判成漂移。
 
 二进制在 `crates/dtmrs`（门面 crate）里，`dtmrs-server` 是纯库 —— 这样
 `cargo install dtmrs` 和 `cargo add dtmrs` 都是那个显而易见的名字。

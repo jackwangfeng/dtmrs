@@ -1,11 +1,17 @@
 //! TC 的可复用部分。做成 lib 是为了让集成测试能直接驱动推进器 ——
 //! bin crate 是不能被 tests/ import 的。
+//!
+//! **两个协议层都放在这儿**（`http` 和 `grpc`），理由同上：它们早先一个在
+//! 这里、一个在 bin crate 的 main.rs 里，结果 gRPC 层有 86% 覆盖率而 HTTP 层
+//! 是 0% —— 而「两边不许漂移」恰恰是这个项目最要紧的结构约束之一。
+//! 现在两边都能被 tests/ 拿到，可以用同一组用例做等价性测试。
 
 pub mod api;
 pub mod driver;
 pub mod embedded;
 #[cfg(feature = "grpc")]
 pub mod grpc;
+pub mod http;
 pub mod registry;
 pub mod workflow;
 
