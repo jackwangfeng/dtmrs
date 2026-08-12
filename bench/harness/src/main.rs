@@ -29,6 +29,8 @@
 //! 加一，主线程直接读内存，零网络。跑完再**全量核对真实终态**（不计时），
 //! 对不上就明确报出来。
 
+mod xa;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,6 +52,8 @@ struct Args {
     tick: String,
     target: String,
     bin: String,
+    /// XA 模式的业务库（RM 侧），必须支持两阶段
+    busi_db: String,
     no_verify: bool,
     quiet: bool,
 }
@@ -66,6 +70,7 @@ impl Args {
             tick: "5".into(),
             target: "dtmrs".into(),
             bin: "target/release/dtmrs".into(),
+            busi_db: "postgres://postgres:dtmrs@127.0.0.1:55435/dtmrs".into(),
             no_verify: false,
             quiet: false,
         };
@@ -88,6 +93,7 @@ impl Args {
                 "--tick" => a.tick = val(),
                 "--target" => a.target = val(),
                 "--bin" => a.bin = val(),
+                "--busi-db" => a.busi_db = val(),
                 "--no-verify" => a.no_verify = true,
                 "--quiet" => a.quiet = true,
                 other => {
@@ -193,6 +199,22 @@ fn client_calls(mode: &str, gid: &str, steps: usize, target: &str) -> Vec<(&'sta
         ];
     }
 
+    // XA 的三步跟别的模式不同：prepare（建空事务）→ 调业务分支做一阶段
+    // （分支自己去 registerBranch + XA PREPARE）→ submit。
+    // 中间那一步是打业务服务，不是打 TC，所以在 submit_one 里单独处理
+    if mode == "xa" {
+        return vec![
+            (
+                "/api/dtmsvr/prepare",
+                serde_json::json!({"gid": gid, "trans_type": "xa"}).to_string(),
+            ),
+            (
+                "/api/dtmsvr/submit",
+                serde_json::json!({"gid": gid, "trans_type": "xa"}).to_string(),
+            ),
+        ];
+    }
+
     if mode == "saga" {
         let body = serde_json::json!({
             "gid": gid,
@@ -282,7 +304,23 @@ async fn main() {
     };
 
     let done = Arc::new(AtomicU64::new(0));
-    spawn_busi(done.clone(), final_path).await;
+    let mut rm_base = String::new();
+    if args.mode == "xa" {
+        // XA 的业务侧必须做真的两阶段，起一个连真库的 RM
+        println!(
+            "  清理残留       : {}",
+            xa::clear_prepared(&args.busi_db).await
+        );
+        match xa::spawn_rm(&args.busi_db, &tc_url, BUSI_PORT, done.clone()).await {
+            Ok(b) => rm_base = b,
+            Err(e) => {
+                eprintln!("XA 的 RM 起不来: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        spawn_busi(done.clone(), final_path).await;
+    }
 
     // DTM 由使用者自己起，我们只起自己的
     let mut child = None;
@@ -347,9 +385,18 @@ async fn main() {
             args.steps,
             &args.target,
         );
+        let (is_xa, rm, gid) = (args.mode == "xa", rm_base.clone(), format!("{prefix}-{i}"));
         tasks.push(tokio::spawn(async move {
             let _p = permit;
-            for (path, body) in calls {
+            for (k, (path, body)) in calls.into_iter().enumerate() {
+                // XA：prepare 之后、submit 之前，要先让业务分支做完一阶段
+                // （分支自己去 registerBranch + XA PREPARE）
+                if is_xa && k == 1 {
+                    let _ = http
+                        .post(format!("{rm}/xa1?gid={gid}&branch_id=01"))
+                        .send()
+                        .await;
+                }
                 let _ = http
                     .post(format!("{tc_url}{path}"))
                     .header("content-type", "application/json")
@@ -425,6 +472,15 @@ async fn main() {
         );
         println!("  ---");
         println!("  终态核对      : {dist}");
+        if args.mode == "xa" {
+            // 光看终态不够 —— 见 xa::verify_rows 的注释
+            let (rows, stuck) = xa::verify_rows(&args.busi_db).await;
+            println!("  业务库实际写入: {rows} 行（应为 {}）", args.n);
+            println!("  残留 prepared : {stuck}（应为 0）");
+            if rows != args.n as i64 {
+                println!("  ❌ 行数对不上 —— 一阶段有失败，这个吞吐数字不算数");
+            }
+        }
         if finished < args.n as u64 {
             println!("  ⚠ 有 {} 笔没在时限内跑完", args.n as u64 - finished);
         }
