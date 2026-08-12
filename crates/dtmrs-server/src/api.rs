@@ -300,6 +300,25 @@ impl Api {
             return Err(ApiError::BadRequest("gid / branch_id 不能为空".into()));
         }
         let tt = match self.store.get_global(&r.gid).await {
+            // ⚠ 必须挡住「事务已经不可能再推进新分支」的状态。
+            //
+            // TCC / XA 的正确顺序是**先登记分支再做一阶段**（见 CLAUDE.md
+            // 「绝对不能破坏的语义」第 5 条）。如果这里放行，客户端拿到 SUCCESS
+            // 之后就会去执行 try / XA PREPARE —— 而 TC 这边事务已经终结或正在
+            // 回滚，那份资源**永远不会有人 confirm 或 cancel**：
+            //   TCC 是资源永久泄漏，XA 更糟 —— 留下永久持锁的 prepared 事务。
+            //
+            // 真实触发路径不需要客户端有 bug：多分支 TCC 登记完分支 1、做完 try、
+            // 正要登记分支 2 时，这笔事务**超时了**，TC 已经回滚并落终态。
+            //
+            // 只放行 Prepared（正常流程）和 Submitted（容忍重试 ——
+            // register_branch 本身是幂等的，见 `分支登记是幂等的`）。
+            Ok(Some(g)) if matches!(g.status, GlobalStatus::Aborting) || g.status.is_final() => {
+                return Err(ApiError::Conflict(format!(
+                    "事务处于 {} 状态，不能再登记分支（登记后的一阶段将无人收尾）",
+                    g.status.as_str()
+                )));
+            }
             Ok(Some(g)) => g.trans_type,
             Ok(None) => return Err(ApiError::NotFound("gid 不存在，先 prepare".into())),
             Err(e) => return Err(internal(e)),

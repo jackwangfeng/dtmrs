@@ -437,3 +437,74 @@ async fn xa_分支不可达时只重试不改方向() {
     );
     assert!(got.next_cron_interval > 0, "要设置退避间隔");
 }
+
+// ============ 分支登记的状态守卫 ============
+//
+// 「TCC / XA 必须先 registerBranch 再做一阶段」这条语义，光靠客户端守规矩
+// 是不够的 —— TC 这边也得挡住「事务已经不可能再推进新分支」的状态。
+// 否则客户端拿到 SUCCESS 就去跑 try，那份资源永远没人收尾。
+
+/// 构造一个处于指定状态的 tcc 事务，然后试着往里登记分支
+async fn 登记分支(状态: GlobalStatus) -> Result<(), dtmrs_server::api::ApiError> {
+    use dtmrs_server::api::{Api, RegisterBranch};
+
+    let s = store().await;
+    let api = Api::new(s.clone());
+    let gid = format!("guard-{}", 状态.as_str());
+    s.create_global(&tcc_rows(&gid), &[]).await.unwrap();
+    s.set_global_status(&gid, 状态, TransType::Tcc, "")
+        .await
+        .unwrap();
+
+    api.register_branch(&RegisterBranch {
+        gid,
+        branch_id: "01".into(),
+        confirm: "http://x/confirm".into(),
+        cancel: "http://x/cancel".into(),
+        r#try: "http://x/try".into(),
+        commit: String::new(),
+        rollback: String::new(),
+    })
+    .await
+}
+
+#[tokio::test]
+async fn 已终结的事务不能再登记分支() {
+    // 真实触发路径：多分支 TCC 登记完分支 1、做完 try，正要登记分支 2 时
+    // 这笔事务超时了，TC 已经回滚并落终态。此时若放行，分支 2 的 try
+    // 会创建一份永远不会被 cancel 的预留资源（XA 更糟：永久持锁的 prepared）。
+    for 终态 in [GlobalStatus::Succeed, GlobalStatus::Failed] {
+        let e = 登记分支(终态)
+            .await
+            .expect_err(&format!("{} 状态下必须拒绝登记", 终态.as_str()));
+        assert!(
+            matches!(e, dtmrs_server::api::ApiError::Conflict(_)),
+            "{} 应该返回 Conflict，实际是 {e:?}",
+            终态.as_str()
+        );
+    }
+}
+
+#[tokio::test]
+async fn 回滚中的事务不能再登记分支() {
+    // Aborting 时新分支的一阶段还没跑 —— 拒绝登记正好阻止客户端去创建
+    // 那份没人回收的资源。放行反而会漏。
+    let e = 登记分支(GlobalStatus::Aborting)
+        .await
+        .expect_err("aborting 状态下必须拒绝登记");
+    assert!(
+        matches!(e, dtmrs_server::api::ApiError::Conflict(_)),
+        "应该返回 Conflict，实际是 {e:?}"
+    );
+}
+
+#[tokio::test]
+async fn 未终结的事务可以正常登记分支() {
+    // 守卫不能误伤正常流程：Prepared 是 TCC/XA 登记分支的标准时机，
+    // Submitted 要放行是为了容忍客户端重试（register_branch 本身幂等）。
+    for 状态 in [GlobalStatus::Prepared, GlobalStatus::Submitted] {
+        登记分支(状态)
+            .await
+            .unwrap_or_else(|e| panic!("{} 状态下应该允许登记，却报了 {e:?}", 状态.as_str()));
+    }
+}
