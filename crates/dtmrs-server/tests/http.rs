@@ -147,8 +147,8 @@ async fn 报文不合法要被拒而不是panic() {
     ] {
         let (code, _) = post(&base, path, body).await;
         assert!(
-            code < 500 || code == 500,
-            "{path} 不该把进程搞崩，得到 {code}"
+            code < 500,
+            "{path} 的烂报文应该是 4xx 客户端错误，不该是 5xx（得到 {code}）"
         );
         // 服务还活着
         let h = reqwest::get(format!("{base}/health")).await.unwrap();
