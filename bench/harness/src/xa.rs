@@ -62,7 +62,6 @@ use axum::Router;
 use dtmrs_core::Backend;
 use dtmrs_xa::Xa;
 use sqlx::any::AnyPoolOptions;
-use sqlx::AnyPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
