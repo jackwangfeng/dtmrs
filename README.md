@@ -704,14 +704,23 @@ row locks become the bottleneck — the same reason DTM supports Redis.
 
 ### ⚠ Three semantics that differ from the SQL backends
 
-**1. Weaker durability.** Redis defaults to `appendfsync everysec`, so a crash can lose the
-last second of writes. For a coordinator what you lose is **transaction state**: you can end
-up with "the business side already deducted money, but the TC has no record of that
-transaction". The SQL backends don't have this (committed means on disk).
+**1. Weaker durability, and the default is worse than you think.**
 
-Either accept it (often acceptable for flash sales, with reconciliation as a backstop) or
-configure `appendfsync always` — slower, but still faster than SQL. **Do not run
-money-critical strong-consistency workloads on the default configuration.**
+⚠ **Redis ships with `appendonly no` — AOF is off entirely**, leaving only RDB snapshots.
+The default `save 3600 1 ...` means a quiet period can lose **an hour** of transaction state.
+(`appendfsync everysec` does nothing while AOF is disabled — don't let that setting reassure you.)
+
+For a coordinator what you lose is **transaction state**: you can end up with "the business
+side already deducted money, but the TC has no record of that transaction". The SQL backends
+don't have this (committed means on disk).
+
+The dangerous case is losing a record whose branches **already partly ran** — those branches
+will never be compensated or confirmed. That is also the most recently written state, i.e.
+exactly what a crash is most likely to lose.
+
+**Minimum: `appendonly yes` + `appendfsync everysec`.** For money-critical strong consistency,
+don't put the TC store on Redis at all — even with `appendfsync always`, Redis replication is
+asynchronous, so a failover can still lose acknowledged writes. AOF cannot fix that.
 
 **2. Finished transactions expire** (7-day TTL by default). Otherwise memory is gone after a
 few tens of millions of flash-sale transactions. The SQL backends keep them forever. Archive
