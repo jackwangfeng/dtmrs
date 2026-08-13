@@ -75,7 +75,30 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve_http(api: Api, addr: String) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, router(App::new(api))).await?;
+    let app = App::new(api);
+
+    // 配了 DTMRS_ADMIN_PASSWORD 才开登录保护；没配保持原样（本地开发用）。
+    // ⚠ 但监听地址不是回环还不设密码，等于把 abort / retry / submit 敞给外面，
+    //   这种情况必须吼一嗓子 —— 静默放行是最糟的默认值。
+    let router = match dtmrs::server::auth::Auth::from_env() {
+        Some(auth) => {
+            let user = std::env::var("DTMRS_ADMIN_USER").unwrap_or_else(|_| "admin".into());
+            info!(user = %user, "管理台已开启登录保护");
+            dtmrs::server::http::router_with_auth(app, auth)
+        }
+        None => {
+            let public = !addr.starts_with("127.") && !addr.starts_with("localhost");
+            if public {
+                tracing::warn!(
+                    %addr,
+                    "⚠ 监听在非回环地址但没设 DTMRS_ADMIN_PASSWORD —— \
+                     管理台和全部接口（含 abort/retry/submit）对任何能连上的人开放"
+                );
+            }
+            router(app)
+        }
+    };
+    axum::serve(listener, router).await?;
     Ok(())
 }
 

@@ -7,6 +7,7 @@
 //! 现在两边都能被 tests/ 拿到，可以用同一组用例做等价性测试。
 
 pub mod api;
+pub mod auth;
 pub mod driver;
 pub mod embedded;
 #[cfg(feature = "grpc")]

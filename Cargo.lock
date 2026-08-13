@@ -407,6 +407,7 @@ dependencies = [
  "dtmrs-xa",
  "prost",
  "protoc-bin-vendored",
+ "rand 0.8.7",
  "redis",
  "reqwest",
  "serde",

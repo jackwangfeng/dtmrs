@@ -122,7 +122,33 @@ fn http_result(r: Result<(), ApiError>) -> (StatusCode, Json<Reply>) {
 }
 
 
+/// 不带认证的 router（本地/内网用）。要保护请用 [`router_with_auth`]
 pub fn router(app: App) -> Router {
+    routes(app)
+}
+
+/// 带登录保护的 router。
+///
+/// ⚠ 中间件是**全局**的，不是只挡管理台页面 —— 真正危险的是它调的那些接口
+/// （abort 能中止在途事务、retry 能改调度、submit 能凭空造事务）。
+/// 白名单只有 `/health`（反代健康检查）和 `/login` `/logout`。
+pub fn router_with_auth(app: App, auth: std::sync::Arc<crate::auth::Auth>) -> Router {
+    use axum::middleware;
+    // 登录路由自带 Arc<Auth> 状态，业务路由自带 App 状态 —— 各自
+    // with_state 收敛成 Router<()> 之后再 merge，最后统一挂中间件
+    let auth_routes = Router::new()
+        .route(
+            "/login",
+            get(crate::auth::login_page).post(crate::auth::login_submit),
+        )
+        .route("/logout", post(crate::auth::logout))
+        .with_state(auth.clone());
+    routes(app)
+        .merge(auth_routes)
+        .layer(middleware::from_fn_with_state(auth, crate::auth::guard))
+}
+
+fn routes(app: App) -> Router {
     Router::new()
         .route("/api/dtmsvr/newGid", get(new_gid))
         .route("/api/dtmsvr/prepare", post(prepare))
