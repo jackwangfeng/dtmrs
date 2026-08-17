@@ -45,11 +45,11 @@ xa = ["dep:dtmrs-xa"]
 full = ["server", "grpc", "barrier", "barrier-redis", "xa", "redis"]
 
 [dependencies]
-dtmrs-core = { path = "../dtmrs-core", version = "0.6.0" }
-dtmrs-server = { path = "../dtmrs-server", version = "0.6.0", optional = true, default-features = false }
-dtmrs-store = { path = "../dtmrs-store", version = "0.6.0", optional = true }
-dtmrs-barrier = { path = "../dtmrs-barrier", version = "0.6.0", optional = true }
-dtmrs-xa = { path = "../dtmrs-xa", version = "0.6.0", optional = true }
+dtmrs-core = { path = "../dtmrs-core", version = "0.7.0" }
+dtmrs-server = { path = "../dtmrs-server", version = "0.7.0", optional = true, default-features = false }
+dtmrs-store = { path = "../dtmrs-store", version = "0.7.0", optional = true }
+dtmrs-barrier = { path = "../dtmrs-barrier", version = "0.7.0", optional = true }
+dtmrs-xa = { path = "../dtmrs-xa", version = "0.7.0", optional = true }
 
 # 只有二进制用得上
 tokio = { workspace = true, optional = true }

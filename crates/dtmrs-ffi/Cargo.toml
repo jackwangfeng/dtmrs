@@ -24,9 +24,9 @@ crate-type = ["cdylib", "staticlib"]
 
 
 [dependencies]
-dtmrs-core = { path = "../dtmrs-core", version = "0.6.0" }
+dtmrs-core = { path = "../dtmrs-core", version = "0.7.0" }
 # 关掉 grpc：这里要的是尽量小的 .so，而嵌入式宿主基本用 local:// 分支。
 # 带上 tonic 整条依赖树会让 .so 明显变大，还要求构建机装 protoc
-dtmrs-server = { path = "../dtmrs-server", version = "0.6.0", default-features = false }
+dtmrs-server = { path = "../dtmrs-server", version = "0.7.0", default-features = false }
 serde_json = { workspace = true }
 tokio = { workspace = true }
