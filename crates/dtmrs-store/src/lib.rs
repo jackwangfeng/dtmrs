@@ -307,6 +307,39 @@ impl SqlStore {
         ))
         .execute(&self.pool)
         .await?;
+        self.add_missing_columns().await?;
+        Ok(())
+    }
+
+    /// 给**已存在**的表补新增的列。
+    ///
+    /// ⚠ 这个方法存在的理由：`CREATE TABLE IF NOT EXISTS` 对已有的表**什么都不做**，
+    /// 所以给表加一列时老库升级上来会直接报 `no such column`。
+    /// 在 auth_token 加 `secret` 列时踩到过 —— 服务起得来，但一调令牌接口就 500。
+    ///
+    /// 三种方言对「列已存在」的处理都不一样（sqlite/MySQL 的 ADD COLUMN 没有
+    /// IF NOT EXISTS），所以统一的做法是：**照发不误，把「列已存在」这个错吞掉**。
+    /// 别的错误照常抛出去。
+    ///
+    /// 加新列时在这个数组里加一行就行。
+    async fn add_missing_columns(&self) -> Result<()> {
+        let mid = self.be.text(MID);
+        let adds: [(&str, String); 1] = [(
+            "auth_token",
+            format!("secret {mid} NOT NULL DEFAULT ''"),
+        )];
+        for (table, coldef) in adds {
+            let sql = format!("ALTER TABLE {table} ADD COLUMN {coldef}");
+            if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
+                let m = e.to_string().to_lowercase();
+                // sqlite: "duplicate column name" / postgres: "already exists"
+                // / mysql: "duplicate column name"
+                let already = m.contains("duplicate column") || m.contains("already exists");
+                if !already {
+                    return Err(e);
+                }
+            }
+        }
         Ok(())
     }
 
