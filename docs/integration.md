@@ -172,7 +172,110 @@ query 参数：
 
 请求体是**空字节**（空 protobuf 消息对任何 message 类型都合法）。所以**你不需要为 dtmrs 改接口**——任何已有的 gRPC 方法都能直接当分支用。
 
-## 五、各语言怎么接
+## 五、TCC 的接入顺序（写错会永久泄漏资源）
+
+前面几节讲的是「你作为分支怎么写」。TCC 多一件事：**发起方的调用顺序**，
+而且这个顺序写反了会静默泄漏资源。
+
+### 顺序只有一种是对的
+
+```
+prepare(gid)
+  ├─ registerBranch(分支1)  →  调分支1的 try
+  ├─ registerBranch(分支2)  →  调分支2的 try
+  └─ registerBranch(分支3)  →  调分支3的 try
+submit(gid)        ← 只有全部 try 明确成功才走到这
+```
+
+**先登记，再 try。** 不是「try 成功了再登记」——那个直觉很自然，但是错的。
+
+### 为什么，两种失败的代价不对称
+
+| 崩在中间时 | 后果 |
+|---|---|
+| **先登记再 try**：登记完、try 前崩了 | TC 发来 cancel，分支发现正向没跑过 → **空回滚，什么都不做** |
+| **先 try 再登记**：try 成功、登记前崩了 | **TC 眼里这笔事务一个分支都没有** —— 既不 confirm 也不 cancel，那份冻结的资源永久泄漏 |
+
+也就是说：
+
+> **登记多了无害**（空回滚兜住），**登记漏了致命**（资源永久泄漏，且无法补救 ——
+> TC 连那个分支的地址都没有）。
+
+顺序就由这个不对称决定。它跟「回滚时补偿所有分支，包括没成功的那些」是同一条
+原则的两种表现：**在「不知道对方状态」时，永远选那个多做一次但无害的动作。**
+
+「try 成功了再登记」这个直觉隐含了一个在分布式环境里不成立的假设 ——
+**你能知道 try 成没成功**。try 超时的时候你不知道，而对方可能真的冻结了。
+
+> ⚠ XA 上同一条规则，代价高一档：先 `PREPARE TRANSACTION` 再登记的话，
+> 崩在中间会留下**永久持锁的 prepared 事务**，在 Postgres 上还阻塞 VACUUM，
+> 能把整个库搞成不可写。
+
+**这不是 dtmrs 自己的约定，是 TCC 的通行做法。** DTM 的 `Tcc.CallBranch` 就是
+先 `registerBranch`（注册失败直接返回，不执行 Try）再调 Try；Seata 的
+`TCCServiceProxy` 也是在 `Prepare` 内部先 `registeBranch`。
+
+顺带一个实现细节：**一次 registerBranch 在 TC 侧会落两条记录**（Confirm 和
+Cancel 各一条，状态 `prepared`），而 **Try 本身不落库** —— 它由客户端直调业务服务。
+所以登记时传的 `try` 地址只是存一份备查，TC 不会去调它。
+
+### 什么时候 submit，什么时候 abort
+
+> **只有全部 try 明确成功才 submit。其余一切情况都 abort。**
+
+「其余一切」有三种，别只想到第一种：
+
+| try 的结果 | 怎么办 |
+|---|---|
+| 明确失败（库存不足、风控拒绝） | **abort** |
+| **超时 / 连不上 / 5xx** | **abort** |
+| 成功了但你的进程随后崩了 | 靠监控发现（见下） |
+
+第二行最容易写错。超时之后**不能重试 try 然后继续 submit** —— 你不知道那个分支
+到底冻结成功没有，而 submit 意味着「决议提交、TC 会一直 confirm 到成功」。
+如果那个分支根本没冻结，confirm 会永远失败，你就卡在无限重试加告警里
+（`confirm` 失败**绝不会**转成 `cancel`，这是铁律）。
+
+abort 反而总是安全的：冻结了就释放，没冻结就被屏障空转掉。
+
+```java
+tc.prepareTcc(gid);
+try {
+    for (每个分支) {
+        tc.registerTccBranch(gid, id, tryUrl, confirm, cancel);  // 先登记
+        callTry(...);          // 再 try，任何异常都往外抛
+    }
+    tc.submitTcc(gid);         // 只有走到这儿才提交
+} catch (Exception e) {
+    tc.abort(gid);             // 明确失败和超时都走这里
+    throw e;
+}
+```
+
+`abort` 可以在**任何时刻**调用，哪怕后面几个分支还没登记 ——
+TC 只 cancel 它知道的那些，没登记的本来也没执行过。
+
+### ⚠ TCC 的 prepared 没有任何自动回收
+
+`catch` 挡不住进程被 kill。而 **TCC 停在 `prepared` 的事务不会被调度器捞起来** ——
+调度条件里只有 `submitted` / `aborting`，外加「`prepared` 且是 msg」
+（msg 有回查地址，TC 能主动问业务方；TCC 没有这个概念，TC 不知道你的 try
+做了什么，也就无从判断该 confirm 还是 cancel）。
+
+实测：登记两个分支、try 了一个，然后不 submit 也不 abort ——
+**12 秒后仍是 prepared，冻结的库存一直占着**；手工 abort 之后才释放。
+
+所以需要第二道防线，定时扫或者在管理台上处理：
+
+```sql
+SELECT gid FROM trans_global
+WHERE trans_type = 'tcc' AND status = 'prepared'
+  AND create_time < extract(epoch from now())::bigint - 600;
+```
+
+十分钟还停在 prepared 的，基本可以判定发起方已经不在了，直接 abort。
+
+## 六、各语言怎么接
 
 ### 远端服务（HTTP / gRPC）
 
@@ -195,7 +298,7 @@ Python / Node / JVM 见 [README 的绑定章节](../README.zh-CN.md#任何语言
 
 > **一个必须知道的约束**：`local://` 分支存的是**名字**（闭包没法持久化），重启后必须注册同名 handler。漏注册会按「结果未知」处理——只重试不回滚，因为这是部署问题不是业务失败。
 
-## 六、自检清单
+## 七、自检清单
 
 上线前对着过一遍：
 
@@ -207,7 +310,10 @@ Python / Node / JVM 见 [README 的绑定章节](../README.zh-CN.md#任何语言
 - [ ] 补偿接口自己也是幂等的（它同样会被重复调用）
 - [ ] 补偿接口能处理「正向分支从没跑过」的情况（空回滚）
 - [ ] 如果用 msg：提供了 `query_prepared` 回查接口，且它能准确回答「本地事务提交了没有」
+- [ ] 如果用 TCC：**先 registerBranch 再调 try**（顺序反了会永久泄漏资源，见第五节）
+- [ ] 如果用 TCC：try 失败**或超时**都要 abort，只有全部明确成功才 submit
 - [ ] 如果用 TCC：`confirm` 能最终成功（它失败时不会触发 cancel，只会无限重试）
+- [ ] 如果用 TCC：监控停在 `prepared` 太久的事务 —— **没有任何自动回收机制**
 
 ## 相关
 
