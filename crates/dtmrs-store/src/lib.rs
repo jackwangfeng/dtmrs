@@ -110,6 +110,9 @@ pub struct TokenRow {
     pub last_ip: String,
     /// 0 表示有效，否则是作废时刻
     pub revoked: i64,
+    /// 令牌明文的**密文**（`nonce||ciphertext` 的十六进制）。
+    /// 空串表示没保存 —— 没配 `DTMRS_TOKEN_KEY` 时就是这样，退化成「只显示一次」
+    pub secret: String,
 }
 
 /// 令牌的哈希。**存哈希不存明文**：库被看到也拿不到能用的凭据。
@@ -298,6 +301,7 @@ impl SqlStore {
               use_count   BIGINT NOT NULL DEFAULT 0,
               last_ip     {ids} NOT NULL DEFAULT '',
               revoked     BIGINT NOT NULL DEFAULT 0,
+              secret      {mid} NOT NULL DEFAULT '',
               PRIMARY KEY (token_hash)
             )"
         ))
@@ -378,15 +382,17 @@ impl SqlStore {
 
     // ---------------- 访问令牌 ----------------
 
-    pub async fn create_token(&self, hash: &str, name: &str) -> Result<()> {
+    pub async fn create_token(&self, hash: &str, name: &str, secret: &str) -> Result<()> {
         len_ok("name", name, MID)?;
+        len_ok("secret", secret, MID)?;
         sqlx::query(&self.be.q(
-            "INSERT INTO auth_token(token_hash,name,create_time,last_used,use_count,last_ip,revoked)
-             VALUES(?,?,?,0,0,'',0)",
+            "INSERT INTO auth_token(token_hash,name,create_time,last_used,use_count,last_ip,revoked,secret)
+             VALUES(?,?,?,0,0,'',0,?)",
         ))
         .bind(hash)
         .bind(name)
         .bind(now())
+        .bind(secret)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -394,7 +400,7 @@ impl SqlStore {
 
     pub async fn list_tokens(&self) -> Result<Vec<TokenRow>> {
         let rows = sqlx::query(&self.be.q(
-            "SELECT token_hash,name,create_time,last_used,use_count,last_ip,revoked
+            "SELECT token_hash,name,create_time,last_used,use_count,last_ip,revoked,secret
              FROM auth_token ORDER BY create_time DESC",
         ))
         .fetch_all(&self.pool)
@@ -778,6 +784,7 @@ fn token_from_row(r: &AnyRow) -> TokenRow {
         use_count: r.get("use_count"),
         last_ip: r.get("last_ip"),
         revoked: r.get("revoked"),
+        secret: r.get("secret"),
     }
 }
 
@@ -1179,11 +1186,11 @@ impl Store {
     // 重复作废返回 false。Redis 侧的令牌 key **不设 TTL** ——
     // 事务是流水可以过期，令牌是配置，过期消失等于凭据莫名失效。
 
-    pub async fn create_token(&self, hash: &str, name: &str) -> Result<()> {
+    pub async fn create_token(&self, hash: &str, name: &str, secret: &str) -> Result<()> {
         match &self.inner {
-            Inner::Sql(s) => s.create_token(hash, name).await,
+            Inner::Sql(s) => s.create_token(hash, name, secret).await,
             #[cfg(feature = "redis")]
-            Inner::Redis(r) => r.create_token(hash, name).await.map_err(redis_err),
+            Inner::Redis(r) => r.create_token(hash, name, secret).await.map_err(redis_err),
         }
     }
 

@@ -88,7 +88,7 @@
   <span class="tk-hint">作废后最长 10 秒生效（各实例各自刷新缓存）</span>
 </div>
 <div id="tknew-box" class="tk-new" style="display:none">
-  <div class="tk-new-t">⚠ 明文只显示这一次，关掉就再也看不到了</div>
+  <div class="tk-new-t">令牌明文（配了 DTMRS_TOKEN_KEY 的话，以后也能在列表里点「复制」取回）</div>
   <code id="tkval"></code>
   <button id="tkcopy">复制</button>
 </div>
@@ -240,8 +240,10 @@ async function loadTokens() {
         '<td>' + t.use_count + '</td>' +
         '<td>' + esc(t.last_ip || '—') + '</td>' +
         '<td>' + (dead ? '已作废 ' + tkTime(t.revoked) : '有效') + '</td>' +
-        '<td>' + (dead ? '' :
-          '<button onclick="revokeToken(\'' + t.id + '\')">作废</button>') + '</td>' +
+        '<td>' +
+          (t.revealable ? '<button onclick="copyToken(\'' + t.id + '\')">复制</button> ' : '') +
+          (dead ? '' : '<button onclick="revokeToken(\'' + t.id + '\')">作废</button>') +
+        '</td>' +
       '</tr>';
     }).join('');
   } catch (e) {
@@ -260,7 +262,7 @@ $('#tknew').onclick = async () => {
   $('#tkval').textContent = j.token;
   $('#tknew-box').style.display = '';
   $('#tkname').value = '';
-  toast('已生成，请立刻保存 —— 明文不会再显示', true);
+  toast('已生成', true);
   loadTokens();
 };
 
@@ -268,6 +270,18 @@ $('#tkcopy').onclick = () => {
   navigator.clipboard.writeText($('#tkval').textContent)
     .then(() => toast('已复制', true), () => toast('复制失败，请手动选中', false));
 };
+
+async function copyToken(id) {
+  const r = await fetch('api/admin/tokens/reveal', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id })
+  });
+  if (!r.ok) { toast(await r.text(), false); return; }
+  const j = await r.json();
+  navigator.clipboard.writeText(j.token)
+    .then(() => toast('已复制到剪贴板', true),
+          () => { $('#tkval').textContent = j.token; $('#tknew-box').style.display = ''; });
+}
 
 async function revokeToken(id) {
   if (!confirm('作废之后用这个令牌的服务会立刻开始收到 401，确定？')) return;

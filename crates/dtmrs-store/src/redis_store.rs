@@ -758,7 +758,7 @@ impl RedisStore {
     // ⚠ 令牌 key **不设 TTL**。事务记录会过期是因为它们是流水；
     // 令牌是配置，过期消失等于凭据莫名失效。
 
-    pub async fn create_token(&self, hash: &str, name: &str) -> Result<()> {
+    pub async fn create_token(&self, hash: &str, name: &str, secret: &str) -> Result<()> {
         let mut c = self.conn.clone();
         let mut pipe = redis::pipe();
         pipe.atomic()
@@ -771,6 +771,7 @@ impl RedisStore {
                     ("use_count", "0".into()),
                     ("last_ip", String::new()),
                     ("revoked", "0".into()),
+                    ("secret", secret.to_string()),
                 ],
             )
             .ignore()
@@ -805,6 +806,7 @@ impl RedisStore {
                 use_count: n("use_count"),
                 last_ip: g("last_ip"),
                 revoked: n("revoked"),
+                secret: g("secret"),
             });
         }
         // 跟 SQL 后端一致：创建时间倒序

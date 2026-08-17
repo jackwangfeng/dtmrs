@@ -151,6 +151,7 @@ pub fn router_with_auth(
         .route("/api/admin/tokens", get(crate::auth::tokens_list))
         .route("/api/admin/tokens/create", post(crate::auth::tokens_create))
         .route("/api/admin/tokens/revoke", post(crate::auth::tokens_revoke))
+        .route("/api/admin/tokens/reveal", post(crate::auth::tokens_reveal))
         .with_state((auth.clone(), store));
     routes(app)
         .merge(auth_routes)

@@ -350,6 +350,8 @@ pub struct TokenView {
     pub use_count: i64,
     pub last_ip: String,
     pub revoked: i64,
+    /// 明文是否保存着（能不能事后复制）
+    pub revealable: bool,
 }
 
 /// 只有会话 cookie 能过 —— 见本节开头的提权说明
@@ -375,6 +377,7 @@ pub async fn tokens_list(
                     use_count: t.use_count,
                     last_ip: t.last_ip,
                     revoked: t.revoked,
+                    revealable: !t.secret.is_empty(),
                 })
                 .collect::<Vec<_>>(),
         )
@@ -413,7 +416,11 @@ pub async fn tokens_create(
     let raw: [u8; 24] = rand::thread_rng().gen();
     let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
 
-    match store.create_token(&dtmrs_store::hash_token(&token), &name).await {
+    let sealed = seal_token(&token);
+    match store
+        .create_token(&dtmrs_store::hash_token(&token), &name, &sealed)
+        .await
+    {
         Ok(()) => {
             auth.invalidate_cache();
             // ⚠ 明文**只在这里返回一次**，库里只有哈希。丢了只能重新生成
@@ -455,5 +462,131 @@ pub async fn tokens_revoke(
             axum::Json(serde_json::json!({ "revoked": done })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+// ==================== 令牌明文的加密存储 ====================
+//
+// # 为什么不是「只存哈希」
+//
+// 只存哈希意味着令牌**只能在生成那一刻看一次**，丢了就得重发并更新所有
+// 用它的服务。但「只显示一次」防的其实**不是能进管理台的人** ——
+// 那个人本来就能生成新令牌，看旧的并没有额外授权。
+//
+// 它真正防的只有一件事：**数据库层面的泄漏**（备份、只读副本、导出的 dump、
+// 共用同一个库的 DBA）。而 TC 存储和业务库共用是很常见的部署。
+//
+// 所以这里两个都要：**密文进库、密钥进配置文件**。
+// dump 出去的库单独没用，而管理台随时能复制。
+//
+// # 密钥来源
+//
+// `DTMRS_TOKEN_KEY`，**没配就退化成「只显示一次」**（secret 存空串）——
+// 已有部署不会因为升级而报错，只是没有「事后复制」这个能力。
+//
+// ⚠ 刻意**不从 `DTMRS_ADMIN_PASSWORD` 派生**：那样改管理台密码就会让
+// 所有令牌解不开，是个很难排查的耦合。
+//
+// # 热路径不解密
+//
+// 校验走的还是哈希（见 `managed_ok`），密文只在管理台点「复制」时才解一次。
+
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
+
+fn token_key() -> Option<LessSafeKey> {
+    let raw = std::env::var("DTMRS_TOKEN_KEY").ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    // 任意长度的口令 → 32 字节密钥
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(raw.as_bytes());
+    let key = h.finalize();
+    UnboundKey::new(&AES_256_GCM, &key).ok().map(LessSafeKey::new)
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    (s.len() % 2 == 0)
+        .then(|| {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+                .collect::<Option<Vec<u8>>>()
+        })
+        .flatten()
+}
+
+/// 加密令牌明文。没配密钥返回空串 —— 调用方据此退化成「只显示一次」
+pub fn seal_token(plain: &str) -> String {
+    let Some(key) = token_key() else {
+        return String::new();
+    };
+    // 每条一个随机 nonce，和密文一起存
+    use rand::Rng;
+    let nonce_bytes: [u8; NONCE_LEN] = rand::thread_rng().gen();
+    let mut buf = plain.as_bytes().to_vec();
+    if key
+        .seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce_bytes),
+            Aad::empty(),
+            &mut buf,
+        )
+        .is_err()
+    {
+        return String::new();
+    }
+    format!("{}{}", hex(&nonce_bytes), hex(&buf))
+}
+
+/// 解开密文。密钥换了、密文损坏、或本来就没存 → `None`
+pub fn open_token(sealed: &str) -> Option<String> {
+    if sealed.is_empty() {
+        return None;
+    }
+    let key = token_key()?;
+    let raw = unhex(sealed)?;
+    if raw.len() <= NONCE_LEN {
+        return None;
+    }
+    let (n, ct) = raw.split_at(NONCE_LEN);
+    let nonce = Nonce::try_assume_unique_for_key(n).ok()?;
+    let mut buf = ct.to_vec();
+    let plain = key.open_in_place(nonce, Aad::empty(), &mut buf).ok()?;
+    String::from_utf8(plain.to_vec()).ok()
+}
+
+/// 管理台点「复制」时用。**只认会话 cookie**，理由同其它令牌管理接口
+pub async fn tokens_reveal(
+    State((auth, store)): State<(Arc<Auth>, dtmrs_store::Store)>,
+    req: Request<Body>,
+) -> Response {
+    if !require_session(&auth, &req) {
+        return (StatusCode::FORBIDDEN, "令牌管理只能在管理台里操作").into_response();
+    }
+    let body = axum::body::to_bytes(req.into_body(), 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let Ok(r) = serde_json::from_slice::<RevokeReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "缺少 id").into_response();
+    };
+    let found = match store.list_tokens().await {
+        Ok(list) => list.into_iter().find(|t| t.token_hash.starts_with(&r.id)),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let Some(t) = found else {
+        return (StatusCode::NOT_FOUND, "没有这个令牌").into_response();
+    };
+    match open_token(&t.secret) {
+        Some(plain) => axum::Json(serde_json::json!({ "token": plain })).into_response(),
+        None => (
+            StatusCode::GONE,
+            "这个令牌的明文没有保存（生成时没配 DTMRS_TOKEN_KEY，或者密钥已更换）",
+        )
+            .into_response(),
     }
 }
