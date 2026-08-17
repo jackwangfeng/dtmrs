@@ -214,3 +214,17 @@ Python / Node / JVM 见 [README 的绑定章节](../README.zh-CN.md#任何语言
 - [五种模式怎么选](choosing-a-mode.md)
 - [部署与运维](deployment.md)
 - [排错](troubleshooting.md)
+
+## 可运行的例子
+
+`examples/java/` 有一套完整的三分支演示，**零依赖、JDK 17+ 直接跑**：
+
+```bash
+DTMRS_URL=http://127.0.0.1:36789 examples/java/run.sh
+```
+
+四个场景各自**断言最终状态数值**（不是只看接口返回码）：saga 全成功、
+业务拒绝触发逆序补偿、超时只重试不回滚、TCC 的登记顺序。
+里面还有「怎么接进 Spring Boot」的样例代码 —— 发起方和分支方各一段。
+
+用其它语言的话，`clients/` 下四个语言的子事务屏障实现都可以直接用。
