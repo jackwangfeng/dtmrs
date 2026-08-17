@@ -36,6 +36,12 @@ use serde::Deserialize;
 const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 const COOKIE: &str = "dtmrs_session";
 
+/// 托管令牌的缓存刷新间隔。**作废最长这么久才生效** ——
+/// 认证在热路径上（几万 QPS），每请求查一次库会让认证开销盖过事务本身。
+///
+/// 多实例部署时每个实例各自刷新，所以延迟是各自独立的、不会叠加。
+const TOKEN_CACHE_TTL: Duration = Duration::from_secs(10);
+
 pub struct Auth {
     /// 管理台登录用。为空表示不提供登录页（只用 token 认证）
     user: String,
@@ -45,6 +51,11 @@ pub struct Auth {
     token: String,
     /// 会话 token -> 过期时刻
     sessions: Mutex<HashMap<String, Instant>>,
+    /// 托管令牌：存储层是权威，这里只是热路径上的缓存。
+    /// `(有效哈希集合, 上次刷新时刻)`
+    managed: Mutex<(std::collections::HashSet<String>, Instant)>,
+    /// 拿托管令牌要用的存储句柄。`None` 表示只用 env 里那个静态 token
+    store: Option<dtmrs_store::Store>,
 }
 
 impl Auth {
@@ -65,7 +76,62 @@ impl Auth {
             password,
             token,
             sessions: Mutex::new(HashMap::new()),
+            // 初始时刻设成很久以前，保证第一次校验必定去刷一遍
+            managed: Mutex::new((
+                std::collections::HashSet::new(),
+                Instant::now() - TOKEN_CACHE_TTL * 2,
+            )),
+            store: None,
         }))
+    }
+
+    /// 接上存储，启用「管理台可增删的托管令牌」。
+    /// 不接的话只有 `DTMRS_AUTH_TOKEN` 那个静态令牌有效
+    pub fn with_store(mut self: Arc<Self>, store: dtmrs_store::Store) -> Arc<Self> {
+        // 刚构造出来还没共享，这里一定能拿到独占引用
+        if let Some(me) = Arc::get_mut(&mut self) {
+            me.store = Some(store);
+        }
+        self
+    }
+
+    /// 校验托管令牌。缓存过期就先刷一遍。
+    ///
+    /// 命中之后**顺手记一次使用**（异步 spawn，失败只吞掉）——
+    /// 统计信息不值得让一次正常的业务调用失败或变慢。
+    pub async fn managed_ok(&self, presented: &str, ip: &str) -> bool {
+        let Some(store) = self.store.clone() else {
+            return false;
+        };
+        let hash = dtmrs_store::hash_token(presented);
+
+        let need_refresh = {
+            let g = self.managed.lock().unwrap();
+            g.1.elapsed() >= TOKEN_CACHE_TTL
+        };
+        if need_refresh {
+            if let Ok(list) = store.active_token_hashes().await {
+                let mut g = self.managed.lock().unwrap();
+                *g = (list.into_iter().collect(), Instant::now());
+            }
+        }
+        let hit = {
+            let g = self.managed.lock().unwrap();
+            g.0.contains(&hash)
+        };
+        if hit {
+            let (s, h, ip) = (store, hash.clone(), ip.to_string());
+            tokio::spawn(async move {
+                let _ = s.touch_token(&h, &ip).await;
+            });
+        }
+        hit
+    }
+
+    /// 作废之后立刻让缓存失效，省得等最多 10 秒
+    pub fn invalidate_cache(&self) {
+        let mut g = self.managed.lock().unwrap();
+        g.1 = Instant::now() - TOKEN_CACHE_TTL * 2;
     }
 
     /// 配了密码才提供登录页
@@ -139,6 +205,17 @@ impl Auth {
     }
 }
 
+/// 取调用方 IP。走反代时真实 IP 在 `X-Forwarded-For` 的第一段；
+/// **不能信任它做安全判断**，这里只用于展示「最近谁在用这个令牌」
+fn client_ip(req: &Request<Body>) -> String {
+    req.headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
 fn cookie_of(req: &Request<Body>) -> Option<String> {
     req.headers()
         .get(header::COOKIE)?
@@ -174,14 +251,22 @@ pub async fn guard(
         return next.run(req).await;
     }
     // 业务端：Authorization: Bearer <token>
-    if req
+    let presented = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(Auth::bearer)
-        .is_some_and(|t| auth.token_ok(t))
-    {
-        return next.run(req).await;
+        .map(str::to_string);
+    if let Some(t) = &presented {
+        // 先比 env 里的静态令牌（引导用，不查库）
+        if auth.token_ok(t) {
+            return next.run(req).await;
+        }
+        // 再看管理台发的托管令牌（走 10 秒 TTL 缓存，不是每次查库）
+        let ip = client_ip(&req);
+        if auth.managed_ok(t, &ip).await {
+            return next.run(req).await;
+        }
     }
     // 浏览器：会话 cookie
     if cookie_of(&req).is_some_and(|t| auth.valid(&t)) {
@@ -246,4 +331,129 @@ pub async fn logout(State(auth): State<Arc<Auth>>, req: Request<Body>) -> Respon
         Redirect::to("/login"),
     )
         .into_response()
+}
+
+// ==================== 令牌管理接口 ====================
+//
+// ⚠ 这几个接口**只给管理台用**，必须走会话 cookie。
+// 允许用 token 去增删 token 会形成提权链：一个泄漏的业务令牌可以自己
+// 再签发一批，作废原来那个也没用。所以这里额外要求「必须是会话登录」。
+
+#[derive(serde::Serialize)]
+pub struct TokenView {
+    /// 只回哈希的前 12 位，够用来在列表里认人，又不至于把完整哈希摊出去
+    pub id: String,
+    pub name: String,
+    pub create_time: i64,
+    /// 0 = 从没用过
+    pub last_used: i64,
+    pub use_count: i64,
+    pub last_ip: String,
+    pub revoked: i64,
+}
+
+/// 只有会话 cookie 能过 —— 见本节开头的提权说明
+fn require_session(auth: &Auth, req: &Request<Body>) -> bool {
+    cookie_of(req).is_some_and(|t| auth.valid(&t))
+}
+
+pub async fn tokens_list(
+    State((auth, store)): State<(Arc<Auth>, dtmrs_store::Store)>,
+    req: Request<Body>,
+) -> Response {
+    if !require_session(&auth, &req) {
+        return (StatusCode::FORBIDDEN, "令牌管理只能在管理台里操作").into_response();
+    }
+    match store.list_tokens().await {
+        Ok(list) => axum::Json(
+            list.into_iter()
+                .map(|t| TokenView {
+                    id: t.token_hash.chars().take(12).collect(),
+                    name: t.name,
+                    create_time: t.create_time,
+                    last_used: t.last_used,
+                    use_count: t.use_count,
+                    last_ip: t.last_ip,
+                    revoked: t.revoked,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateTokenReq {
+    #[serde(default)]
+    pub name: String,
+}
+
+pub async fn tokens_create(
+    State((auth, store)): State<(Arc<Auth>, dtmrs_store::Store)>,
+    req: Request<Body>,
+) -> Response {
+    if !require_session(&auth, &req) {
+        return (StatusCode::FORBIDDEN, "令牌管理只能在管理台里操作").into_response();
+    }
+    let body = axum::body::to_bytes(req.into_body(), 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let name = serde_json::from_slice::<CreateTokenReq>(&body)
+        .map(|r| r.name)
+        .unwrap_or_default();
+    let name = if name.trim().is_empty() {
+        "未命名".to_string()
+    } else {
+        name.trim().to_string()
+    };
+
+    // 24 字节 = 192 位熵，爆破不可行
+    use rand::Rng;
+    let raw: [u8; 24] = rand::thread_rng().gen();
+    let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+
+    match store.create_token(&dtmrs_store::hash_token(&token), &name).await {
+        Ok(()) => {
+            auth.invalidate_cache();
+            // ⚠ 明文**只在这里返回一次**，库里只有哈希。丢了只能重新生成
+            axum::Json(serde_json::json!({ "token": token, "name": name })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RevokeReq {
+    pub id: String,
+}
+
+pub async fn tokens_revoke(
+    State((auth, store)): State<(Arc<Auth>, dtmrs_store::Store)>,
+    req: Request<Body>,
+) -> Response {
+    if !require_session(&auth, &req) {
+        return (StatusCode::FORBIDDEN, "令牌管理只能在管理台里操作").into_response();
+    }
+    let body = axum::body::to_bytes(req.into_body(), 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let Ok(r) = serde_json::from_slice::<RevokeReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "缺少 id").into_response();
+    };
+    // 前端拿到的是哈希前缀，这里要还原成完整哈希
+    let full = match store.list_tokens().await {
+        Ok(list) => list.into_iter().find(|t| t.token_hash.starts_with(&r.id)),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let Some(t) = full else {
+        return (StatusCode::NOT_FOUND, "没有这个令牌").into_response();
+    };
+    match store.revoke_token(&t.token_hash).await {
+        Ok(done) => {
+            auth.invalidate_cache(); // 立刻生效，不用等 10 秒
+            axum::Json(serde_json::json!({ "revoked": done })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }

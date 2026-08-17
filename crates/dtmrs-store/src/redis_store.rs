@@ -32,7 +32,7 @@
 //!
 //! 多个 TC 实例抢同一笔事务时，Redis 侧不需要行锁也不会重复推进。
 
-use crate::{BranchRow, GlobalRow, SubmitOutcome, MID};
+use crate::{TokenRow, BranchRow, GlobalRow, SubmitOutcome, MID};
 use dtmrs_core::dialect::check_len;
 use dtmrs_core::{Backend, BranchOp, BranchStatus, GlobalStatus, TransType};
 use redis::aio::MultiplexedConnection;
@@ -117,6 +117,14 @@ impl RedisStore {
     /// 最近事务的索引，score = create_time
     fn akey(&self) -> String {
         format!("{}all", self.prefix)
+    }
+    /// 一个访问令牌一个 hash：`tok:{sha256}`
+    fn tkey(&self, hash: &str) -> String {
+        format!("{}tok:{}", self.prefix, hash)
+    }
+    /// 令牌索引（set），用来列举 —— Redis 上不能像 SQL 那样 SELECT *
+    fn tidx(&self) -> String {
+        format!("{}tokens", self.prefix)
     }
 
     /// 分支在 hash 里的字段名。用 `\x1f`（单元分隔符）拼，
@@ -742,6 +750,111 @@ impl RedisStore {
     }
 
     /// 清空这个前缀下的全部数据。**只给测试用。**
+    // ---------------- 访问令牌 ----------------
+    //
+    // 语义必须跟 SQL 后端逐条一致：作废是**打标记不删**（管理台要能看到
+    // 「什么时候被作废的」），列举按创建时间倒序。
+    //
+    // ⚠ 令牌 key **不设 TTL**。事务记录会过期是因为它们是流水；
+    // 令牌是配置，过期消失等于凭据莫名失效。
+
+    pub async fn create_token(&self, hash: &str, name: &str) -> Result<()> {
+        let mut c = self.conn.clone();
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            .hset_multiple(
+                self.tkey(hash),
+                &[
+                    ("name", name.to_string()),
+                    ("create_time", crate::now().to_string()),
+                    ("last_used", "0".into()),
+                    ("use_count", "0".into()),
+                    ("last_ip", String::new()),
+                    ("revoked", "0".into()),
+                ],
+            )
+            .ignore()
+            .sadd(self.tidx(), hash)
+            .ignore();
+        pipe.query_async::<()>(&mut c).await?;
+        Ok(())
+    }
+
+    pub async fn list_tokens(&self) -> Result<Vec<TokenRow>> {
+        let mut c = self.conn.clone();
+        let hashes: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(self.tidx())
+            .query_async(&mut c)
+            .await?;
+        let mut out = Vec::with_capacity(hashes.len());
+        for h in hashes {
+            let m: std::collections::HashMap<String, String> = redis::cmd("HGETALL")
+                .arg(self.tkey(&h))
+                .query_async(&mut c)
+                .await?;
+            if m.is_empty() {
+                continue;
+            }
+            let g = |k: &str| m.get(k).cloned().unwrap_or_default();
+            let n = |k: &str| g(k).parse::<i64>().unwrap_or(0);
+            out.push(TokenRow {
+                token_hash: h,
+                name: g("name"),
+                create_time: n("create_time"),
+                last_used: n("last_used"),
+                use_count: n("use_count"),
+                last_ip: g("last_ip"),
+                revoked: n("revoked"),
+            });
+        }
+        // 跟 SQL 后端一致：创建时间倒序
+        out.sort_by(|a, b| b.create_time.cmp(&a.create_time));
+        Ok(out)
+    }
+
+    pub async fn revoke_token(&self, hash: &str) -> Result<bool> {
+        let mut c = self.conn.clone();
+        // 只有当前是有效状态才算作废成功 —— 跟 SQL 的 `AND revoked=0` 对齐
+        let script = redis::Script::new(
+            r#"
+            if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+            if redis.call('HGET', KEYS[1], 'revoked') ~= '0' then return 0 end
+            redis.call('HSET', KEYS[1], 'revoked', ARGV[1])
+            return 1
+            "#,
+        );
+        let n: i64 = script
+            .key(self.tkey(hash))
+            .arg(crate::now())
+            .invoke_async(&mut c)
+            .await?;
+        Ok(n == 1)
+    }
+
+    pub async fn active_token_hashes(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_tokens()
+            .await?
+            .into_iter()
+            .filter(|t| t.revoked == 0)
+            .map(|t| t.token_hash)
+            .collect())
+    }
+
+    pub async fn touch_token(&self, hash: &str, ip: &str) -> Result<()> {
+        let mut c = self.conn.clone();
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            .hset(self.tkey(hash), "last_used", crate::now())
+            .ignore()
+            .hincr(self.tkey(hash), "use_count", 1)
+            .ignore()
+            .hset(self.tkey(hash), "last_ip", ip)
+            .ignore();
+        pipe.query_async::<()>(&mut c).await?;
+        Ok(())
+    }
+
     pub async fn flush_prefix(&self) -> Result<()> {
         let mut c = self.conn.clone();
         let keys: Vec<String> = c.keys(format!("{}*", self.prefix)).await?;

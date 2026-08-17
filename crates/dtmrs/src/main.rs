@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(1000);
 
     let store = Store::open(&db).await?;
+    let store_for_auth = store.clone();
     // 按环境变量配超时/租约/退避，非法值退回默认
     let driver = Driver::from_env(store.clone(), owner.clone());
     info!(db = %db, http = %addr, grpc = %grpc_addr, owner = %owner,
@@ -65,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     // gRPC 和 HTTP 各占一个端口，任一个挂了就整体退出 —— 不能出现
     // 「HTTP 还活着但 gRPC 已经死了」这种半可用状态，那会让客户端困惑
     // ⚠ 两个协议层**必须共用同一个 Auth** —— 各构造一个就会漂移
-    let auth = dtmrs::server::auth::Auth::from_env();
+    let auth = dtmrs::server::auth::Auth::from_env().map(|a| a.with_store(store_for_auth.clone()));
     if let Some(a) = &auth {
         info!(
             登录页 = a.has_login(),
@@ -73,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let grpc = serve_grpc(api.clone(), grpc_addr, auth.clone());
-    let http = serve_http(api, addr, auth);
+    let http = serve_http(api, addr, auth, store_for_auth);
     tokio::select! {
         r = grpc => r?,
         r = http => r?,
@@ -85,6 +86,7 @@ async fn serve_http(
     api: Api,
     addr: String,
     auth: Option<std::sync::Arc<dtmrs::server::auth::Auth>>,
+    store: dtmrs::Store,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let app = App::new(api);
@@ -93,7 +95,7 @@ async fn serve_http(
     // ⚠ 但监听地址不是回环还不设密码，等于把 abort / retry / submit 敞给外面，
     //   这种情况必须吼一嗓子 —— 静默放行是最糟的默认值。
     let router = match auth {
-        Some(auth) => dtmrs::server::http::router_with_auth(app, auth),
+        Some(auth) => dtmrs::server::http::router_with_auth(app, auth, store),
         None => {
             let public = !addr.starts_with("127.") && !addr.starts_with("localhost");
             if public {

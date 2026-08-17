@@ -48,6 +48,13 @@
   .msg.show { display:block }
   .msg.good { background:rgba(10,124,63,.12); color:var(--ok) }
   .msg.bad { background:rgba(192,54,44,.12); color:var(--fail) }
+  .tk-h { margin:34px 0 10px; font-size:17px; font-weight:600 }
+  .tk-hint { font-size:12px; font-weight:400; color:var(--dim) }
+  .tk-new { margin:10px 0; padding:12px 14px; border-radius:8px;
+            background:rgba(56,189,248,.10); border:1px solid rgba(56,189,248,.35) }
+  .tk-new-t { font-size:12px; margin-bottom:7px; color:var(--dim) }
+  .tk-new code { font-size:13px; word-break:break-all; user-select:all }
+  .tk-dead { color:var(--dim); text-decoration:line-through }
 </style>
 
 <h1>dtmrs 管理台</h1>
@@ -71,6 +78,26 @@
       <th>gid</th><th>类型</th><th>状态</th><th>创建</th><th>耗时</th><th>操作</th>
     </tr></thead>
     <tbody id="rows"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+  </table>
+</div>
+
+<h2 class="tk-h">访问令牌 <span class="tk-hint">业务端调 TC 用：<code>Authorization: Bearer &lt;token&gt;</code></span></h2>
+<div class="bar">
+  <input id="tkname" placeholder="给这个令牌起个名（比如 order-service）" size="34">
+  <button id="tknew">生成</button>
+  <span class="tk-hint">作废后最长 10 秒生效（各实例各自刷新缓存）</span>
+</div>
+<div id="tknew-box" class="tk-new" style="display:none">
+  <div class="tk-new-t">⚠ 明文只显示这一次，关掉就再也看不到了</div>
+  <code id="tkval"></code>
+  <button id="tkcopy">复制</button>
+</div>
+<div class="wrap">
+  <table>
+    <thead><tr>
+      <th>名字</th><th>ID</th><th>创建</th><th>最后使用</th><th>调用次数</th><th>最近来源</th><th>状态</th><th>操作</th>
+    </tr></thead>
+    <tbody id="tkrows"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
   </table>
 </div>
 
@@ -187,5 +214,71 @@ $('#auto').onchange = e => {
   clearInterval(timer);
   if (e.target.checked) timer = setInterval(load, 3000);
 };
+// ---------------- 访问令牌 ----------------
+const tkTime = t => t ? new Date(t * 1000).toLocaleString() : '—';
+
+async function loadTokens() {
+  try {
+    const r = await fetch('api/admin/tokens');
+    if (!r.ok) {
+      $('#tkrows').innerHTML = '<tr><td colspan="8" class="empty">' +
+        (r.status === 403 ? '令牌管理只能在管理台里操作' : '读取失败') + '</td></tr>';
+      return;
+    }
+    const list = await r.json();
+    if (!list.length) {
+      $('#tkrows').innerHTML = '<tr><td colspan="8" class="empty">还没有令牌</td></tr>';
+      return;
+    }
+    $('#tkrows').innerHTML = list.map(t => {
+      const dead = t.revoked !== 0;
+      return '<tr' + (dead ? ' class="tk-dead"' : '') + '>' +
+        '<td>' + esc(t.name) + '</td>' +
+        '<td><code>' + esc(t.id) + '</code></td>' +
+        '<td>' + tkTime(t.create_time) + '</td>' +
+        '<td>' + tkTime(t.last_used) + '</td>' +
+        '<td>' + t.use_count + '</td>' +
+        '<td>' + esc(t.last_ip || '—') + '</td>' +
+        '<td>' + (dead ? '已作废 ' + tkTime(t.revoked) : '有效') + '</td>' +
+        '<td>' + (dead ? '' :
+          '<button onclick="revokeToken(\'' + t.id + '\')">作废</button>') + '</td>' +
+      '</tr>';
+    }).join('');
+  } catch (e) {
+    $('#tkrows').innerHTML = '<tr><td colspan="8" class="empty">' + esc(e.message) + '</td></tr>';
+  }
+}
+
+$('#tknew').onclick = async () => {
+  const name = $('#tkname').value.trim();
+  const r = await fetch('api/admin/tokens/create', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name })
+  });
+  if (!r.ok) { toast('生成失败：' + await r.text(), false); return; }
+  const j = await r.json();
+  $('#tkval').textContent = j.token;
+  $('#tknew-box').style.display = '';
+  $('#tkname').value = '';
+  toast('已生成，请立刻保存 —— 明文不会再显示', true);
+  loadTokens();
+};
+
+$('#tkcopy').onclick = () => {
+  navigator.clipboard.writeText($('#tkval').textContent)
+    .then(() => toast('已复制', true), () => toast('复制失败，请手动选中', false));
+};
+
+async function revokeToken(id) {
+  if (!confirm('作废之后用这个令牌的服务会立刻开始收到 401，确定？')) return;
+  const r = await fetch('api/admin/tokens/revoke', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id })
+  });
+  toast(r.ok ? '已作废' : ('失败：' + await r.text()), r.ok);
+  loadTokens();
+}
+
 load();
+loadTokens();
 </script>

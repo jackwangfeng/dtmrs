@@ -95,6 +95,35 @@ pub struct BranchRow {
     pub status: BranchStatus,
 }
 
+
+/// 访问令牌的展示信息。**不含明文** —— 明文只在生成那一刻返回一次
+#[derive(Debug, Clone)]
+pub struct TokenRow {
+    /// SHA-256 十六进制，同时是主键
+    pub token_hash: String,
+    /// 人给的名字，用来认出「这个 token 是给谁的」
+    pub name: String,
+    pub create_time: i64,
+    /// 0 表示从没被用过
+    pub last_used: i64,
+    pub use_count: i64,
+    pub last_ip: String,
+    /// 0 表示有效，否则是作废时刻
+    pub revoked: i64,
+}
+
+/// 令牌的哈希。**存哈希不存明文**：库被看到也拿不到能用的凭据。
+///
+/// 这里刻意用朴素的 SHA-256 而不是 bcrypt/argon2 —— 那些是给**低熵的人类密码**
+/// 用的，慢是特性。这里的令牌是 24 字节随机数（192 位熵），爆破不可行，
+/// 而认证在热路径上，每请求跑一次 argon2 会直接毁掉吞吐。
+pub fn hash_token(raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(raw.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[derive(Clone)]
 pub struct SqlStore {
     pool: AnyPool,
@@ -258,6 +287,22 @@ impl SqlStore {
         ))
         .execute(&self.pool)
         .await?;
+        // 业务端的访问令牌。**存 SHA-256 不存明文** —— 库被看到也拿不到能用的凭据，
+        // 明文只在生成那一刻返回给用户一次
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS auth_token (
+              token_hash  {idt} NOT NULL,
+              name        {ids} NOT NULL,
+              create_time BIGINT NOT NULL,
+              last_used   BIGINT NOT NULL DEFAULT 0,
+              use_count   BIGINT NOT NULL DEFAULT 0,
+              last_ip     {ids} NOT NULL DEFAULT '',
+              revoked     BIGINT NOT NULL DEFAULT 0,
+              PRIMARY KEY (token_hash)
+            )"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -329,6 +374,71 @@ impl SqlStore {
         }
         tx.commit().await?;
         Ok(true)
+    }
+
+    // ---------------- 访问令牌 ----------------
+
+    pub async fn create_token(&self, hash: &str, name: &str) -> Result<()> {
+        len_ok("name", name, MID)?;
+        sqlx::query(&self.be.q(
+            "INSERT INTO auth_token(token_hash,name,create_time,last_used,use_count,last_ip,revoked)
+             VALUES(?,?,?,0,0,'',0)",
+        ))
+        .bind(hash)
+        .bind(name)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_tokens(&self) -> Result<Vec<TokenRow>> {
+        let rows = sqlx::query(&self.be.q(
+            "SELECT token_hash,name,create_time,last_used,use_count,last_ip,revoked
+             FROM auth_token ORDER BY create_time DESC",
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(token_from_row).collect())
+    }
+
+    /// 作废。**不删行** —— 留着才能在管理台看到「这个 token 什么时候被谁作废的」
+    pub async fn revoke_token(&self, hash: &str) -> Result<bool> {
+        let r = sqlx::query(
+            &self
+                .be
+                .q("UPDATE auth_token SET revoked=? WHERE token_hash=? AND revoked=0"),
+        )
+        .bind(now())
+        .bind(hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// 当前有效的令牌哈希。认证的热路径**不查这个** —— 上层按 TTL 缓存，
+    /// 见 `dtmrs_server::auth`
+    pub async fn active_token_hashes(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(&self.be.q(
+            "SELECT token_hash FROM auth_token WHERE revoked=0",
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("token_hash")).collect())
+    }
+
+    /// 记一次使用。**尽力而为**：失败只吞掉不影响请求 ——
+    /// 统计信息不值得让一次正常的业务调用失败
+    pub async fn touch_token(&self, hash: &str, ip: &str) -> Result<()> {
+        sqlx::query(&self.be.q(
+            "UPDATE auth_token SET last_used=?, use_count=use_count+1, last_ip=? WHERE token_hash=?",
+        ))
+        .bind(now())
+        .bind(ip)
+        .bind(hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn get_global(&self, gid: &str) -> Result<Option<GlobalRow>> {
@@ -658,6 +768,18 @@ impl SqlStore {
 const SELECT_GLOBAL: &str = "SELECT gid,trans_type,status,payload,next_cron_time,
     next_cron_interval,owner,rollback_reason,query_prepared,create_time,finish_time
     FROM trans_global";
+
+fn token_from_row(r: &AnyRow) -> TokenRow {
+    TokenRow {
+        token_hash: r.get("token_hash"),
+        name: r.get("name"),
+        create_time: r.get("create_time"),
+        last_used: r.get("last_used"),
+        use_count: r.get("use_count"),
+        last_ip: r.get("last_ip"),
+        revoked: r.get("revoked"),
+    }
+}
 
 fn global_from_row(r: AnyRow) -> GlobalRow {
     GlobalRow {
@@ -1049,6 +1171,52 @@ impl Store {
         Ok(Self {
             inner: Inner::Sql(SqlStore::open(url).await?),
         })
+    }
+
+    // ---------------- 访问令牌 ----------------
+    //
+    // 两个后端的语义必须逐条一致：作废是打标记不删、列举按创建时间倒序、
+    // 重复作废返回 false。Redis 侧的令牌 key **不设 TTL** ——
+    // 事务是流水可以过期，令牌是配置，过期消失等于凭据莫名失效。
+
+    pub async fn create_token(&self, hash: &str, name: &str) -> Result<()> {
+        match &self.inner {
+            Inner::Sql(s) => s.create_token(hash, name).await,
+            #[cfg(feature = "redis")]
+            Inner::Redis(r) => r.create_token(hash, name).await.map_err(redis_err),
+        }
+    }
+
+    pub async fn list_tokens(&self) -> Result<Vec<TokenRow>> {
+        match &self.inner {
+            Inner::Sql(s) => s.list_tokens().await,
+            #[cfg(feature = "redis")]
+            Inner::Redis(r) => r.list_tokens().await.map_err(redis_err),
+        }
+    }
+
+    pub async fn revoke_token(&self, hash: &str) -> Result<bool> {
+        match &self.inner {
+            Inner::Sql(s) => s.revoke_token(hash).await,
+            #[cfg(feature = "redis")]
+            Inner::Redis(r) => r.revoke_token(hash).await.map_err(redis_err),
+        }
+    }
+
+    pub async fn active_token_hashes(&self) -> Result<Vec<String>> {
+        match &self.inner {
+            Inner::Sql(s) => s.active_token_hashes().await,
+            #[cfg(feature = "redis")]
+            Inner::Redis(r) => r.active_token_hashes().await.map_err(redis_err),
+        }
+    }
+
+    pub async fn touch_token(&self, hash: &str, ip: &str) -> Result<()> {
+        match &self.inner {
+            Inner::Sql(s) => s.touch_token(hash, ip).await,
+            #[cfg(feature = "redis")]
+            Inner::Redis(r) => r.touch_token(hash, ip).await.map_err(redis_err),
+        }
     }
 
     /// 底层是不是 Redis

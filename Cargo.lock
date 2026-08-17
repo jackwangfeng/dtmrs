@@ -429,6 +429,7 @@ dependencies = [
  "dtmrs-core",
  "redis",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
 ]

@@ -132,10 +132,14 @@ pub fn router(app: App) -> Router {
 /// ⚠ 中间件是**全局**的，不是只挡管理台页面 —— 真正危险的是它调的那些接口
 /// （abort 能中止在途事务、retry 能改调度、submit 能凭空造事务）。
 /// 白名单只有 `/health`（反代健康检查）和 `/login` `/logout`。
-pub fn router_with_auth(app: App, auth: std::sync::Arc<crate::auth::Auth>) -> Router {
+pub fn router_with_auth(
+    app: App,
+    auth: std::sync::Arc<crate::auth::Auth>,
+    store: dtmrs_store::Store,
+) -> Router {
     use axum::middleware;
-    // 登录路由自带 Arc<Auth> 状态，业务路由自带 App 状态 —— 各自
-    // with_state 收敛成 Router<()> 之后再 merge，最后统一挂中间件
+    // 三组路由三种状态：业务路由用 App、登录用 Arc<Auth>、令牌管理两个都要。
+    // 各自 with_state 收敛成 Router<()> 之后再 merge，最后统一挂中间件
     let auth_routes = Router::new()
         .route(
             "/login",
@@ -143,8 +147,14 @@ pub fn router_with_auth(app: App, auth: std::sync::Arc<crate::auth::Auth>) -> Ro
         )
         .route("/logout", post(crate::auth::logout))
         .with_state(auth.clone());
+    let token_routes = Router::new()
+        .route("/api/admin/tokens", get(crate::auth::tokens_list))
+        .route("/api/admin/tokens/create", post(crate::auth::tokens_create))
+        .route("/api/admin/tokens/revoke", post(crate::auth::tokens_revoke))
+        .with_state((auth.clone(), store));
     routes(app)
         .merge(auth_routes)
+        .merge(token_routes)
         .layer(middleware::from_fn_with_state(auth, crate::auth::guard))
 }
 

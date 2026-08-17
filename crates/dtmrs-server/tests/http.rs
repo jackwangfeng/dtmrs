@@ -337,11 +337,11 @@ mod 认证 {
         a
     }
 
-    async fn spawn_http_auth(api: Api, a: Arc<Auth>) -> String {
+    async fn spawn_http_auth(api: Api, a: Arc<Auth>, st: Store) -> String {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(l, dtmrs_server::http::router_with_auth(App::new(api), a)).await
+            axum::serve(l, dtmrs_server::http::router_with_auth(App::new(api), a, st)).await
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         format!("http://{addr}")
@@ -364,7 +364,7 @@ mod 认证 {
     async fn 两边带token(token: Option<&str>) -> (bool, bool) {
         let st = store().await;
         let a = auth();
-        let h = spawn_http_auth(Api::new(st.clone()), a.clone()).await;
+        let h = spawn_http_auth(Api::new(st.clone()), a.clone(), st.clone()).await;
         let g = spawn_grpc_auth(Api::new(st.clone()), a.clone()).await;
 
         let mut rb = reqwest::Client::new().get(format!("{h}/api/dtmsvr/newGid"));
