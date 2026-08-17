@@ -35,6 +35,34 @@ impl TcService {
     pub fn into_server(self) -> pb::tc_server::TcServer<Self> {
         pb::tc_server::TcServer::new(self)
     }
+
+    /// 带认证的版本。**必须和 HTTP 侧用同一个 `Auth`**，否则就出现
+    /// 「同一个请求走 HTTP 被拒、走 gRPC 却受理了」—— 这正是
+    /// 「绝对不能破坏的语义」里防的那种漂移。
+    ///
+    /// gRPC 没有 cookie 和登录页的概念，所以这里**只认 Bearer token**
+    /// （metadata 的 `authorization` 键）。管理台的会话 cookie 只在 HTTP 侧有意义。
+    pub fn into_server_with_auth(
+        self,
+        auth: std::sync::Arc<crate::auth::Auth>,
+    ) -> tonic::service::interceptor::InterceptedService<
+        pb::tc_server::TcServer<Self>,
+        impl tonic::service::Interceptor + Clone,
+    > {
+        pb::tc_server::TcServer::with_interceptor(self, move |req: tonic::Request<()>| {
+            let ok = req
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::auth::Auth::bearer)
+                .is_some_and(|t| auth.token_ok(t));
+            if ok {
+                Ok(req)
+            } else {
+                Err(tonic::Status::unauthenticated("需要 Bearer token"))
+            }
+        })
+    }
 }
 
 #[tonic::async_trait]

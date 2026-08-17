@@ -64,8 +64,16 @@ async fn main() -> anyhow::Result<()> {
 
     // gRPC 和 HTTP 各占一个端口，任一个挂了就整体退出 —— 不能出现
     // 「HTTP 还活着但 gRPC 已经死了」这种半可用状态，那会让客户端困惑
-    let grpc = serve_grpc(api.clone(), grpc_addr);
-    let http = serve_http(api, addr);
+    // ⚠ 两个协议层**必须共用同一个 Auth** —— 各构造一个就会漂移
+    let auth = dtmrs::server::auth::Auth::from_env();
+    if let Some(a) = &auth {
+        info!(
+            登录页 = a.has_login(),
+            "认证已开启（业务端用 Authorization: Bearer <DTMRS_AUTH_TOKEN>）"
+        );
+    }
+    let grpc = serve_grpc(api.clone(), grpc_addr, auth.clone());
+    let http = serve_http(api, addr, auth);
     tokio::select! {
         r = grpc => r?,
         r = http => r?,
@@ -73,26 +81,27 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn serve_http(api: Api, addr: String) -> anyhow::Result<()> {
+async fn serve_http(
+    api: Api,
+    addr: String,
+    auth: Option<std::sync::Arc<dtmrs::server::auth::Auth>>,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let app = App::new(api);
 
     // 配了 DTMRS_ADMIN_PASSWORD 才开登录保护；没配保持原样（本地开发用）。
     // ⚠ 但监听地址不是回环还不设密码，等于把 abort / retry / submit 敞给外面，
     //   这种情况必须吼一嗓子 —— 静默放行是最糟的默认值。
-    let router = match dtmrs::server::auth::Auth::from_env() {
-        Some(auth) => {
-            let user = std::env::var("DTMRS_ADMIN_USER").unwrap_or_else(|_| "admin".into());
-            info!(user = %user, "管理台已开启登录保护");
-            dtmrs::server::http::router_with_auth(app, auth)
-        }
+    let router = match auth {
+        Some(auth) => dtmrs::server::http::router_with_auth(app, auth),
         None => {
             let public = !addr.starts_with("127.") && !addr.starts_with("localhost");
             if public {
                 tracing::warn!(
                     %addr,
-                    "⚠ 监听在非回环地址但没设 DTMRS_ADMIN_PASSWORD —— \
-                     管理台和全部接口（含 abort/retry/submit）对任何能连上的人开放"
+                    "⚠ 监听在非回环地址但既没设 DTMRS_AUTH_TOKEN 也没设 \
+                     DTMRS_ADMIN_PASSWORD —— 管理台和全部接口（含 abort/retry/submit）\
+                     对任何能连上的人开放"
                 );
             }
             router(app)
@@ -103,18 +112,38 @@ async fn serve_http(api: Api, addr: String) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "grpc")]
-async fn serve_grpc(api: Api, addr: String) -> anyhow::Result<()> {
+async fn serve_grpc(
+    api: Api,
+    addr: String,
+    auth: Option<std::sync::Arc<dtmrs::server::auth::Auth>>,
+) -> anyhow::Result<()> {
     use dtmrs::server::grpc::server::TcService;
     let sock = addr.parse()?;
-    tonic::transport::Server::builder()
-        .add_service(TcService::new(api).into_server())
-        .serve(sock)
-        .await?;
+    let svc = TcService::new(api);
+    // gRPC 没有 cookie/登录页，只认 Bearer token。**必须跟 HTTP 用同一个 Auth**
+    match auth {
+        Some(a) => {
+            tonic::transport::Server::builder()
+                .add_service(svc.into_server_with_auth(a))
+                .serve(sock)
+                .await?
+        }
+        None => {
+            tonic::transport::Server::builder()
+                .add_service(svc.into_server())
+                .serve(sock)
+                .await?
+        }
+    }
     Ok(())
 }
 
 #[cfg(not(feature = "grpc"))]
-async fn serve_grpc(_api: Api, _addr: String) -> anyhow::Result<()> {
+async fn serve_grpc(
+    _api: Api,
+    _addr: String,
+    _auth: Option<std::sync::Arc<dtmrs::server::auth::Auth>>,
+) -> anyhow::Result<()> {
     // 关掉 grpc feature 的构建里，这个 future 永远挂着，让 select! 只跑 HTTP
     std::future::pending::<()>().await;
     Ok(())

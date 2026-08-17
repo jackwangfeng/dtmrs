@@ -308,3 +308,97 @@ mod 等价 {
         }
     }
 }
+
+// ==================== 认证 ====================
+//
+// ⚠ 认证做在中间件/拦截器层，**在 api.rs 之外**，所以上面那组等价性测试
+// 覆盖不到它。这正是它出过事的地方：0.5.0 给 HTTP 加了全局认证却漏了 gRPC，
+// 于是「同一个请求走 HTTP 被拒、走 gRPC 却受理了」—— 恰好是
+// 「绝对不能破坏的语义」第 2 条防的那种漂移。
+
+#[cfg(feature = "grpc")]
+mod 认证 {
+    use super::*;
+    use dtmrs_server::auth::Auth;
+    use dtmrs_server::grpc::pb;
+    use dtmrs_server::grpc::server::TcService;
+    use std::sync::Arc;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    const TOKEN: &str = "test-token-9f3a";
+
+    fn auth() -> Arc<Auth> {
+        // from_env 读进程环境，测试里并行跑会互相污染，所以直接构造
+        std::env::set_var("DTMRS_AUTH_TOKEN", TOKEN);
+        std::env::set_var("DTMRS_ADMIN_PASSWORD", "pw-for-test");
+        let a = Auth::from_env().expect("配了 token 应该启用");
+        std::env::remove_var("DTMRS_AUTH_TOKEN");
+        std::env::remove_var("DTMRS_ADMIN_PASSWORD");
+        a
+    }
+
+    async fn spawn_http_auth(api: Api, a: Arc<Auth>) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(l, dtmrs_server::http::router_with_auth(App::new(api), a)).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        format!("http://{addr}")
+    }
+
+    async fn spawn_grpc_auth(api: Api, a: Arc<Auth>) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(TcService::new(api).into_server_with_auth(a))
+                .serve_with_incoming(TcpListenerStream::new(l))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        format!("http://{addr}")
+    }
+
+    /// 用给定的 token 分别打两个协议，返回 (http 通过吗, grpc 通过吗)
+    async fn 两边带token(token: Option<&str>) -> (bool, bool) {
+        let st = store().await;
+        let a = auth();
+        let h = spawn_http_auth(Api::new(st.clone()), a.clone()).await;
+        let g = spawn_grpc_auth(Api::new(st.clone()), a.clone()).await;
+
+        let mut rb = reqwest::Client::new().get(format!("{h}/api/dtmsvr/newGid"));
+        if let Some(t) = token {
+            rb = rb.header("authorization", format!("Bearer {t}"));
+        }
+        let http_ok = rb.send().await.unwrap().status().is_success();
+
+        let mut cli = pb::tc_client::TcClient::connect(g).await.unwrap();
+        let mut req = tonic::Request::new(pb::NewGidRequest {});
+        if let Some(t) = token {
+            req.metadata_mut()
+                .insert("authorization", format!("Bearer {t}").parse().unwrap());
+        }
+        let grpc_ok = cli.new_gid(req).await.is_ok();
+        (http_ok, grpc_ok)
+    }
+
+    #[tokio::test]
+    async fn 带对的token两个协议都放行() {
+        let (h, g) = 两边带token(Some(TOKEN)).await;
+        assert!(h && g, "HTTP {h} / gRPC {g}，都该放行");
+    }
+
+    #[tokio::test]
+    async fn 不带token两个协议都拒绝() {
+        // 这条如果失败，多半是某个协议层漏挂了认证 —— 0.5.0 的 gRPC 就是这样
+        let (h, g) = 两边带token(None).await;
+        assert!(!h && !g, "HTTP {h} / gRPC {g}，都该拒绝");
+    }
+
+    #[tokio::test]
+    async fn 带错的token两个协议都拒绝() {
+        let (h, g) = 两边带token(Some("wrong-token")).await;
+        assert!(!h && !g, "HTTP {h} / gRPC {g}，都该拒绝");
+    }
+}

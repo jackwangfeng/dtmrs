@@ -37,24 +37,61 @@ const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 const COOKIE: &str = "dtmrs_session";
 
 pub struct Auth {
+    /// 管理台登录用。为空表示不提供登录页（只用 token 认证）
     user: String,
     password: String,
-    /// token -> 过期时刻
+    /// 业务端用的静态令牌。**服务之间调用不该走登录表单+cookie**，
+    /// 那是给浏览器设计的。为空表示不接受 token 认证
+    token: String,
+    /// 会话 token -> 过期时刻
     sessions: Mutex<HashMap<String, Instant>>,
 }
 
 impl Auth {
     /// 密码为空返回 `None` —— 调用方据此决定「不启用认证」
+    /// 两个都没配返回 `None` —— 调用方据此决定「不启用认证」。
+    ///
+    /// 两种凭据是**并列**的，满足任一即放行：
+    /// - `DTMRS_ADMIN_PASSWORD`：浏览器登录管理台，拿会话 cookie
+    /// - `DTMRS_AUTH_TOKEN`：业务服务/SDK 带 `Authorization: Bearer <token>`
     pub fn from_env() -> Option<Arc<Self>> {
         let password = std::env::var("DTMRS_ADMIN_PASSWORD").unwrap_or_default();
-        if password.is_empty() {
+        let token = std::env::var("DTMRS_AUTH_TOKEN").unwrap_or_default();
+        if password.is_empty() && token.is_empty() {
             return None;
         }
         Some(Arc::new(Self {
             user: std::env::var("DTMRS_ADMIN_USER").unwrap_or_else(|_| "admin".into()),
             password,
+            token,
             sessions: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// 配了密码才提供登录页
+    pub fn has_login(&self) -> bool {
+        !self.password.is_empty()
+    }
+
+    /// 校验业务端的 Bearer token。定长时间比较，理由同 `matches`
+    pub fn token_ok(&self, presented: &str) -> bool {
+        if self.token.is_empty() {
+            return false;
+        }
+        let (a, b) = (presented.as_bytes(), self.token.as_bytes());
+        let mut diff = a.len() ^ b.len();
+        for i in 0..a.len().max(b.len()) {
+            diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(1));
+        }
+        diff == 0
+    }
+
+    /// 从 `Authorization: Bearer xxx` 里取 token。gRPC 侧的 metadata 同名，复用
+    pub fn bearer(v: &str) -> Option<&str> {
+        let v = v.trim();
+        v.strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
+            .map(str::trim)
     }
 
     /// ⚠ 定长时间比较。管理台密码通常不长，朴素的 `==` 会随前缀匹配长度
@@ -136,6 +173,17 @@ pub async fn guard(
     if path == "/health" || path == "/login" || path == "/logout" {
         return next.run(req).await;
     }
+    // 业务端：Authorization: Bearer <token>
+    if req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(Auth::bearer)
+        .is_some_and(|t| auth.token_ok(t))
+    {
+        return next.run(req).await;
+    }
+    // 浏览器：会话 cookie
     if cookie_of(&req).is_some_and(|t| auth.valid(&t)) {
         return next.run(req).await;
     }
@@ -166,7 +214,7 @@ pub async fn login_submit(
     headers: axum::http::HeaderMap,
     Form(f): Form<LoginForm>,
 ) -> Response {
-    if !auth.matches(&f.user, &f.password) {
+    if !auth.has_login() || !auth.matches(&f.user, &f.password) {
         // 不区分「用户名不存在」和「密码错误」—— 那等于告诉对方用户名猜对了
         return (
             StatusCode::UNAUTHORIZED,

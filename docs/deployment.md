@@ -99,6 +99,40 @@ HTTP 和 gRPC 各占一个端口，**任一个挂了整个进程退出**——�
 
 健康检查：`GET /health` 返回 `ok`。
 
+## 认证
+
+默认**不启用**（本地开发不受影响）。两种凭据并列，满足任一即放行：
+
+| 环境变量 | 给谁用 | 怎么带 |
+|---|---|---|
+| `DTMRS_AUTH_TOKEN` | **业务服务 / SDK** | `Authorization: Bearer <token>` |
+| `DTMRS_ADMIN_PASSWORD` | 浏览器管理台 | 登录表单 → 会话 cookie（`DTMRS_ADMIN_USER` 默认 `admin`） |
+
+```bash
+DTMRS_AUTH_TOKEN=$(openssl rand -hex 24) \
+DTMRS_ADMIN_PASSWORD='...' \
+  dtmrs
+```
+
+```bash
+# 业务侧调用
+curl -H "Authorization: Bearer $TOKEN" -X POST $TC/api/dtmsvr/submit -d '...'
+```
+
+⚠ **两个协议层用同一个 `Auth`，gRPC 也要认证**（metadata 的 `authorization` 键，
+同样是 Bearer）。gRPC 没有 cookie 和登录页的概念，所以它**只认 token** ——
+管理台的会话 cookie 只在 HTTP 侧有意义。
+
+这一条踩过：0.5.0 只给 HTTP 加了中间件、漏了 gRPC，结果**同一个请求走 HTTP 被拒、
+走 gRPC 却受理了** —— 正是「绝对不能破坏的语义」第 2 条防的那种漂移。
+现在 `tests/http.rs` 的「认证」那组用例会同时打两个协议，断言结论一致。
+
+保护范围是**除 `/health` `/login` `/logout` 外的全部**，不只是管理台页面 ——
+真正危险的是它调的接口：`abort` 能中止在途事务、`retry` 能改调度、
+`submit` 能凭空造事务。只保护页面等于没保护。
+
+> 监听非回环地址却两个都没配时，启动日志会打醒目警告。
+
 **管理台**：浏览器打开 `http://<DTMRS_ADDR>/` 就是。能看最近事务、展开分支明细、
 对未终结的事务手动「立刻重试」或「中止」。单文件内嵌在二进制里，
 没有构建步骤也不依赖 CDN —— 内网离线环境可用。
