@@ -11,7 +11,7 @@ use dtmrs_core::{
 use dtmrs_store::{GlobalRow, Store};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 pub struct Driver {
@@ -401,7 +401,26 @@ impl Driver {
             .map(|m| m + 1)
             .unwrap_or(0);
         if n == 0 {
-            // 一个分支都没登记就 submit/abort 了 —— 空事务，直接落终态
+            // ⚠ `n == 0` 有两种成因，**结论完全相反，绝不能混为一谈**：
+            //
+            //   a) rows 是空的 —— 真的一个分支都没登记就 submit/abort 了，空事务，落终态；
+            //   b) rows 不空，但分支号一个都解析不出下标 —— 这时候落终态是**灾难**：
+            //      TCC 会被判成 succeed 而 confirm 一次都没调，那份已经 try 冻结的资源
+            //      永远没人收尾。实测过：登记 branch_id="inventory" 再 submit，
+            //      事务直接变 succeed，分支停在 prepared。
+            //
+            // 现在 register_branch 会挡住 (b)，但库里可能存着更早写进去的坏行，
+            // 所以这里也得挡。按项目的一贯原则处理：**既不判成功也不回滚，停下等人。**
+            if !rows.is_empty() {
+                error!(
+                    gid = %g.gid,
+                    branches = rows.len(),
+                    ids = ?rows.iter().map(|r| r.branch_id.as_str()).take(5).collect::<Vec<_>>(),
+                    "分支号全都无法解析成下标，无法推进。这笔事务需要人工介入 —— \
+                     合法的分支号形如 01 / 02 / 100（见 is_canonical_branch_id）"
+                );
+                return Ok(());
+            }
             let s = if g.status == GlobalStatus::Aborting {
                 GlobalStatus::Failed
             } else {
@@ -718,11 +737,48 @@ pub fn branch_id(index: usize) -> String {
     format!("{:02}", index + 1)
 }
 
+/// 分支下标的上限。
+///
+/// ⚠ 这不是「够用就行」的产品限制，是**内存安全的护栏**。
+/// `n` 是拿所有分支行里的最大下标算出来的，紧接着就 `vec![...; n]`。
+/// 分支号是 TCC / XA 客户端自己给的字符串 —— 登记一个 `"2000000000"`，
+/// TC 就会去分配二十亿个元素。实测过：一次 submit 把 RSS 从 38 MB
+/// 顶到 **3.4 GB**，而且那行留在库里，推进器每次轮询都再来一遍。
+///
+/// SAGA 那边有 payload 的 8192 字符上限兜着（最多装几百步），
+/// TCC / XA 的分支是一条条登记的，没有任何天然上限，只能在这里挡。
+pub const MAX_BRANCH_INDEX: usize = 9999;
+
+/// 把分支号解析回下标。**认不出来就返回 None，调用方必须当心 —— 见 `n == 0` 那段。**
+///
+/// 超过 `MAX_BRANCH_INDEX` 一律不认：库里可能已经存着历史坏数据
+/// （早先 `register_branch` 只校验非空），不在这里挡住的话，
+/// 光是把它捞起来推进就能把 TC 撑爆。
 fn index_of(branch_id: &str) -> Option<usize> {
     branch_id
         .parse::<usize>()
         .ok()
         .and_then(|v| v.checked_sub(1))
+        .filter(|&i| i <= MAX_BRANCH_INDEX)
+}
+
+/// 分支号是否是 driver 能**原样还原**的形式。
+///
+/// 判据就一句：`branch_id(index_of(s)) == s`。这不是洁癖 ——
+/// driver 推进时并不用库里存的那个字符串，而是拿下标**重新生成**
+/// （`Advance::Call { index }` → `branch_id(index)` → 反查那一行）。
+/// 所以只要还原不出原样，那一行就永远对不上：
+///
+/// | 客户端登记 | 会发生什么 |
+/// |---|---|
+/// | `"01"` / `"100"` | ✅ 正常 |
+/// | `"1"` / `"001"` | 存进去是 `"1"`，driver 找的是 `"01"` —— 状态更新全部落空，无限重试 |
+/// | `"inventory"` | 解析不出下标 → 事务被当成**空事务直接判成功**，confirm 一次都不会调，资源永久泄漏 |
+/// | `"2000000000"` | 推进时按下标开数组，一次 submit 吃掉 3.4 GB |
+///
+/// 后两行都是实测出来的，不是推演。
+pub fn is_canonical_branch_id(s: &str) -> bool {
+    index_of(s).map(branch_id).as_deref() == Some(s)
 }
 
 /// 按 op 把分支行拆成两列（正向 / 反向），按步序对齐

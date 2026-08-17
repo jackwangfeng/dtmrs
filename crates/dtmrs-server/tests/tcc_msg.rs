@@ -508,3 +508,152 @@ async fn 未终结的事务可以正常登记分支() {
             .unwrap_or_else(|e| panic!("{} 状态下应该允许登记，却报了 {e:?}", 状态.as_str()));
     }
 }
+
+// ===================================================================
+// 分支号的格式守卫
+//
+// driver 推进时并不用库里存的那个字符串，而是拿下标**重新生成**分支号去反查行
+// （`Advance::Call { index }` → `branch_id(index)`）。所以还原不出原样的分支号
+// 一律不能收 —— 下面两条故障都是先在真 TC 上实测出来，再回来补的守卫。
+// ===================================================================
+
+/// 往一个正常的 Prepared 事务里登记指定分支号
+async fn 登记分支号(bid: &str) -> Result<(), dtmrs_server::api::ApiError> {
+    use dtmrs_server::api::{Api, RegisterBranch};
+
+    let s = store().await;
+    let api = Api::new(s.clone());
+    let gid = format!("bid-{bid}");
+    s.create_global(&tcc_rows(&gid), &[]).await.unwrap();
+
+    api.register_branch(&RegisterBranch {
+        gid,
+        branch_id: bid.into(),
+        confirm: "http://x/confirm".into(),
+        cancel: "http://x/cancel".into(),
+        r#try: "http://x/try".into(),
+        commit: String::new(),
+        rollback: String::new(),
+    })
+    .await
+}
+
+#[tokio::test]
+async fn 解析不出下标的分支号必须拒绝() {
+    // 放行的后果实测过，是最坏的那种：登记 branch_id="inventory" 再 submit，
+    // 推进器解析不出任何下标 → 把整笔事务当成「空事务」→ 直接判 **succeed**，
+    // confirm 一次都没调，分支永远停在 prepared。
+    // 也就是说客户端拿到「事务成功」，而那份 try 冻结的资源永久泄漏。
+    for bad in ["inventory", "abc", "0x1f", "1.5", "-1", "00", "", " 01"] {
+        assert!(
+            登记分支号(bad).await.is_err(),
+            "branch_id {bad:?} 必须被拒绝，放行会让整笔事务被误判成空事务直接判成功"
+        );
+    }
+}
+
+#[tokio::test]
+async fn 补零不对的分支号也必须拒绝() {
+    // "1" 看起来完全合理，但它是**静默失效**的那一类：
+    // 存进库里是 "1"，driver 反查时找的是 "01" —— 状态更新全部落空，
+    // 这笔事务会一直重试到永远，日志里还看不出为什么。
+    for bad in ["1", "001", "0001", "9"] {
+        assert!(
+            登记分支号(bad).await.is_err(),
+            "branch_id {bad:?} 必须被拒绝：driver 反查时用的是 {:?}，对不上",
+            dtmrs_server::driver::branch_id(bad.trim_start_matches('0').parse::<usize>().unwrap_or(1) - 1)
+        );
+    }
+}
+
+#[tokio::test]
+async fn 超大分支号必须拒绝否则能把tc撑爆() {
+    // ⚠ 这条不是格式洁癖，是内存安全。
+    //
+    // 推进时 `n` 取所有分支里的最大下标，紧接着 `vec![...; n]`。
+    // 实测：登记 branch_id="2000000000" 再 submit 一次，
+    // TC 的 RSS 从 38 MB 顶到 **3.4 GB**，而且那行留在库里，
+    // 推进器每轮轮询都再分配一遍 —— 一个请求就能持续打爆 TC。
+    for bad in ["2000000000", "99999999", "10001"] {
+        assert!(
+            登记分支号(bad).await.is_err(),
+            "branch_id {bad:?} 必须被拒绝，否则推进时会按这个下标开数组"
+        );
+    }
+}
+
+#[tokio::test]
+async fn 合法的分支号要放行() {
+    // 守卫不能误伤：01 起步、超过 99 变三位都是 driver 自己生成的形式
+    for ok in ["01", "02", "99", "100", "101", "9999"] {
+        登记分支号(ok)
+            .await
+            .unwrap_or_else(|e| panic!("branch_id {ok:?} 是合法的，却被拒了：{e:?}"));
+    }
+}
+
+#[tokio::test]
+async fn 库里已有的坏分支号不能被当成空事务判成功() {
+    // API 的守卫只能挡住**新**登记的。早先 register_branch 只校验非空，
+    // 所以别人的库里可能已经躺着这样的行 —— 推进器捞起来时也必须挡住。
+    //
+    // 关键在于区分 `n == 0` 的两种成因：
+    //   · rows 为空      → 真空事务，落终态是对的
+    //   · rows 不空但号全废 → 落终态是灾难（TCC 判 succeed 而 confirm 没调过）
+    //
+    // 正确处理是**既不判成功也不回滚，停下等人**，跟 workflow 的分岔检测同一个原则。
+    let s = store().await;
+    let gid = "rotten-bid";
+    s.create_global(&tcc_rows(gid), &[]).await.unwrap();
+    // 绕过 API 直接写坏行，模拟历史数据
+    s.register_branch(
+        gid,
+        "inventory",
+        &[
+            (BranchOp::Confirm, "http://x/confirm".to_string()),
+            (BranchOp::Cancel, "http://x/cancel".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    s.set_global_status(gid, GlobalStatus::Submitted, TransType::Tcc, "")
+        .await
+        .unwrap();
+
+    let d = Driver::new(s.clone(), "t".into());
+    let g = s.get_global(gid).await.unwrap().unwrap();
+    d.process(&g).await.unwrap();
+
+    let after = s.get_global(gid).await.unwrap().unwrap().status;
+    assert_eq!(
+        after,
+        GlobalStatus::Submitted,
+        "有分支行却因为分支号认不出来被落成 {}，那份 try 冻结的资源就永远没人收尾了",
+        after.as_str()
+    );
+}
+
+#[tokio::test]
+async fn 真的没有分支时仍然按空事务落终态() {
+    // 守卫不能误伤：一个分支都没登记就 submit，那是真空事务，
+    // 必须照常落终态，不能因为上一条的改动被卡住。
+    let s = store().await;
+    for (gid, 起始, 期望) in [
+        ("empty-ok", GlobalStatus::Submitted, GlobalStatus::Succeed),
+        ("empty-abort", GlobalStatus::Aborting, GlobalStatus::Failed),
+    ] {
+        s.create_global(&tcc_rows(gid), &[]).await.unwrap();
+        s.set_global_status(gid, 起始, TransType::Tcc, "")
+            .await
+            .unwrap();
+        let d = Driver::new(s.clone(), "t".into());
+        let g = s.get_global(gid).await.unwrap().unwrap();
+        d.process(&g).await.unwrap();
+        assert_eq!(
+            s.get_global(gid).await.unwrap().unwrap().status,
+            期望,
+            "{gid} 是真空事务，应该落 {}",
+            期望.as_str()
+        );
+    }
+}

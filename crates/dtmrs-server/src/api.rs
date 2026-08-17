@@ -16,6 +16,7 @@
 //! `Conflict` 在 HTTP 上返回 200 是**刻意保留的历史行为**（已终结的事务再调
 //! abort），换成 4xx 会打破现有客户端。
 
+use crate::driver;
 use crate::{msg_rows, saga_rows, tcc_rows};
 use dtmrs_core::{BranchOp, GlobalStatus, SagaStep, TransType};
 use dtmrs_store::{Store, SubmitOutcome};
@@ -298,6 +299,27 @@ impl Api {
     pub async fn register_branch(&self, r: &RegisterBranch) -> Result<()> {
         if r.gid.is_empty() || r.branch_id.is_empty() {
             return Err(ApiError::BadRequest("gid / branch_id 不能为空".into()));
+        }
+        // ⚠ 分支号的格式必须在**入口**挡住，放进去之后就来不及了。
+        //
+        // 这里原先只校验非空，于是客户端随手写个 branch_id="inventory" 就能
+        // 触发两个都很难查的故障（都实测过，不是推演）：
+        //
+        //   · 解析不出下标 → 推进器把整笔事务当成「空事务」直接判 succeed，
+        //     confirm 一次都不会调，那份已经 try 冻结的资源永久泄漏；
+        //   · 写个 "2000000000" → 推进时按下标开数组，一次 submit 把 RSS
+        //     从 38 MB 顶到 3.4 GB，而且这行留在库里，每轮轮询再来一遍。
+        //
+        // 判据见 `is_canonical_branch_id`：driver 推进时是拿下标**重新生成**
+        // 分支号去反查行的，所以还原不出原样的写法一律不收 —— 包括 "1"、"001"
+        // 这种「看起来对但少了/多了补零」的，它们会让状态更新静默落空。
+        if !driver::is_canonical_branch_id(&r.branch_id) {
+            return Err(ApiError::BadRequest(format!(
+                "branch_id \"{}\" 格式不对：必须是从 01 开始、至少两位补零的十进制序号\
+                 （01、02 …… 99、100），且不超过 {}",
+                r.branch_id,
+                driver::MAX_BRANCH_INDEX + 1
+            )));
         }
         let tt = match self.store.get_global(&r.gid).await {
             // ⚠ 必须挡住「事务已经不可能再推进新分支」的状态。
