@@ -28,7 +28,8 @@ import java.util.concurrent.Executors;
  * <ul>
  *   <li><b>重复请求</b> —— 协调器会重试，同一个操作可能被调多次</li>
  *   <li><b>空回滚</b> —— 补偿到了，但正向操作根本没执行过</li>
- *   <li><b>悬挂</b> —— 补偿先执行了，迷路的正向操作后到，必须丢弃</li>
+ *   <li><b>悬挂</b> —— 补偿先执行了，迷路的正向操作后到，必须丢弃。
+ *       注意这个不需要单独的判断分支：空回滚时**替正向占位**就已经挡住了</li>
  * </ul>
  *
  * 这里为了让例子能独立跑，屏障用内存 Map 实现。<b>生产上必须用
@@ -46,6 +47,19 @@ public class BranchService {
             8903, new Cfg("账户服务", "balance", 1000, -10));
 
     static final Map<Integer, State> ST = new HashMap<>();
+
+    /**
+     * 只处理 gid 含这个标记的请求，其余一律忽略（但仍回 SUCCESS）。
+     *
+     * ⚠ 这不是洁癖，是被坑出来的：分支服务监听固定端口，**任何**知道这些 URL 的
+     * 协调器都能打进来。实际发生过 —— 几小时前一笔被故意卡住的事务留在了另一个
+     * 长期运行的 TC 里，那个 TC 一直在重试它；每次我把分支服务起在同样的端口上，
+     * 那笔陈年事务的重试就送达一次，凭空扣掉一笔钱，表现为「偶发失败」。
+     *
+     * 回 SUCCESS 而不是报错，是为了让那个外来的 TC 能把它的事务了结掉，
+     * 否则它会永远重试下去。
+     */
+    static final String TAG = System.getenv().getOrDefault("BRANCH_TAG", "");
 
     static class State {
         int value;
@@ -87,7 +101,15 @@ public class BranchService {
                         return;
                     }
                     case "/reset" -> {
-                        st.value = cfg.init(); st.barrier.clear(); st.calls.clear(); st.mode.clear();
+                        // ⚠ **刻意不清屏障。**
+                        //
+                        // 清了的话，上一个测试留下的在途重试请求（协调器被 kill 时
+                        // 可能有几个还在路上）会在 reset 之后到达，发现屏障是空的，
+                        // 于是**重新执行一次** —— 扣款扣两次。
+                        // 也就是说「为了隔离而清空去重状态」恰好把屏障要防的重复放了进来。
+                        //
+                        // 各测试的 gid 唯一，屏障键天然不冲突，留着就行。
+                        st.value = cfg.init(); st.calls.clear(); st.mode.clear();
                         reply(ex, 200, "ok"); return;
                     }
                     case "/mode" -> { st.mode.clear(); st.mode.putAll(q); reply(ex, 200, "ok"); return; }
@@ -97,6 +119,13 @@ public class BranchService {
 
             String gid = q.getOrDefault("gid", "-");
             String br  = q.getOrDefault("branch_id", "-");
+
+            // 不属于本次运行的请求：认掉但不改状态，见 TAG 的注释
+            if (!TAG.isEmpty() && !gid.contains(TAG)) {
+                synchronized (st) { st.calls.add("外来请求,已忽略 " + gid); }
+                reply(ex, 200, "SUCCESS");
+                return;
+            }
             boolean isCompensate = path.startsWith("/compensate");
             String op = isCompensate ? "compensate" : "action";
 
@@ -110,18 +139,22 @@ public class BranchService {
 
                 // ---- 子事务屏障 ----
                 if (st.barrier.contains(key)) {                       // 重复请求
-                    st.calls.add(op + ":重复,已幂等挡掉");
+                    st.calls.add(op + ":重复,已幂等挡掉 " + gid);
                     reply(ex, 200, "SUCCESS"); return;
                 }
                 if (isCompensate && !st.barrier.contains(gid + "|" + br + "|action")) {
-                    // 空回滚：正向没跑过。占位是为了防悬挂 —— 万一正向请求还在路上
+                    // 空回滚：正向没跑过，所以什么都不做。
+                    //
+                    // ★ 这里**替正向占位**（插入 action 的 key）—— 这一步就是
+                    //   防悬挂的全部手段。之后那个迟到的正向请求进来时，
+                    //   第一个检查就会命中「已处理过」，从而被丢弃。
+                    //
+                    //   所以不需要再单独写一个「if 补偿已存在则判为悬挂」的分支 ——
+                    //   那个分支永远走不到（写过，是死代码）。屏障算法的精髓
+                    //   就在这个占位上，容易被漏掉。
                     st.barrier.add(gid + "|" + br + "|action");
                     st.barrier.add(key);
-                    st.calls.add("compensate:空回滚,未改状态");
-                    reply(ex, 200, "SUCCESS"); return;
-                }
-                if (!isCompensate && st.barrier.contains(gid + "|" + br + "|compensate")) {
-                    st.calls.add("action:悬挂,已丢弃");             // 补偿先到了
+                    st.calls.add("compensate:空回滚,未改状态 " + gid);
                     reply(ex, 200, "SUCCESS"); return;
                 }
 
@@ -129,13 +162,13 @@ public class BranchService {
                 // ⚠ 别拿它表示「超时/暂时不可用」—— 那是「结果未知」，
                 //    要靠 5xx 或直接超时，让协调器重试而不是回滚
                 if (!isCompensate && st.mode.containsKey("fail")) {
-                    st.calls.add("action:业务拒绝");
+                    st.calls.add("action:业务拒绝 " + gid);
                     reply(ex, 409, "FAILURE"); return;
                 }
 
                 st.barrier.add(key);
                 st.value += isCompensate ? -cfg.delta() : cfg.delta();
-                st.calls.add(op + ":执行 → " + cfg.field() + "=" + st.value);
+                st.calls.add(op + ":执行 → " + cfg.field() + "=" + st.value + " " + gid);
                 reply(ex, 200, "SUCCESS");
             }
         } catch (Exception e) {
