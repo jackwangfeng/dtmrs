@@ -262,3 +262,74 @@ service Tc {
 ## Rust API
 
 嵌入式用法和库 API 见 [docs.rs/dtmrs](https://docs.rs/dtmrs)。
+
+---
+
+## 从 DTM 迁过来要注意的三处差异
+
+路径、字段、`dtm_result` 的语义都跟 DTM 对齐，直接换个地址通常就能跑。
+但下面三处**行为**不一样，都跟 `branch_id` 有关，而且都是实测比对过真 DTM 的。
+
+差异的根源是一处设计分歧：**DTM 取分支时按 `ORDER BY id asc`（自增主键，
+也就是登记顺序），全程不解析 `branch_id`；dtmrs 把 `branch_id` 解析成整数下标，
+用它索引数组。** 对 DTM 来说 branch_id 只是个标识串，对 dtmrs 来说它是承重的。
+
+### ① 执行顺序：DTM 按登记顺序，dtmrs 按分支号数值序
+
+SAGA / msg / workflow 不受影响——分支号由 TC 自己按步序生成，两者必然一致。
+
+**只有 TCC 和 XA 会踩到**，因为分支号是你自己给的。如果你先登记 `02` 再登记 `01`：
+
+| | 执行顺序 |
+|---|---|
+| DTM | `02` → `01`（你登记的顺序） |
+| dtmrs | `01` → `02`（分支号的数值顺序） |
+
+正常写法下两者一致（循环里递增生成分支号）。会出问题的是那种「按业务条件
+决定登记哪些分支」而分支号又不连续的写法——迁过来之前确认一下顺序。
+
+### ② 分支数上限：DTM 卡在 99，dtmrs 是 10000
+
+DTM 的客户端 SDK 直接 panic：
+
+```go
+func (g *BranchIDGen) NewSubBranchID() string {
+	if g.subBranchID >= 99 { panic(fmt.Errorf("branch id is larger than 99")) }
+```
+
+dtmrs 没这个限制，分支号超过 99 就变成三位（`100`、`101`…），上限 `10000`。
+SAGA 另有 payload 的 8192 字符上限兜着，实测短 URL 能装进 101 步。
+
+所以：**DTM → dtmrs 不会有问题，反向迁移要留意**。
+
+### ③ 重复登记：DTM 一律报错，dtmrs 只拒绝真冲突
+
+DTM 靠 `UNIQUE KEY (gid, branch_id, op)` + 直接 INSERT，撞了就把数据库错误
+原样抛给你。实测——**即使两次请求完全一样**：
+
+```
+登记 01 (kucun)  → {"dtm_result":"SUCCESS"}
+再登记 01 (kucun) → {"message":"Error 1062 (23000): Duplicate entry ..."}
+```
+
+也就是说 DTM 的 registerBranch **不是幂等的**，网络抖动重发会拿到错误。
+
+dtmrs 把两种长得一样、结论相反的情况分开了：
+
+| 第二次登记 | dtmrs | DTM |
+|---|---|---|
+| 分支号和 URL **都一样**（客户端重试） | ✅ 放行 | ❌ `Error 1062` |
+| 分支号一样但 URL **不同**（两个分支撞号） | ❌ `Conflict` | ❌ `Error 1062` |
+
+第二行必须拒绝——放行的话第二个分支的 URL 根本存不进去，而客户端会以为
+登记成功并去调它的 try 把资源冻结上，TC 却不知道有这个分支，
+confirm / cancel 都不会调，**那份资源永久泄漏**。
+
+### 顺带：dtmrs 对 branch_id 的格式校验比 DTM 严
+
+DTM 服务端不校验 `branch_id`（因为它不解析，写什么都无害）。
+dtmrs 必须校验——格式不对会导致很难查的故障，详见上面
+[branch_id 的格式是硬性要求](#branch_id-的格式是硬性要求不是建议)。
+
+对用官方 SDK 的人没影响（DTM 的分支号本来就由 SDK 生成成 `01`、`02`…）；
+**手写 HTTP 调用的要注意**，dtmrs 会明确拒绝而不是默默收下。
