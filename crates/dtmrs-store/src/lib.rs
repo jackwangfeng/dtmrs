@@ -68,6 +68,29 @@ pub enum SubmitOutcome {
     Already,
 }
 
+/// [`Store::register_branch`] 的结果。
+///
+/// 之所以不能只返回 `()`：登记走的是「冲突忽略」，而**冲突有两种，结论完全相反**——
+///
+/// * 客户端重试，URL 跟上次一模一样 → 必须当成功（`register_branch` 是幂等的）
+/// * 客户端把两个不同的分支都编成了同一个号 → 第二个分支的 URL **根本没存进去**
+///
+/// 后者原先也返回 SUCCESS，是个很难查的坑：客户端以为登记成功了，
+/// 接着去调那个分支的 try 把资源冻结上，而 TC 压根不知道有这个分支 ——
+/// confirm 和 cancel 都不会调，**那份资源永久泄漏**。
+/// 实测过：两次登记 branch_id="01"，库里只留下第一个的 URL，两次都回 SUCCESS。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    /// 登记成功，或客户端重试且 URL 完全一致
+    Registered,
+    /// 这个 branch_id 已经被**另一组 URL** 占了。调用方必须拒绝，不能当成功
+    Conflict {
+        op: BranchOp,
+        /// 库里已经存着的 URL
+        existing: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct GlobalRow {
     pub gid: String,
@@ -765,7 +788,7 @@ impl SqlStore {
         gid: &str,
         branch_id: &str,
         ops: &[(BranchOp, String)],
-    ) -> Result<()> {
+    ) -> Result<RegisterOutcome> {
         len_ok("gid", gid, Backend::ID_MAX)?;
         len_ok("branch_id", branch_id, Backend::ID_MAX)?;
         for (_, url) in ops {
@@ -787,9 +810,33 @@ impl SqlStore {
             .bind(t)
             .execute(&mut *tx)
             .await?;
+
+            // ⚠ 插完必须回读一次，**不能看 rows_affected**。
+            //
+            // MySQL 上 `INSERT IGNORE` 遇到冲突返回 0、成功返回 1，看似能用；
+            // 但这里要区分的不是「插没插进去」而是「里面躺的是不是同一个 URL」，
+            // 那个数字回答不了。回读还顺带解决了并发：两个请求同时登记同一个号时，
+            // 输的那个在自己事务里读到的是赢家已提交的行，照样能发现冲突。
+            let stored: Option<String> = sqlx::query_scalar(&self.be.q(
+                "SELECT url FROM trans_branch_op WHERE gid=? AND branch_id=? AND op=?",
+            ))
+            .bind(gid)
+            .bind(branch_id)
+            .bind(op.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(existing) = stored {
+                if existing != *url {
+                    // 不 commit，前面几个 op 一并回滚 —— 半登记的分支比没登记更难查
+                    return Ok(RegisterOutcome::Conflict {
+                        op: *op,
+                        existing,
+                    });
+                }
+            }
         }
         tx.commit().await?;
-        Ok(())
+        Ok(RegisterOutcome::Registered)
     }
 
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<GlobalRow>> {
@@ -1084,6 +1131,63 @@ mod tests {
         }
     }
 
+    /// 重号登记的判定必须在**每个后端**上一致。
+    ///
+    /// 三家的机制各不相同：SQL 走「冲突忽略 + 回读比对」，其中 MySQL 是
+    /// `INSERT IGNORE`、其它是 `ON CONFLICT DO NOTHING`；Redis 走
+    /// `hset_nx` 的返回值 + 回读。机制不同，结论必须逐条一样 ——
+    /// 所以这条测试挂在 `backends()` 上而不是只测 sqlite。
+    #[tokio::test]
+    async fn 重号登记要报冲突而同号重试要幂等() {
+        let (_g, backends) = backends().await;
+        for (name, s) in backends {
+            let 库存 = [
+                (BranchOp::Confirm, "http://kucun/confirm".to_string()),
+                (BranchOp::Cancel, "http://kucun/cancel".to_string()),
+            ];
+            let 订单 = [
+                (BranchOp::Confirm, "http://dingdan/confirm".to_string()),
+                (BranchOp::Cancel, "http://dingdan/cancel".to_string()),
+            ];
+
+            assert_eq!(
+                s.register_branch("dup1", "01", &库存).await.unwrap(),
+                RegisterOutcome::Registered,
+                "{name}: 首次登记"
+            );
+            assert_eq!(
+                s.register_branch("dup1", "01", &库存).await.unwrap(),
+                RegisterOutcome::Registered,
+                "{name}: URL 一致的重复登记是客户端重试，必须幂等放行"
+            );
+            assert!(
+                matches!(
+                    s.register_branch("dup1", "01", &订单).await.unwrap(),
+                    RegisterOutcome::Conflict { .. }
+                ),
+                "{name}: 重号必须报冲突 —— 放行的话订单的 URL 根本写不进去，\
+                 客户端却以为登记成功并去冻结资源，那份资源永久泄漏"
+            );
+            assert_eq!(
+                s.register_branch("dup1", "02", &订单).await.unwrap(),
+                RegisterOutcome::Registered,
+                "{name}: 各用各的号要互不影响"
+            );
+
+            let rows = s.list_branches("dup1").await.unwrap();
+            assert_eq!(rows.len(), 4, "{name}: 两个分支各两个 op");
+            for r in &rows {
+                let 期望 = if r.branch_id == "01" { "kucun" } else { "dingdan" };
+                assert!(
+                    r.url.contains(期望),
+                    "{name}: 分支 {} 的地址串味了 —— {}",
+                    r.branch_id,
+                    r.url
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn msg的prepared会被捞tcc的不会() {
         let (_g, bes) = backends().await;
@@ -1332,6 +1436,8 @@ dispatch! {
     fn set_branch_status(&self, gid: &str, branch_id: &str, op: BranchOp, status: BranchStatus) -> ();
     fn schedule_retry(&self, gid: &str, interval: i64) -> ();
     fn schedule_now(&self, gid: &str) -> ();
-    fn register_branch(&self, gid: &str, branch_id: &str, ops: &[(BranchOp, String)]) -> ();
+    /// 登记分支。**重号但 URL 不同时返回 [`RegisterOutcome::Conflict`]**，
+    /// 调用方必须拒绝 —— 见那个类型的文档
+    fn register_branch(&self, gid: &str, branch_id: &str, ops: &[(BranchOp, String)]) -> RegisterOutcome;
     fn list_recent(&self, limit: i64) -> Vec<GlobalRow>;
 }

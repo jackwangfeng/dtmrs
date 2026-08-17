@@ -350,3 +350,61 @@ fn require_real_db(缺的变量: &str) {
         );
     }
 }
+
+/// 重号判定：Redis 侧靠 `hset_nx` 的返回值 + 回读比对，SQL 侧靠冲突忽略后回读。
+/// **机制不同，结论必须逐条一致** —— 跟 `两个分支用同一个分支号必须拒绝`
+/// / `同一个分支重复登记仍然要幂等`（SQL 侧，tcc_msg.rs）一一对应。
+#[tokio::test]
+async fn redis_重号登记要拒绝而同号重试要幂等() {
+    let Some((_g, s)) = store("dupbid").await else {
+        return;
+    };
+    use dtmrs_core::BranchOp;
+    use dtmrs_store::RegisterOutcome;
+
+    let gid = "dupbid-1";
+    let 库存 = [
+        (BranchOp::Confirm, "http://库存/confirm".to_string()),
+        (BranchOp::Cancel, "http://库存/cancel".to_string()),
+    ];
+    let 订单 = [
+        (BranchOp::Confirm, "http://订单/confirm".to_string()),
+        (BranchOp::Cancel, "http://订单/cancel".to_string()),
+    ];
+
+    assert_eq!(
+        s.register_branch(gid, "01", &库存).await.unwrap(),
+        RegisterOutcome::Registered
+    );
+    // 同号同 URL = 客户端重试 → 幂等放行
+    assert_eq!(
+        s.register_branch(gid, "01", &库存).await.unwrap(),
+        RegisterOutcome::Registered,
+        "URL 一致的重复登记是客户端重试，必须放行"
+    );
+    // 同号不同 URL = 两个分支撞号 → 必须报冲突
+    assert!(
+        matches!(
+            s.register_branch(gid, "01", &订单).await.unwrap(),
+            RegisterOutcome::Conflict { .. }
+        ),
+        "重号必须报冲突：放行的话订单的 URL 根本写不进去，那份资源永久泄漏"
+    );
+    // 各用各的号则互不影响
+    assert_eq!(
+        s.register_branch(gid, "02", &订单).await.unwrap(),
+        RegisterOutcome::Registered
+    );
+
+    let rows = s.list_branches(gid).await.unwrap();
+    assert_eq!(rows.len(), 4, "两个分支各两个 op");
+    for r in &rows {
+        let 期望 = if r.branch_id == "01" { "库存" } else { "订单" };
+        assert!(
+            r.url.contains(期望),
+            "分支 {} 的地址串味了：{}",
+            r.branch_id,
+            r.url
+        );
+    }
+}

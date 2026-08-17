@@ -373,10 +373,33 @@ impl Api {
             _ => return Err(ApiError::BadRequest("只有 tcc 和 xa 需要登记分支".into())),
         }
 
-        self.store
+        // ⚠ 重号必须拒绝，不能沿用「登记是幂等的」那条放行。
+        //
+        // 两种冲突长得一样但结论相反：URL 完全一致是客户端重试（放行），
+        // URL 不同则是**两个不同的分支编成了同一个号** —— 存储层是冲突忽略，
+        // 第二个分支的 URL 根本没写进去。原先这里照样返回 SUCCESS，
+        // 于是客户端接着去调那个分支的 try 把资源冻结上，而 TC 不知道有它，
+        // confirm / cancel 都不会调，那份资源永久泄漏。
+        //
+        // 判定放在存储层（见 `RegisterOutcome`）是为了拿到事务/脚本的原子性：
+        // 两个请求同时登记同一个号时，输的那个也能看见赢家的 URL。
+        match self
+            .store
             .register_branch(&r.gid, &r.branch_id, &ops)
             .await
-            .map_err(internal)
+            .map_err(internal)?
+        {
+            dtmrs_store::RegisterOutcome::Registered => Ok(()),
+            dtmrs_store::RegisterOutcome::Conflict { op, existing } => {
+                Err(ApiError::Conflict(format!(
+                    "branch_id \"{}\" 的 {} 已经登记成 {existing}，不能改成另一个地址。\
+                     每个分支要用**各自**的分支号（01、02、03…），重号会让后面那个分支\
+                     没人 confirm/cancel，资源永久泄漏",
+                    r.branch_id,
+                    op.as_str()
+                )))
+            }
+        }
     }
 
     /// 主动中止，触发逆序补偿

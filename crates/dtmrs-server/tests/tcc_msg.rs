@@ -657,3 +657,90 @@ async fn 真的没有分支时仍然按空事务落终态() {
         );
     }
 }
+
+// ===================================================================
+// 分支号不能重复
+//
+// 登记走的是「冲突忽略」，所以重号的第二个分支 URL 根本写不进去。
+// 原先两次都返回 SUCCESS —— 客户端以为登记成功，接着去调那个分支的 try
+// 把资源冻结上，而 TC 压根不知道有它，confirm / cancel 都不会调。
+// 实测过：两次登记 "01"，库里只留下第一个的 URL。
+// ===================================================================
+
+async fn 登记(api: &dtmrs_server::api::Api, gid: &str, bid: &str, base: &str)
+    -> Result<(), dtmrs_server::api::ApiError>
+{
+    use dtmrs_server::api::RegisterBranch;
+    api.register_branch(&RegisterBranch {
+        gid: gid.into(),
+        branch_id: bid.into(),
+        confirm: format!("{base}/confirm"),
+        cancel: format!("{base}/cancel"),
+        r#try: format!("{base}/try"),
+        commit: String::new(),
+        rollback: String::new(),
+    })
+    .await
+}
+
+#[tokio::test]
+async fn 两个分支用同一个分支号必须拒绝() {
+    use dtmrs_server::api::Api;
+    let s = store().await;
+    let api = Api::new(s.clone());
+    let gid = "dup-bid";
+    s.create_global(&tcc_rows(gid), &[]).await.unwrap();
+
+    登记(&api, gid, "01", "http://库存").await.unwrap();
+    let e = 登记(&api, gid, "01", "http://订单")
+        .await
+        .expect_err("重号必须拒绝：放行的话订单服务的 URL 根本没存进去，\
+                     客户端却会以为登记成功并去冻结资源");
+    assert!(
+        matches!(e, dtmrs_server::api::ApiError::Conflict(_)),
+        "应该是 Conflict，实际 {e:?}"
+    );
+
+    // 而且不能留下半登记的状态：第一个分支必须原样保留
+    let rows = s.list_branches(gid).await.unwrap();
+    assert!(
+        rows.iter().all(|r| r.url.contains("库存")),
+        "拒绝之后库里不该混进订单的地址，实际：{:?}",
+        rows.iter().map(|r| &r.url).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn 同一个分支重复登记仍然要幂等() {
+    // 守卫不能误伤客户端重试 —— 网络抖动重发是常态，URL 一模一样时
+    // 必须当成功，否则客户端会以为没受理而放弃整笔事务
+    use dtmrs_server::api::Api;
+    let s = store().await;
+    let api = Api::new(s.clone());
+    let gid = "dup-retry";
+    s.create_global(&tcc_rows(gid), &[]).await.unwrap();
+
+    for _ in 0..3 {
+        登记(&api, gid, "01", "http://库存")
+            .await
+            .expect("URL 一致的重复登记是客户端重试，必须放行");
+    }
+    assert_eq!(s.list_branches(gid).await.unwrap().len(), 3, "不该写重复行");
+}
+
+#[tokio::test]
+async fn 不同分支号各自登记不受影响() {
+    // 正常的多分支 TCC：各用各的号
+    use dtmrs_server::api::Api;
+    let s = store().await;
+    let api = Api::new(s.clone());
+    let gid = "multi-bid";
+    s.create_global(&tcc_rows(gid), &[]).await.unwrap();
+
+    for (bid, base) in [("01", "http://库存"), ("02", "http://订单"), ("03", "http://账户")] {
+        登记(&api, gid, bid, base)
+            .await
+            .unwrap_or_else(|e| panic!("{bid} 应该能登记，却报了 {e:?}"));
+    }
+    assert_eq!(s.list_branches(gid).await.unwrap().len(), 9, "3 个分支 × 3 个 op");
+}

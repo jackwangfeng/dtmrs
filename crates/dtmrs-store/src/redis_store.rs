@@ -705,7 +705,7 @@ impl RedisStore {
         gid: &str,
         branch_id: &str,
         ops: &[(BranchOp, String)],
-    ) -> Result<()> {
+    ) -> Result<crate::RegisterOutcome> {
         check_len("gid", gid, Backend::ID_MAX).map_err(|e| err(&e.to_string()))?;
         check_len("branch_id", branch_id, Backend::ID_MAX).map_err(|e| err(&e.to_string()))?;
         for (_, url) in ops {
@@ -721,15 +721,35 @@ impl RedisStore {
                 payload: String::new(),
                 status: BranchStatus::Prepared,
             };
-            let _: i64 = c
+            // hset_nx 返回 1=写进去了 / 0=这个字段已经有值了。
+            // ⚠ 这个返回值原先被丢掉了，跟 SQL 后端一样的坑：重号的第二个分支
+            //   静默不写入，客户端却拿到 SUCCESS，那份资源永久泄漏。
+            //   两个后端的判定语义必须逐条一致（见 CLAUDE.md）。
+            let set: i64 = c
                 .hset_nx(
                     self.bkey(gid),
                     Self::bfield(branch_id, *op),
                     Self::branch_value(&row),
                 )
                 .await?;
+            if set == 0 {
+                // 已经有了 —— 得看清楚里面躺的是不是同一个 URL。
+                // 一致就是客户端重试（幂等，放行）；不一致就是两个分支编了同一个号
+                let raw: Option<String> = c
+                    .hget(self.bkey(gid), Self::bfield(branch_id, *op))
+                    .await?;
+                let existing = raw
+                    .as_deref()
+                    .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+                    .and_then(|v| v.get("url").and_then(|x| x.as_str()).map(String::from));
+                if let Some(existing) = existing {
+                    if existing != *url {
+                        return Ok(crate::RegisterOutcome::Conflict { op: *op, existing });
+                    }
+                }
+            }
         }
-        Ok(())
+        Ok(crate::RegisterOutcome::Registered)
     }
 
     /// 最近的事务，按创建时间倒序。**只有最近 [`RECENT_CAP`] 笔**，不是全量历史
