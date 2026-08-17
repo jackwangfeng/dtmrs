@@ -703,7 +703,17 @@ impl Driver {
     }
 }
 
-/// 分支号：第 0 步是 "01"，跟 DTM 一致
+/// 分支号：第 0 步是 "01"，跟 DTM 一致。
+///
+/// ⚠ **补零只有两位，第 100 个分支起会变成三位** —— 别据此以为顺序会乱。
+/// 执行顺序不是按 `branch_id` 的字符串序决定的：`split_by_op` /
+/// `compensate_states` 都是用 `index_of()` 解析出的**整数下标**写进数组，
+/// 再由 core 的状态机按下标推进。`ORDER BY branch_id` 只影响 `/query`
+/// 的输出排版（105 个分支时列表里 "100" 会显示在 "99" 前面，仅此而已）。
+///
+/// 宽度**不能随便改宽**：TCC / XA 的分支是客户端自己登记 id 的，而 driver
+/// 在推进时用 `branch_id(index)` 反查那一行。改成 `{:04}` 会让所有登记
+/// `"01"` 的现有客户端对不上行 —— 试过，TCC 的三个用例当场挂掉。
 pub fn branch_id(index: usize) -> String {
     format!("{:02}", index + 1)
 }
@@ -860,5 +870,23 @@ mod tests {
         assert_eq!(index_of("10"), Some(9));
         assert_eq!(index_of("00"), None);
         assert_eq!(index_of("xx"), None);
+    }
+
+    /// 超过 99 个分支时分支号会变成三位（`"100"`），**字符串序就跟数值序分家了**
+    /// （`"100" < "99"`）。这条测试钉的是：即便如此，**下标解析仍然正确** ——
+    /// 因为执行顺序走的是 `index_of()` 解析出的整数，不是字符串排序。
+    ///
+    /// 曾经因为看到 `/query` 的输出乱序就误判成执行顺序 bug，实际只是列表排版。
+    /// 真要改这里的补零宽度前先读 `branch_id()` 的注释（会破坏 TCC 客户端）。
+    #[test]
+    fn 分支号超过99后下标解析仍然正确() {
+        let ids: Vec<String> = (0..500).map(branch_id).collect();
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(index_of(id), Some(i), "下标解析错了，执行顺序会乱");
+        }
+        // 字符串序确实不等于数值序 —— 这是已知且无害的，别改这条断言去"修"它
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_ne!(ids, sorted);
     }
 }
