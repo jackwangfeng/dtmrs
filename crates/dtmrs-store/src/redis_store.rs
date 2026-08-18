@@ -769,7 +769,6 @@ impl RedisStore {
         Ok(out)
     }
 
-    /// 清空这个前缀下的全部数据。**只给测试用。**
     // ---------------- 访问令牌 ----------------
     //
     // 语义必须跟 SQL 后端逐条一致：作废是**打标记不删**（管理台要能看到
@@ -877,6 +876,10 @@ impl RedisStore {
         Ok(())
     }
 
+    /// 清空这个前缀下的全部数据。**只给测试用。**
+    ///
+    /// （这条注释一度被挤到了 create_token 头上 —— 中间插进了「访问令牌」那节。
+    /// 一个生产用的函数被标成「只给测试用」，比没注释更糟。）
     pub async fn flush_prefix(&self) -> Result<()> {
         let mut c = self.conn.clone();
         let keys: Vec<String> = c.keys(format!("{}*", self.prefix)).await?;
