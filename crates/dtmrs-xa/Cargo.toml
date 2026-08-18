@@ -14,7 +14,7 @@ description = "XA two-phase commit helper for the resource-manager side (Postgre
 readme = "README.md"
 
 [dependencies]
-dtmrs-core = { path = "../dtmrs-core", version = "0.7.0" }
+dtmrs-core = { path = "../dtmrs-core", version = "0.8.0" }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
