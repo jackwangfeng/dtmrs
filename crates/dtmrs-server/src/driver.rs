@@ -98,6 +98,19 @@ impl Driver {
         self
     }
 
+    /// 给 `grpcs://` 分支加一个额外信任的 CA（PEM 内容，不是路径）。
+    ///
+    /// 独立部署时用环境变量 `DTMRS_GRPC_CA` 就够了；这个方法是给
+    /// **嵌入式宿主**和测试用的 —— 宿主往往已经从别处拿到了证书，
+    /// 不想为了传一份 PEM 再去设进程级环境变量（并行测试里还会互相打架）。
+    ///
+    /// PEM 里没有证书块时会被忽略并打警告，见 `grpc::client` 里的 `check_ca_pem`。
+    #[cfg(feature = "grpc")]
+    pub fn with_grpc_ca_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.grpc = self.grpc.with_ca_pem(pem);
+        self
+    }
+
     /// 常驻推进器。起 `workers` 个并行的抢占循环。
     ///
     /// # 为什么可以直接并行，不需要新的并发控制

@@ -429,3 +429,136 @@ async fn grpc的错误映射到正确的状态码() {
         .unwrap_err();
     assert_eq!(e.code(), tonic::Code::FailedPrecondition);
 }
+
+// ===================================================================
+// grpcs:// —— TLS 分支调用
+//
+// 前面那些用的都是明文 grpc://。TLS 这条路必须**真握一次手**才算验过：
+// 单测里 connect_lazy 不会真连，配错了也看不出来。
+// 证书当场用 rcgen 生成 —— 落盘一份固定证书会在某个未来的日子过期，
+// 那时测试突然变红而代码根本没动。
+// ===================================================================
+
+/// 生成一张 127.0.0.1 的自签证书，返回 (证书 PEM, 私钥 PEM)
+fn 自签证书() -> (String, String) {
+    let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key).unwrap();
+    (cert.pem(), key.serialize_pem())
+}
+
+/// 起一个**开了 TLS** 的假业务 gRPC 服务
+async fn spawn_busi_tls(busi: Arc<FakeBusi>, cert: String, key: String) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .tls_config(
+                tonic::transport::ServerTlsConfig::new()
+                    .identity(tonic::transport::Identity::from_pem(cert, key)),
+            )
+            .unwrap()
+            .add_service(BusiServer::new(BusiSvc(busi)))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    addr.to_string()
+}
+
+#[tokio::test]
+async fn grpcs分支能真的跑完一笔事务() {
+    let (cert, key) = 自签证书();
+    let busi = Arc::new(FakeBusi::default());
+    let addr = spawn_busi_tls(busi.clone(), cert.clone(), key).await;
+
+    let s = Store::open("sqlite::memory:").await.unwrap();
+    // 自签证书不在任何根里，所以必须把它当额外 CA 传进去 ——
+    // 这同时验了 DTMRS_GRPC_CA 那条路（只是绕开环境变量，避免并行测试打架）
+    let d = Driver::new(s.clone(), "t".into()).with_grpc_ca_pem(cert.into_bytes());
+
+    let steps = vec![SagaStep {
+        action: format!("grpcs://{addr}/busi.v1.Busi/Deduct"),
+        compensate: format!("grpcs://{addr}/busi.v1.Busi/DeductUndo"),
+        payload: String::new(),
+    }];
+    let (g, br) = saga_rows("tls-1", &steps);
+    s.create_global(&g, &br).await.unwrap();
+    let g = s.get_global("tls-1").await.unwrap().unwrap();
+    d.process(&g).await.unwrap();
+
+    assert_eq!(
+        s.get_global("tls-1").await.unwrap().unwrap().status,
+        GlobalStatus::Succeed,
+        "TLS 分支没跑通"
+    );
+    let (deduct, undo, _, _) = busi.counts();
+    assert_eq!((deduct, undo), (1, 0), "正向该调一次，补偿一次都不该调");
+}
+
+#[tokio::test]
+async fn 证书不被信任时只重试绝不回滚() {
+    // ⚠ 这条是这一组里最重要的。
+    //
+    // 证书错误感觉像「明确的拒绝」，很容易顺手判成 Failure。但它跟业务无关 ——
+    // 判 Failure 会因为一个证书配置问题去回滚一笔**可能已经成功**的事务。
+    // 正确处理是 Unknown：只重试，等人把证书配对。
+    let (cert, key) = 自签证书();
+    let busi = Arc::new(FakeBusi::default());
+    let addr = spawn_busi_tls(busi.clone(), cert, key).await;
+
+    let s = Store::open("sqlite::memory:").await.unwrap();
+    // **故意不传 CA** —— 自签证书不在任何根证书里，握手必然失败
+    let d = Driver::new(s.clone(), "t".into());
+
+    let steps = vec![SagaStep {
+        action: format!("grpcs://{addr}/busi.v1.Busi/Deduct"),
+        compensate: format!("grpcs://{addr}/busi.v1.Busi/DeductUndo"),
+        payload: String::new(),
+    }];
+    let (g, br) = saga_rows("tls-bad", &steps);
+    s.create_global(&g, &br).await.unwrap();
+    let g = s.get_global("tls-bad").await.unwrap().unwrap();
+    d.process(&g).await.unwrap();
+
+    let st = s.get_global("tls-bad").await.unwrap().unwrap().status;
+    assert_eq!(
+        st,
+        GlobalStatus::Submitted,
+        "证书不被信任被当成了业务失败（状态 {}）—— 那会回滚一笔可能已经成功的事务",
+        st.as_str()
+    );
+    let (_, undo, _, _) = busi.counts();
+    assert_eq!(undo, 0, "绝不能因为证书问题去调补偿");
+}
+
+#[tokio::test]
+async fn 拿grpc明文去连tls端口也只是未知() {
+    // 地址写错前缀（grpc:// 打到 TLS 端口）是很常见的配置失误。
+    // 同样只能重试，不能回滚。
+    let (cert, key) = 自签证书();
+    let busi = Arc::new(FakeBusi::default());
+    let addr = spawn_busi_tls(busi.clone(), cert, key).await;
+
+    let s = Store::open("sqlite::memory:").await.unwrap();
+    let d = Driver::new(s.clone(), "t".into());
+    let steps = vec![SagaStep {
+        action: format!("grpc://{addr}/busi.v1.Busi/Deduct"), // ← 少了 s
+        compensate: format!("grpc://{addr}/busi.v1.Busi/DeductUndo"),
+        payload: String::new(),
+    }];
+    let (g, br) = saga_rows("tls-plain", &steps);
+    s.create_global(&g, &br).await.unwrap();
+    let g = s.get_global("tls-plain").await.unwrap().unwrap();
+    d.process(&g).await.unwrap();
+
+    assert_eq!(
+        s.get_global("tls-plain").await.unwrap().unwrap().status,
+        GlobalStatus::Submitted,
+        "协议写错是部署问题，只能重试"
+    );
+}
+

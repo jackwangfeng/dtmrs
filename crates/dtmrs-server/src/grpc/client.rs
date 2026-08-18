@@ -92,26 +92,91 @@ impl Decoder for BytesCodec {
 pub struct GrpcCaller {
     channels: Arc<Mutex<HashMap<String, Channel>>>,
     timeout: Duration,
+    /// 额外信任的 CA（PEM 内容，不是路径）。内网自签证书用。
+    ///
+    /// 做成字段而不是每次去读环境变量，是为了能测：改进程级 env 在并行测试里
+    /// 会互相打架，而 TLS 这种东西不实际连一次根本不知道配没配对。
+    extra_ca: Option<Arc<Vec<u8>>>,
+}
+
+/// 检查这份 PEM 里到底有没有证书，没有就**大声拒掉**。
+///
+/// ⚠ 这个函数存在的理由是一次实测：给 tonic 传一份垃圾 PEM，
+/// `tls_config()` **不报任何错** —— rustls 的 `add_parsable_certificates`
+/// 会静默跳过认不出的条目。于是运维把 `DTMRS_GRPC_CA` 指错文件（指到了私钥、
+/// 指到了不存在的软链、文件被截断）时没有任何提示，只会在握手时收到一个
+/// 跟根因毫无关系的错误。
+///
+/// 这里只做最轻的判断（有没有 BEGIN CERTIFICATE 块），不引入 PEM 解析器 ——
+/// 要抓的就是「指错文件」这类现实错误，不是要做完整校验。
+fn check_ca_pem(pem: Vec<u8>, from: &str) -> Option<Arc<Vec<u8>>> {
+    const MARK: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    let has_cert = pem.windows(MARK.len()).any(|w| w == MARK);
+    if !has_cert {
+        warn!(
+            source = from,
+            bytes = pem.len(),
+            "额外 CA 里没有 BEGIN CERTIFICATE 块，已忽略 —— \
+             传了私钥或指错文件？注意 tonic 对这种输入不会报错，只会静默不生效"
+        );
+        return None;
+    }
+    Some(Arc::new(pem))
 }
 
 impl GrpcCaller {
+    /// `DTMRS_GRPC_CA` 指向一个 PEM 文件时，把它加进信任列表。
+    ///
+    /// 读不到就**只是不加**，不 panic —— 推进器是常驻的，
+    /// 因为一个可选配置起不来比连不上更糟。
     pub fn new(timeout: Duration) -> Self {
+        let extra_ca = std::env::var("DTMRS_GRPC_CA").ok().and_then(|p| {
+            match std::fs::read(&p) {
+                Ok(pem) => check_ca_pem(pem, &p),
+                Err(e) => {
+                    warn!(path = %p, error = %e, "DTMRS_GRPC_CA 读不到，忽略该配置");
+                    None
+                }
+            }
+        });
         Self {
             channels: Arc::new(Mutex::new(HashMap::new())),
             timeout,
+            extra_ca,
         }
     }
 
-    fn channel(&self, endpoint: &str) -> Result<Channel, String> {
+    /// 直接指定额外信任的 CA（PEM 内容）。测试和嵌入式宿主用，绕开环境变量。
+    pub fn with_ca_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.extra_ca = check_ca_pem(pem.into(), "<直接传入>");
+        self
+    }
+
+    fn channel(&self, target: &GrpcTarget) -> Result<Channel, String> {
+        let endpoint = target.endpoint.as_str();
         // 先查缓存。锁里不做 await，所以用 std 的 Mutex 就够
         if let Some(c) = self.channels.lock().unwrap().get(endpoint) {
             return Ok(c.clone());
         }
-        let ch = Endpoint::from_shared(endpoint.to_string())
+        let mut ep = Endpoint::from_shared(endpoint.to_string())
             .map_err(|e| format!("gRPC 地址不合法: {e}"))?
             .timeout(self.timeout)
-            .connect_timeout(self.timeout)
-            .connect_lazy();
+            .connect_timeout(self.timeout);
+
+        if target.tls {
+            // with_enabled_roots()：把编译进来的根证书集合都启用
+            // （native = 系统信任库，走内网自签 CA；webpki = 内置 Mozilla 根）。
+            // 域名不用手写，tonic 从 uri 的 host 里取，跟证书的 SAN 校验。
+            let mut tls = tonic::transport::ClientTlsConfig::new().with_enabled_roots();
+            if let Some(pem) = &self.extra_ca {
+                tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(pem.as_slice()));
+            }
+            ep = ep
+                .tls_config(tls)
+                .map_err(|e| format!("gRPC TLS 配置不可用: {e}"))?;
+        }
+
+        let ch = ep.connect_lazy();
         self.channels
             .lock()
             .unwrap()
@@ -129,7 +194,7 @@ impl GrpcCaller {
         branch_id: &str,
         op: &str,
     ) -> BranchResult {
-        let channel = match self.channel(&target.endpoint) {
+        let channel = match self.channel(target) {
             Ok(c) => c,
             Err(e) => {
                 // 地址都拼不出来，是配置错误。但仍然按「未知」处理：
@@ -203,23 +268,83 @@ impl GrpcCaller {
 mod tests {
     use super::*;
 
+    fn target(endpoint: &str, tls: bool) -> GrpcTarget {
+        GrpcTarget {
+            endpoint: endpoint.into(),
+            path: "/a.B/C".into(),
+            tls,
+        }
+    }
+
     #[test]
     fn 地址不合法时是未知而不是失败() {
         // 判失败会触发回滚，而地址写错是部署问题
         let c = GrpcCaller::new(Duration::from_secs(1));
-        assert!(c.channel("这不是个地址").is_err());
+        assert!(c.channel(&target("这不是个地址", false)).is_err());
     }
 
     #[tokio::test]
     async fn 连不上的分支不能触发回滚() {
         // 端口上没人听 —— 必须是 Unknown（重试），绝不能是 Failure（回滚）
         let c = GrpcCaller::new(Duration::from_millis(300));
-        let t = GrpcTarget {
-            endpoint: "http://127.0.0.1:1".into(),
-            path: "/a.B/C".into(),
-        };
-        let r = c.call(&t, "g1", "saga", "01", "action").await;
+        let r = c
+            .call(&target("http://127.0.0.1:1", false), "g1", "saga", "01", "action")
+            .await;
         assert_eq!(r, BranchResult::Unknown, "连不上必须是未知，不能是失败");
+    }
+
+    /// TLS 握手失败（对面根本不是 TLS 服务）也必须是 Unknown。
+    ///
+    /// ⚠ 这条容易想当然：证书错误感觉像「明确的拒绝」，但它跟业务无关 ——
+    /// 判成 Failure 会因为一个配置问题去回滚一笔可能已经成功的事务。
+    #[tokio::test]
+    async fn tls握手失败也只能是未知() {
+        let c = GrpcCaller::new(Duration::from_millis(300));
+        let r = c
+            .call(&target("https://127.0.0.1:1", true), "g1", "saga", "01", "action")
+            .await;
+        assert_eq!(r, BranchResult::Unknown, "TLS 失败是部署问题，不是业务拒绝");
+    }
+
+    #[tokio::test]
+    async fn tls端点能建出channel() {
+        // connect_lazy 不会真握手，这里验的是 tls_config 本身能装上 ——
+        // 根证书集合没编进来的话这一步就会报错
+        let c = GrpcCaller::new(Duration::from_secs(1));
+        assert!(
+            c.channel(&target("https://busi.internal:9000", true)).is_ok(),
+            "TLS 配置装不上，多半是 tonic 的 tls feature 没开"
+        );
+    }
+
+    /// ⚠ 实测发现的坑：给 tonic 传垃圾 PEM，`tls_config()` **不报错** ——
+    /// rustls 会静默跳过认不出的条目。所以指错文件时完全没有提示，
+    /// 只会在握手阶段收到一个跟根因无关的错误。
+    ///
+    /// 现在在装载时就挡掉并打警告。这里断言的是「没被当成 CA 收下」，
+    /// 而不是「channel 建不出来」—— 建得出来是对的，只是不该多信任什么。
+    #[tokio::test]
+    async fn 垃圾ca要被挡掉而不是静默收下() {
+        for junk in [
+            &b"not a pem"[..],
+            &b"-----BEGIN PRIVATE KEY-----\nxxx\n-----END PRIVATE KEY-----"[..], // 指到私钥
+            &b""[..],
+        ] {
+            let c = GrpcCaller::new(Duration::from_secs(1)).with_ca_pem(junk.to_vec());
+            assert!(
+                c.extra_ca.is_none(),
+                "垃圾 PEM 被当成 CA 收下了，那它只会静默不生效"
+            );
+            // 而且不能把推进器搞崩
+            assert!(c.channel(&target("https://a:1", true)).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn 像样的ca要能装上() {
+        let pem = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".to_vec();
+        let c = GrpcCaller::new(Duration::from_secs(1)).with_ca_pem(pem);
+        assert!(c.extra_ca.is_some(), "守卫不能误伤真的证书");
     }
 
     /// `connect_lazy` 内部要拿 tokio 的 executor，**必须在运行时里调** ——
@@ -228,8 +353,8 @@ mod tests {
     #[tokio::test]
     async fn channel会被缓存复用() {
         let c = GrpcCaller::new(Duration::from_secs(1));
-        let a = c.channel("http://127.0.0.1:9").unwrap();
-        let b = c.channel("http://127.0.0.1:9").unwrap();
+        let a = c.channel(&target("http://127.0.0.1:9", false)).unwrap();
+        let b = c.channel(&target("http://127.0.0.1:9", false)).unwrap();
         // 缓存命中时表里只该有一条
         assert_eq!(c.channels.lock().unwrap().len(), 1);
         drop((a, b));

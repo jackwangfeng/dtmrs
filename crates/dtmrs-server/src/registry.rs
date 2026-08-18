@@ -43,7 +43,8 @@ pub enum Target {
     Local(String),
     /// `http://...` / `https://...`
     Http(String),
-    /// `grpc://host:port/包.服务/方法`
+    /// `grpc://host:port/包.服务/方法`（明文）
+    /// 或 `grpcs://host:port/包.服务/方法`（TLS）
     Grpc(GrpcTarget),
 }
 
@@ -53,21 +54,33 @@ pub enum Target {
 /// 而 HTTP 是一整个 URL。所以这里必须拆开存，不能像 http 那样原样透传。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrpcTarget {
-    /// tonic 连接用，形如 `http://host:port`
+    /// tonic 连接用。`grpc://` → `http://host:port`，`grpcs://` → `https://host:port`
     pub endpoint: String,
     /// gRPC 方法路径，形如 `/包.服务/方法`
     pub path: String,
+    /// 是否走 TLS。**不能只看 endpoint 的前缀来推**——判定散在两处早晚会漂移，
+    /// 而漂移的后果是「以为加密了其实是明文」，这种错不会有任何报错提示
+    pub tls: bool,
 }
 
 pub fn parse_target(s: &str) -> Target {
     if let Some(name) = s.strip_prefix("local://") {
         return Target::Local(name.to_string());
     }
-    // grpcs:// 走 TLS，但当前 tonic 依赖没开 tls feature，先只认明文。
-    // 认错了不如认不出来 —— 落到 Http 分支会明确报错，而不是静默用错协议。
-    if let Some(rest) = s.strip_prefix("grpc://") {
-        if let Some(t) = parse_grpc(rest) {
-            return Target::Grpc(t);
+    // ⚠ grpcs 必须排在 grpc 前面判断。反过来的话 "grpcs://..." 会先被
+    //   strip_prefix("grpc://") 试探 —— 那个不匹配（因为第 5 个字符是 s），
+    //   所以现在顺序其实无所谓，但写死这个顺序是防止以后有人改成
+    //   starts_with("grpc") 那种前缀判断，那时静默降级成明文就发生了
+    for (prefix, scheme, tls) in [
+        ("grpcs://", "https", true),
+        ("grpc://", "http", false),
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            // 认不出来就落到 Http 分支去**明确失败**，不猜。
+            // 静默用错协议比报错难查得多
+            if let Some(t) = parse_grpc(rest, scheme, tls) {
+                return Target::Grpc(t);
+            }
         }
     }
     Target::Http(s.to_string())
@@ -77,7 +90,7 @@ pub fn parse_target(s: &str) -> Target {
 ///
 /// 必须正好有两段路径（服务名 + 方法名）。少一段或多一段都说明地址写错了，
 /// 这时候**不能猜** —— 返回 None 让它落到 Http 分支去明确失败。
-fn parse_grpc(rest: &str) -> Option<GrpcTarget> {
+fn parse_grpc(rest: &str, scheme: &str, tls: bool) -> Option<GrpcTarget> {
     let (authority, path) = rest.split_once('/')?;
     if authority.is_empty() {
         return None;
@@ -87,8 +100,9 @@ fn parse_grpc(rest: &str) -> Option<GrpcTarget> {
         return None;
     }
     Some(GrpcTarget {
-        endpoint: format!("http://{authority}"),
+        endpoint: format!("{scheme}://{authority}"),
         path: format!("/{}/{}", segs[0], segs[1]),
+        tls,
     })
 }
 
@@ -178,6 +192,38 @@ mod tests {
         // endpoint 必须带 http:// —— tonic 的 Endpoint 要求是个完整 URI
         assert_eq!(t.endpoint, "http://127.0.0.1:9000");
         assert_eq!(t.path, "/busi.Busi/Deduct");
+        assert!(!t.tls, "grpc:// 是明文");
+    }
+
+    #[test]
+    fn grpcs走tls且端点是https() {
+        let Target::Grpc(t) = parse_target("grpcs://busi.internal:9000/busi.Busi/Deduct") else {
+            panic!("应该认成 grpc");
+        };
+        assert_eq!(t.endpoint, "https://busi.internal:9000");
+        assert_eq!(t.path, "/busi.Busi/Deduct");
+        assert!(t.tls, "grpcs:// 必须走 TLS");
+    }
+
+    /// ⚠ 这条钉的是**静默降级**：如果 grpcs 因为某种原因没被认出来，
+    /// 它会落到 Http 分支去明确失败 —— 而绝不能变成一个 tls=false 的 Grpc。
+    /// 后者的后果是「以为加密了其实是明文」，没有任何报错提示。
+    #[test]
+    fn grpcs绝不能静默降级成明文() {
+        for s in [
+            "grpcs://a:1/p.S/M",
+            "grpcs://a:1/bad",       // 畸形，会落回 Http
+            "grpcs://",              // 畸形
+        ] {
+            if let Target::Grpc(t) = parse_target(s) {
+                assert!(t.tls, "{s} 认成了 grpc 却没开 TLS —— 这是静默降级成明文");
+                assert!(
+                    t.endpoint.starts_with("https://"),
+                    "{s} 的端点不是 https：{}",
+                    t.endpoint
+                );
+            }
+        }
     }
 
     #[test]

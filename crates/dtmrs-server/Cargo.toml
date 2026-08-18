@@ -58,6 +58,9 @@ tonic-prost = { workspace = true }
 prost = { workspace = true }
 tokio-stream = { workspace = true }
 redis = { workspace = true }
+# 端到端 TLS 测试要现生成一张自签证书。纯 Rust，不依赖系统 openssl ——
+# 落盘一份固定证书更省事，但那种证书会过期，测试会在某个未来的日子突然变红
+rcgen = "0.14"
 
 [package.metadata.docs.rs]
 # 默认就带 grpc；protoc 由 build.rs 兜底，docs.rs 上不需要额外装

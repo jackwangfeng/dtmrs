@@ -958,7 +958,7 @@ dtmrs = { version = "0.7", default-features = false, features = ["barrier"] }
 | Feature | 给你什么 |
 |---|---|
 | `server`（默认） | 协调器本体、`Embedded`、`dtmrs` 二进制 |
-| `grpc` | gRPC 服务端接口 + 调 `grpc://` 分支 |
+| `grpc` | gRPC 服务端接口 + 调 `grpc://` `grpcs://` 分支 |
 | `barrier` | 子事务屏障（业务库是 SQL）——任何业务服务接入都必需 |
 | `barrier-redis` | **业务数据在 Redis 里**时的屏障（秒杀库存那类） |
 | `xa` | 业务侧（RM）的 XA 助手 |

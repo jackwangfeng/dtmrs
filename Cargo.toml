@@ -37,7 +37,13 @@ sqlx = { version = "0.8", default-features = false, features = [
 chrono = { version = "0.4", features = ["serde"] }
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tonic = "0.14"
+# TLS：tls-ring 跟 reqwest 的 rustls-tls 用同一个后端（rustls + ring），
+# 不会在依赖树里拉进第二套 TLS 实现。
+# 两套根证书都开，用 with_enabled_roots() 一起生效：
+#   native-roots —— 内网自签 CA 通常装在系统信任库里，只有它管用
+#   webpki-roots —— 内置 Mozilla 根，scratch 容器里没装 ca-certificates 时兜底
+# 另有 DTMRS_GRPC_CA 可以再塞一个 PEM，覆盖「证书谁都不认」的情况
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots", "tls-webpki-roots"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic-prost = "0.14"
 redis = { version = "1", default-features = false, features = ["tokio-comp", "script"] }
