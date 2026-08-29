@@ -13,6 +13,7 @@
 | 上生产 / 多实例 / 配监控 | [部署与运维](deployment.md) |
 | 查接口字段和返回码 | [API 参考](api.md) |
 | 出问题了 | [排错](troubleshooting.md) |
+| 想知道跑多快、压测怎么做才不骗人 | [性能实测](benchmarks.md) |
 | 了解协议和内部设计 | [DESIGN.md](../DESIGN.md) |
 | 查 Rust 库 API | [docs.rs/dtmrs](https://docs.rs/dtmrs) |
 | 非 Rust 服务要接入 | [各语言屏障实现](../clients/) |
