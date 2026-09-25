@@ -141,19 +141,33 @@ create table barrier(
 ```
 next_cron_time      下次该处理的时间
 next_cron_interval  当前退避间隔（指数增长，有上限）
-owner               哪个 TC 实例正在处理（租约，防并发重复推进）
+owner               哪个 TC 实例正在处理（只用于排查，不参与判断）
+lease_until         租约到期时刻，0 = 没人持有（0.11 起单独一列）
 ```
 
 cron 轮询走 `key(status, next_cron_time)` 索引：
 
 ```sql
-UPDATE trans_global SET owner=?, next_cron_time=now()+interval
-WHERE status IN ('submitted','aborting') AND next_cron_time < now()
-ORDER BY next_cron_time LIMIT 1     -- 抢到即持有租约
+UPDATE trans_global SET owner=?, lease_until=now()+lease, next_cron_time=now()+lease
+WHERE status IN ('submitted','aborting') AND next_cron_time <= now()
+  AND lease_until <= now()          -- 抢到即持有租约
 ```
 
 抢占式更新是**原子的**，所以多个 TC 实例不会重复推进同一个事务。
 如果持有租约的实例崩了，租约到期后别的实例接手 —— 这就是崩溃恢复。
+
+**为什么租约要单独一列。** 0.11 之前租约就是「抢到时把 next_cron_time 推到租约之后」。
+于是 abort / 管理台「立刻重试」一调 `schedule_now`（把 next_cron_time 拨回现在），
+租约就被冲掉了，第二个 worker 抢到同一笔，两个 worker 并发推。现在抢占只看
+lease_until，`schedule_now` 碰不到它。
+
+**推进器落状态是「比较后再写」。** 它手上的状态是抢到那一刻读的；推的过程中可能被
+abort 改了（saga 推到一半被中止）。按旧状态写 `succeed` 会把 aborting 无声地盖掉，
+所以写的条件是「状态还是我读到的那个」，写不进去就放掉租约、下一轮按新状态推。
+
+**放租约时不推迟外部请求。** 持有者这一轮以退避收尾时，如果持有期间有人要求过
+立刻处理（next_cron_time 被提前到了 lease_until 之前），就保留那个时间 ——
+否则 abort 的补偿要等一整个退避周期。
 
 ### 崩溃恢复的正确性
 TC 崩溃后重启，所有未终结事务会被 cron 重新捞起继续推进。

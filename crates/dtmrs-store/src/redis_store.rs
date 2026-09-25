@@ -294,6 +294,8 @@ impl RedisStore {
             next_cron_time: num("next_cron_time"),
             next_cron_interval: num("next_cron_interval"),
             owner: get("owner"),
+            // 老数据没有这个字段 = 没人持有
+            lease_until: num("lease_until"),
             rollback_reason: get("rollback_reason"),
             query_prepared: get("query_prepared"),
             create_time: num("create_time"),
@@ -325,13 +327,14 @@ impl RedisStore {
                 'gid', ARGV[1], 'trans_type', ARGV[2], 'status', ARGV[3],
                 'payload', ARGV[4], 'next_cron_time', ARGV[5],
                 'next_cron_interval', ARGV[6], 'owner', ARGV[10], 'rollback_reason', '',
-                'query_prepared', ARGV[7], 'create_time', ARGV[8], 'update_time', ARGV[8])
-            -- 分支从第 11 个 ARGV 开始，每两个一组（field, value），
+                'query_prepared', ARGV[7], 'create_time', ARGV[8], 'update_time', ARGV[8],
+                'lease_until', ARGV[11])
+            -- 分支从第 12 个 ARGV 开始，每两个一组（field, value），
             -- 定义和状态各占一组。**一条 HSET 全写完** —— 原来是每个字段
             -- 一条 HSETNX，分支多的时候命令数线性涨。
             -- 上面已经确认过全局键不存在，所以不需要 NX 语义
-            if #ARGV >= 11 then
-                redis.call('HSET', KEYS[2], unpack(ARGV, 11))
+            if #ARGV >= 12 then
+                redis.call('HSET', KEYS[2], unpack(ARGV, 12))
             end
             if ARGV[9] == '1' then
                 redis.call('ZADD', KEYS[3], ARGV[5], ARGV[1])
@@ -370,7 +373,8 @@ impl RedisStore {
             })
             // ⚠ owner 要真的写进去（原来写死空串）。提交方可以在建事务时
             // 就把租约占在自己手上，直接开推，省掉一次抢占往返 —— 见 `Api::submit`
-            .arg(&g.owner);
+            .arg(&g.owner)
+            .arg(g.lease_until);
         for b in branches {
             inv.arg(Self::bfield(&b.branch_id, b.op))
                 .arg(Self::branch_value(b));
@@ -439,7 +443,7 @@ impl RedisStore {
                 local gkey = ARGV[4] .. gid
                 -- 一条 HMGET 拿两个字段。索引自愈保留着（下面两个 ZREM），
                 -- 只是把两次 HGET 合成一次
-                local v = redis.call('HMGET', gkey, 'status', 'trans_type')
+                local v = redis.call('HMGET', gkey, 'status', 'trans_type', 'lease_until')
                 local st, tt = v[1], v[2]
                 if not st then
                     -- 事务本体没了（过期了），索引里的残留清掉
@@ -447,10 +451,15 @@ impl RedisStore {
                 elseif not schedulable(st, tt) then
                     -- 状态已经不该被调度，从索引摘掉
                     redis.call('ZREM', KEYS[1], gid)
+                elseif tonumber(v[3] or '0') > tonumber(ARGV[1]) then
+                    -- 有人持着租约（持有期间被 schedule_now 提前了，所以出现在这里）。
+                    -- **跳过、不摘索引**：持有者放租约时会把它按新时间排回去
                 else
-                    -- 抢到了：立刻把下次调度时间推到租约之后，等于占坑
+                    -- 抢到了：租约和下次调度时间都推到租约之后（两者相等是
+                    -- release_lease 判断「持有期间有没有人要求立刻处理」的依据）
                     redis.call('HSET', gkey, 'owner', ARGV[2],
-                               'next_cron_time', ARGV[3], 'update_time', ARGV[1])
+                               'next_cron_time', ARGV[3], 'lease_until', ARGV[3],
+                               'update_time', ARGV[1])
                     redis.call('ZADD', KEYS[1], ARGV[3], gid)
                     return redis.call('HGETALL', gkey)
                 end
@@ -585,6 +594,114 @@ impl RedisStore {
         Ok(())
     }
 
+    /// 「比较后再写」的落状态，见 SQL 后端同名方法。
+    ///
+    /// 只对 [`dtmrs_core::status_contested`] 的 `from` 真比较：比较要走 Lua，而落终态
+    /// 原本专门做成了不用 Lua 的一次 MULTI（见 [`Self::set_global_status`]，+15% 吞吐）。
+    /// 没人能改的状态比较了也是白比较，那些照旧走 MULTI。
+    pub async fn transition(
+        &self,
+        gid: &str,
+        from: GlobalStatus,
+        to: GlobalStatus,
+        trans_type: TransType,
+        reason: &str,
+    ) -> Result<bool> {
+        if !dtmrs_core::status_contested(from, trans_type) {
+            self.set_global_status(gid, to, trans_type, reason).await?;
+            return Ok(true);
+        }
+        let t = crate::now();
+        let reason: String = reason.chars().take(MID).collect();
+        let script = redis::Script::new(
+            r#"
+            local v = redis.call('HMGET', KEYS[1], 'status', 'next_cron_time')
+            if not v[1] then return 0 end
+            if v[1] ~= ARGV[5] then return 0 end
+            -- ⚠ 普通字符串字面量，不是 format!，花括号别写成 {{}}
+            local f = {'status', ARGV[1], 'update_time', ARGV[2]}
+            if ARGV[3] == '1' then
+                f[#f + 1] = 'finish_time'
+                f[#f + 1] = ARGV[2]
+            end
+            if ARGV[4] ~= '' then
+                f[#f + 1] = 'rollback_reason'
+                f[#f + 1] = ARGV[4]
+            end
+            redis.call('HSET', KEYS[1], unpack(f))
+            if ARGV[7] == '1' then
+                redis.call('ZADD', KEYS[2], v[2] or ARGV[2], ARGV[6])
+            else
+                redis.call('ZREM', KEYS[2], ARGV[6])
+            end
+            if ARGV[3] == '1' and tonumber(ARGV[8]) > 0 then
+                redis.call('EXPIRE', KEYS[1], ARGV[8])
+                redis.call('EXPIRE', KEYS[3], ARGV[8])
+            end
+            return 1
+            "#,
+        );
+        let mut c = self.conn.clone();
+        let n: i64 = script
+            .key(self.gkey(gid))
+            .key(self.ikey())
+            .key(self.bkey(gid))
+            .arg(to.as_str())
+            .arg(t)
+            .arg(if to.is_final() { "1" } else { "0" })
+            .arg(reason)
+            .arg(from.as_str())
+            .arg(gid)
+            .arg(if schedulable(to, trans_type) {
+                "1"
+            } else {
+                "0"
+            })
+            .arg(self.final_ttl)
+            .invoke_async(&mut c)
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// 放掉租约并排下一次，见 SQL 后端同名方法（两个条件的理由都在那边）。
+    pub async fn release_lease(&self, gid: &str, lease: i64, interval: i64) -> Result<()> {
+        let t = crate::now();
+        let script = redis::Script::new(
+            r#"
+            local v = redis.call('HMGET', KEYS[1], 'status', 'lease_until', 'next_cron_time')
+            if not v[1] then return 0 end
+            local lu = tonumber(v[2] or '0')
+            -- 租约已经不是我的了（过期后被别人接手）：什么都不做
+            if lu ~= tonumber(ARGV[1]) then return 0 end
+            local nct = tonumber(v[3] or '0')
+            local newt, newi = ARGV[2], ARGV[3]
+            -- 持有期间有人要求立刻处理过（next_cron_time 被提前到租约之前）：保留
+            if nct < lu then
+                newt, newi = v[3], '0'
+            end
+            redis.call('HSET', KEYS[1], 'next_cron_time', newt, 'next_cron_interval', newi,
+                       'lease_until', 0, 'update_time', ARGV[4])
+            -- 只更新已经在索引里的，别把不该调度的塞回去
+            if redis.call('ZSCORE', KEYS[2], ARGV[5]) then
+                redis.call('ZADD', KEYS[2], newt, ARGV[5])
+            end
+            return 1
+            "#,
+        );
+        let mut c = self.conn.clone();
+        let _: i64 = script
+            .key(self.gkey(gid))
+            .key(self.ikey())
+            .arg(lease)
+            .arg(t + interval)
+            .arg(interval)
+            .arg(t)
+            .arg(gid)
+            .invoke_async(&mut c)
+            .await?;
+        Ok(())
+    }
+
     /// 落分支状态和结果数据。
     ///
     /// 结果数据（`payload`）和状态**必须在同一次写里落盘**：分两步写的话
@@ -698,7 +815,7 @@ impl RedisStore {
             if v[1] ~= ARGV[3] then return {{'ALREADY'}} end
             redis.call('HSET', KEYS[1], 'status', ARGV[2], 'update_time', ARGV[1],
                        'next_cron_time', ARGV[5], 'next_cron_interval', 0,
-                       'owner', ARGV[6])
+                       'owner', ARGV[6], 'lease_until', ARGV[7])
             if schedulable(ARGV[2], v[2]) then
                 redis.call('ZADD', KEYS[2], ARGV[5], ARGV[4])
             end
@@ -720,6 +837,8 @@ impl RedisStore {
             .arg(gid)
             .arg(next_cron_time)
             .arg(owner)
+            // owner 非空 = 调用方顺便占了租约
+            .arg(if owner.is_empty() { 0 } else { next_cron_time })
             .invoke_async(&mut c)
             .await?;
         Ok(match r.first().map(String::as_str) {

@@ -16,7 +16,7 @@ Apache-2.0。只实现 DTM 的协议，不抄它的代码。
 
 ```bash
 cargo build --release                 # 二进制在 target/release/dtmrs
-cargo test --workspace                # 236 个测试（真库那部分会被跳过，见下）
+cargo test --workspace                # 250 个测试（真库那部分会被跳过，见下）
 cargo run --example embedded -p dtmrs-server   # 嵌入式模式的可运行示例
 cargo run --example workflow -p dtmrs-server   # workflow 模式（重放/断点续跑）
 
@@ -201,6 +201,16 @@ crates/
   任何分支出过错，之后的 `dtmrs_wf_branch` 一律不执行，宿主函数的返回值也不算数 ——
   宿主不检查返回值（或 Python 裸 `except:` 吞掉停止信号）时靠它兜住。
   Java 的分支回调是嵌套回调，必须 `Native.detach(false)`，否则 JNA 每次都报 detach 失败。
+- **租约是 `lease_until` 一列，推进器落状态一律 `transition`（比较后再写）**。
+  三条都有 `tests/lease.rs` 钉着，别退回去：
+  - 抢占看 `lease_until <= now`，所以 `schedule_now` 冲不掉别人的租约；
+  - 推进器**不能用** `set_global_status`：手上的状态可能已经被 abort 改了，
+    无条件写会把 aborting 盖掉。`transition` 返回 false 就放租约、立刻重排、结束这一轮；
+  - 放租约走 `release_lease(gid, g.lease_until, 退避)`：`lease_until` 是令牌
+    （同进程的 worker 共用 owner，分不出是谁），持有期间被 `schedule_now` 过就不推迟。
+  Redis 上只对 `dtmrs_core::status_contested` 的状态真比较（要走 Lua，落终态原本是 MULTI）。
+  **改 `Api` 里 abort / submit 的放行规则时必须同步改 `status_contested`**，
+  `外部能改的状态必须跟api的放行规则一致` 会逐格核对。
 - **workflow 模式靠重放**：函数会被从头跑多次，已成功的分支走记忆化。改
   `workflow.rs` 时记住两条不变量：补偿必须**先于**正向动作登记（否则动作超时
   或崩溃会漏掉补偿）；分岔检测发现名字对不上时**既不能成功也不能回滚**，

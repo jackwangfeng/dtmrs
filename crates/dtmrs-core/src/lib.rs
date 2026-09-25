@@ -280,6 +280,38 @@ impl SagaStep {
     }
 }
 
+/// 处于这个状态的事务，会不会被**推进器之外**的人改掉状态。
+///
+/// 推进器手上的状态是抢到事务那一刻读的，推的过程中别人可能改了它 ——
+/// saga 推到一半被 abort，推进器推完还想写 `succeed`，这一写要是生效，
+/// abort 就被无声地盖掉了（调用方拿到的是「中止成功」）。所以推进器落状态
+/// 要「比较后再写」：只有状态还是它读到的那个，才写得进去。
+///
+/// 但「比较」在 Redis 上要走 Lua，落终态原本专门做成了一次 MULTI（实测 +15%
+/// 吞吐）。这个函数回答「这次比较有没有必要」—— 没人能改的状态，比较了也白比较。
+///
+/// 外部能改全局状态的只有两处（`dtmrs-server` 的 `Api`）：
+///
+/// | 外部操作 | 从 | 到 |
+/// |---|---|---|
+/// | `abort` | 非终态，且**不是**已 submit 的 tcc / xa / msg，且不是已经 aborting | aborting |
+/// | `submit` | prepared | submitted |
+///
+/// ⚠ 改那两处的放行规则时必须同步改这里，`dtmrs-server` 里有测试把两边钉在一起
+/// （`外部能改的状态必须跟api的放行规则一致`）。这里漏写一个，那个状态上的
+/// 并发 abort 就会被推进器盖掉。
+pub fn status_contested(status: GlobalStatus, tt: TransType) -> bool {
+    match status {
+        // abort / submit 都能改
+        GlobalStatus::Prepared => true,
+        // abort 只对 saga / workflow 放行 —— 另外三种 submit 之后方向已定
+        GlobalStatus::Submitted => matches!(tt, TransType::Saga | TransType::Workflow),
+        // 已经在回滚了：abort 再调一次是空操作，submit 只认 prepared
+        GlobalStatus::Aborting => false,
+        GlobalStatus::Succeed | GlobalStatus::Failed => false,
+    }
+}
+
 /// 推进全局事务后，状态机给出的下一步指令
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Advance {

@@ -100,6 +100,17 @@ pub struct GlobalRow {
     pub next_cron_time: i64,
     pub next_cron_interval: i64,
     pub owner: String,
+    /// 租约到期时刻（unix 秒），0 = 没人持有。**谁在推这笔事务只看它。**
+    ///
+    /// 原先租约就是「抢到时把 next_cron_time 推到租约之后」，于是 abort /
+    /// 管理台的「立刻重试」一调 `schedule_now`，租约就被冲掉了，第二个 worker
+    /// 抢到同一笔，两个 worker 并发推。现在抢占要求 `lease_until <= now`，
+    /// `schedule_now` 碰不到它。
+    ///
+    /// 它同时是**释放租约的令牌**：[`Store::release_lease`] 只放得掉值对得上的那次
+    /// 租约。同一进程的 worker 共用 owner，靠 owner 分不出是谁 —— 一个租约过期的
+    /// 慢 worker 回来释放时，不能把接手者的租约放掉
+    pub lease_until: i64,
     pub rollback_reason: String,
     /// 二阶段消息的回查地址。进程在 prepare 和 submit 之间崩了，
     /// TC 靠它问业务方"这单本地事务到底提交了没有"
@@ -279,6 +290,7 @@ impl SqlStore {
               next_cron_time     BIGINT NOT NULL DEFAULT 0,
               next_cron_interval BIGINT NOT NULL DEFAULT 0,
               owner              {idt} NOT NULL,
+              lease_until        BIGINT NOT NULL DEFAULT 0,
               rollback_reason    {mid} NOT NULL,
               query_prepared     {mid} NOT NULL,
               create_time        BIGINT NOT NULL,
@@ -346,8 +358,17 @@ impl SqlStore {
     /// 加新列时在这个数组里加一行就行。
     async fn add_missing_columns(&self) -> Result<()> {
         let mid = self.be.text(MID);
-        let adds: [(&str, String); 1] =
-            [("auth_token", format!("secret {mid} NOT NULL DEFAULT ''"))];
+        let adds: [(&str, String); 2] = [
+            ("auth_token", format!("secret {mid} NOT NULL DEFAULT ''")),
+            // 0.11：租约单独一列（见 GlobalRow::lease_until）。老行补出来是 0 =
+            // 没人持有，正在跑的老租约会失效一次 —— 最坏是升级那一刻某笔被推两遍，
+            // 跟升级前的行为一样。**所有 TC 实例要一起升级**：老版本不认这一列，
+            // 照样会用 schedule_now 冲掉新版本的租约
+            (
+                "trans_global",
+                "lease_until BIGINT NOT NULL DEFAULT 0".to_string(),
+            ),
+        ];
         for (table, coldef) in adds {
             let sql = format!("ALTER TABLE {table} ADD COLUMN {coldef}");
             if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
@@ -389,8 +410,8 @@ impl SqlStore {
         let t = now();
         let n = sqlx::query(&self.be.q("{INS} trans_global
              (gid,trans_type,status,payload,next_cron_time,next_cron_interval,
-              owner,rollback_reason,query_prepared,create_time,update_time)
-             VALUES (?,?,?,?,?,?,?,'',?,?,?)
+              owner,lease_until,rollback_reason,query_prepared,create_time,update_time)
+             VALUES (?,?,?,?,?,?,?,?,'',?,?,?)
              {NOCONFLICT}"))
         .bind(&g.gid)
         .bind(g.trans_type.to_string())
@@ -403,6 +424,7 @@ impl SqlStore {
         // next_cron_time=现在+租约），这样它能直接开推，
         // **省掉一次抢占往返** —— 见 `Api::submit`
         .bind(&g.owner)
+        .bind(g.lease_until)
         .bind(&g.query_prepared)
         .bind(t)
         .bind(t)
@@ -570,6 +592,48 @@ impl SqlStore {
         Ok(())
     }
 
+    /// 「比较后再写」的落状态：只有当前状态还是 `from` 才改成 `to`。返回改没改成。
+    ///
+    /// 推进器落状态一律走这个。它手上的状态是抢到事务那一刻读的，推的过程中
+    /// 可能被 abort 改了 —— 这时候再按旧状态写（比如 `succeed`），abort 就被无声地
+    /// 盖掉了。返回 `false` 时推进器要放掉租约、立刻重排，下一轮读到新状态再推。
+    ///
+    /// SQL 上就是 WHERE 里多一个条件，没有额外代价。Redis 上只对
+    /// [`dtmrs_core::status_contested`] 的状态真比较（那边比较要走 Lua）。
+    ///
+    /// ⚠ `from` 和 `to` 不能相同：MySQL 的 rows_affected 数的是「改变了的行」，
+    /// 值没变（同一秒内 update_time 也一样）会返回 0，被误判成没改成
+    pub async fn transition(
+        &self,
+        gid: &str,
+        from: GlobalStatus,
+        to: GlobalStatus,
+        _trans_type: TransType,
+        reason: &str,
+    ) -> Result<bool> {
+        debug_assert_ne!(from, to, "transition 的 from 和 to 不能相同，见文档");
+        let t = now();
+        let fin = if to.is_final() { Some(t) } else { None };
+        let reason: String = reason.chars().take(MID).collect();
+        let reason = reason.as_str();
+        let n = sqlx::query(&self.be.q(
+            "UPDATE trans_global SET status=?, update_time=?, finish_time=?,
+             rollback_reason = CASE WHEN ? <> '' THEN ? ELSE rollback_reason END
+             WHERE gid=? AND status=?",
+        ))
+        .bind(to.as_str())
+        .bind(t)
+        .bind(fin)
+        .bind(reason)
+        .bind(reason)
+        .bind(gid)
+        .bind(from.as_str())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
     /// 落一个分支的状态**和结果数据**。
     ///
     /// workflow 模式的重放靠这个：函数崩溃后会从头再跑一遍，已完成的分支
@@ -662,9 +726,11 @@ impl SqlStore {
              WHERE (status IN ('submitted','aborting')
                     OR (status = 'prepared' AND trans_type = 'msg'))
                AND next_cron_time <= ?
+               AND lease_until <= ?
              LIMIT 1{}",
             self.be.skip_locked()
         )))
+        .bind(t)
         .bind(t)
         .fetch_optional(&mut *tx)
         .await?;
@@ -672,15 +738,21 @@ impl SqlStore {
             tx.rollback().await?;
             return Ok(None);
         };
-        // 立刻把 next_cron_time 推到租约之后，等于占坑
+        // 占租约。next_cron_time 也推到租约之后：
+        // - 不推的话，被租着的行一直满足 `next_cron_time <= now`，每个 worker 的
+        //   SELECT 都会先撞上它（LIMIT 1），别的到期事务就饿着了
+        // - 持有者崩了，租约到期时 next_cron_time 也到期，别人正好接手
+        // 两者相等还是 release_lease 判断「持有期间有没有人要求立刻处理」的依据
         let n = sqlx::query(&self.be.q(
-            "UPDATE trans_global SET owner=?, next_cron_time=?, update_time=?
-             WHERE gid=? AND next_cron_time <= ?",
+            "UPDATE trans_global SET owner=?, next_cron_time=?, lease_until=?, update_time=?
+             WHERE gid=? AND next_cron_time <= ? AND lease_until <= ?",
         ))
         .bind(owner)
         .bind(t + lease)
+        .bind(t + lease)
         .bind(t)
         .bind(&gid)
+        .bind(t)
         .bind(t)
         .execute(&mut *tx)
         .await?
@@ -708,6 +780,42 @@ impl SqlStore {
         .bind(t + interval)
         .bind(t)
         .bind(gid)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 推进器推完这一轮，放掉租约并排下一次（`interval` 秒后）。
+    ///
+    /// 两个条件都不能少：
+    ///
+    /// 1. **`lease_until` 要对得上 `lease`**（抢到时拿到的那个值）。租约过期后被别人
+    ///    接手了的话，这里什么都不做 —— 不能把接手者的租约放掉。同一进程的 worker
+    ///    共用 owner，只能靠租约值区分
+    /// 2. **持有期间有人要求立刻处理，就不按退避推迟。** 抢到时 next_cron_time
+    ///    和 lease_until 相等；持有期间 abort / 管理台「立刻重试」调了 schedule_now，
+    ///    next_cron_time 就会小于 lease_until。这时保留那个时间，不然 abort 要等一整个
+    ///    退避周期（10 秒起）才开始补偿
+    ///
+    /// ⚠ **SET 子句的顺序不能动。** MySQL 的单表 UPDATE 是从左往右求值的，后面的
+    /// 表达式看到的是前面**刚改过的新值**（Postgres / sqlite 看到的都是旧值）。
+    /// 两个 CASE 都要读原来的 next_cron_time 和 lease_until，所以它们排在前面、
+    /// next_cron_interval 在 next_cron_time 之前、lease_until 清零放最后
+    pub async fn release_lease(&self, gid: &str, lease: i64, interval: i64) -> Result<()> {
+        let t = now();
+        sqlx::query(&self.be.q(
+            "UPDATE trans_global SET
+               next_cron_interval = CASE WHEN next_cron_time < lease_until THEN 0 ELSE ? END,
+               next_cron_time = CASE WHEN next_cron_time < lease_until THEN next_cron_time ELSE ? END,
+               update_time = ?,
+               lease_until = 0
+             WHERE gid=? AND lease_until=?",
+        ))
+        .bind(interval)
+        .bind(t + interval)
+        .bind(t)
+        .bind(gid)
+        .bind(lease)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -747,13 +855,16 @@ impl SqlStore {
         // 状态、退避、排队一条 UPDATE 落完。
         // ⚠ `AND status=?`（prepared）不能省：并发重复提交时，
         // 别把已经在推进的事务硬拽回队首
+        // owner 非空 = 调用方顺便占了租约，租约到期时刻就是它给的 next_cron_time
+        let lease_until = if owner.is_empty() { 0 } else { next_cron_time };
         sqlx::query(&self.be.q("UPDATE trans_global SET status=?, update_time=?,
-             next_cron_time=?, next_cron_interval=0, owner=?
+             next_cron_time=?, next_cron_interval=0, owner=?, lease_until=?
              WHERE gid=? AND status=?"))
         .bind(GlobalStatus::Submitted.as_str())
         .bind(t)
         .bind(next_cron_time)
         .bind(owner)
+        .bind(lease_until)
         .bind(gid)
         .bind(GlobalStatus::Prepared.as_str())
         .execute(&self.pool)
@@ -762,10 +873,14 @@ impl SqlStore {
         g.status = GlobalStatus::Submitted;
         g.next_cron_time = next_cron_time;
         g.owner = owner.to_string();
+        g.lease_until = lease_until;
         Ok(SubmitOutcome::Advanced(Box::new(g)))
     }
 
-    /// 让某个事务立刻可被调度（提交/中止之后叫一下，不用等 cron 周期）
+    /// 让某个事务立刻可被调度（提交/中止之后叫一下，不用等 cron 周期）。
+    ///
+    /// 正被 worker 持着租约的也可以放心调：抢占看的是 lease_until，这里不碰它。
+    /// 持有者放租约时会看到这次请求、不按退避推迟（见 [`Self::release_lease`]）
     pub async fn schedule_now(&self, gid: &str) -> Result<()> {
         sqlx::query(
             &self
@@ -853,7 +968,7 @@ impl SqlStore {
 
 /// 列清单只写一处 —— 三个地方读 trans_global，列顺序漂移过一次就够难查了
 const SELECT_GLOBAL: &str = "SELECT gid,trans_type,status,payload,next_cron_time,
-    next_cron_interval,owner,rollback_reason,query_prepared,create_time,finish_time
+    next_cron_interval,owner,lease_until,rollback_reason,query_prepared,create_time,finish_time
     FROM trans_global";
 
 fn token_from_row(r: &AnyRow) -> TokenRow {
@@ -880,6 +995,7 @@ fn global_from_row(r: AnyRow) -> GlobalRow {
         next_cron_time: r.get("next_cron_time"),
         next_cron_interval: r.get("next_cron_interval"),
         owner: r.get("owner"),
+        lease_until: r.get("lease_until"),
         rollback_reason: r.get("rollback_reason"),
         query_prepared: r.get("query_prepared"),
         create_time: r.get("create_time"),
@@ -995,6 +1111,7 @@ mod tests {
             next_cron_time: 0,
             next_cron_interval: 0,
             owner: String::new(),
+            lease_until: 0,
             rollback_reason: String::new(),
             query_prepared: String::new(),
             create_time: 0,
@@ -1024,6 +1141,262 @@ mod tests {
             let b = s.lock_one_due("worker-b", 60).await.unwrap();
             assert!(b.is_none(), "{name}: 租约期内不能被别人抢走");
         }
+    }
+
+    /// 租约只能由 `lease_until` 决定，**不能被 schedule_now 冲掉**。
+    ///
+    /// 原先租约就是「next_cron_time 被推到租约之后」，于是 abort / 管理台的「立刻重试」
+    /// 一调 schedule_now，正在推的那笔就被第二个 worker 抢走，两个 worker 并发推同一笔
+    #[tokio::test]
+    async fn 租约期间schedule_now不能让第二个worker抢到() {
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
+            s.create_global(&g("ls1"), &[]).await.unwrap();
+            let a = s.lock_one_due("worker-a", 60).await.unwrap().unwrap();
+            assert!(a.lease_until > now(), "{name}: 抢到时要带着租约");
+            s.schedule_now("ls1").await.unwrap();
+            assert!(
+                s.lock_one_due("worker-b", 60).await.unwrap().is_none(),
+                "{name}: 租约期内被 schedule_now 过也不能被别人抢"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn 租约期间被要求立刻处理的_释放后不能被推迟到退避之后() {
+        // 持有者推完这一轮要退避 600 秒，但持有期间有人 abort / 立刻重试过 ——
+        // 那个「现在就处理」不能被持有者的退避盖掉，否则 abort 要等十分钟才开始补偿
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
+            s.create_global(&g("ls2"), &[]).await.unwrap();
+            let a = s.lock_one_due("worker-a", 60).await.unwrap().unwrap();
+            s.schedule_now("ls2").await.unwrap();
+            s.release_lease("ls2", a.lease_until, 600).await.unwrap();
+            let b = s.lock_one_due("worker-b", 60).await.unwrap();
+            assert_eq!(
+                b.map(|g| g.gid),
+                Some("ls2".into()),
+                "{name}: 放掉之后要立刻能被抢"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn 没人插手时_释放按退避时间走() {
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
+            s.create_global(&g("ls3"), &[]).await.unwrap();
+            let a = s.lock_one_due("worker-a", 60).await.unwrap().unwrap();
+            s.release_lease("ls3", a.lease_until, 600).await.unwrap();
+            assert!(
+                s.lock_one_due("worker-b", 60).await.unwrap().is_none(),
+                "{name}"
+            );
+            let got = s.get_global("ls3").await.unwrap().unwrap();
+            assert_eq!(got.lease_until, 0, "{name}: 租约要放掉");
+            assert_eq!(got.next_cron_interval, 600, "{name}");
+            assert!(got.next_cron_time >= now() + 590, "{name}: 按退避排到之后");
+        }
+    }
+
+    #[tokio::test]
+    async fn 过期租约的持有者放不掉别人的新租约() {
+        // 慢 worker 的租约过期了，别人接手了。它推完回来释放「自己的」租约时
+        // 不能把接手者的租约放掉 —— 同一进程的 worker 共用 owner，只能靠租约值本身区分
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
+            s.create_global(&g("ls4"), &[]).await.unwrap();
+            let a = s.lock_one_due("tc-1", 1).await.unwrap().unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+            let b = s.lock_one_due("tc-1", 60).await.unwrap();
+            assert!(b.is_some(), "{name}: 租约过期了要能被接手（崩溃恢复）");
+            s.release_lease("ls4", a.lease_until, 0).await.unwrap();
+            assert!(
+                s.lock_one_due("tc-1", 60).await.unwrap().is_none(),
+                "{name}: 过期的持有者把接手者的租约放掉了"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn 建事务时就占了租约的_别人抢不到() {
+        // 提交方「顺便占租约直接开推」（Api::with_inline_driver）也要走 lease_until
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
+            let mut row = g("ls5");
+            row.owner = "submitter".into();
+            row.next_cron_time = now() + 60;
+            row.lease_until = row.next_cron_time;
+            s.create_global(&row, &[]).await.unwrap();
+            s.schedule_now("ls5").await.unwrap();
+            assert!(s.lock_one_due("w", 60).await.unwrap().is_none(), "{name}");
+
+            let mut p = g("ls6");
+            p.status = GlobalStatus::Prepared;
+            p.trans_type = TransType::Tcc;
+            s.create_global(&p, &[]).await.unwrap();
+            let nct = now() + 60;
+            let SubmitOutcome::Advanced(adv) =
+                s.submit_prepared("ls6", "submitter", nct).await.unwrap()
+            else {
+                panic!("{name}: 应该推成 submitted");
+            };
+            assert_eq!(adv.lease_until, nct, "{name}: 带回的事务体要带着租约");
+            s.schedule_now("ls6").await.unwrap();
+            assert!(s.lock_one_due("w", 60).await.unwrap().is_none(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn 状态迁移按期望值比较_对不上就不改() {
+        // 推进器手上的状态可能是旧的：saga 推到一半被 abort 了，它推完还想写 succeed。
+        // 那一写必须失败，否则 abort 被无声地盖掉，调用方却以为中止成功了
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
+            s.create_global(&g("cas1"), &[]).await.unwrap();
+            let tt = TransType::Saga;
+            assert!(
+                s.transition(
+                    "cas1",
+                    GlobalStatus::Submitted,
+                    GlobalStatus::Aborting,
+                    tt,
+                    "中止"
+                )
+                .await
+                .unwrap(),
+                "{name}"
+            );
+            assert!(
+                !s.transition(
+                    "cas1",
+                    GlobalStatus::Submitted,
+                    GlobalStatus::Succeed,
+                    tt,
+                    ""
+                )
+                .await
+                .unwrap(),
+                "{name}: 状态已经不是 submitted 了，不能写成功"
+            );
+            let got = s.get_global("cas1").await.unwrap().unwrap();
+            assert_eq!(got.status, GlobalStatus::Aborting, "{name}");
+            assert_eq!(got.rollback_reason, "中止", "{name}");
+            // aborting 仍在调度里
+            assert!(
+                s.lock_one_due("w", 60).await.unwrap().is_some(),
+                "{name}: aborting 要能被调度"
+            );
+            assert!(
+                s.transition("cas1", GlobalStatus::Aborting, GlobalStatus::Failed, tt, "")
+                    .await
+                    .unwrap(),
+                "{name}"
+            );
+            let got = s.get_global("cas1").await.unwrap().unwrap();
+            assert_eq!(got.status, GlobalStatus::Failed, "{name}");
+            assert!(got.finish_time.is_some(), "{name}");
+            // 不存在的事务：false 而不是报错
+            assert!(
+                !s.transition(
+                    "nope",
+                    GlobalStatus::Submitted,
+                    GlobalStatus::Succeed,
+                    tt,
+                    ""
+                )
+                .await
+                .unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn 状态迁移落终态后不再被调度() {
+        let (_g, bes) = backends().await;
+        for (name, s) in bes {
+            s.create_global(&g("cas2"), &[]).await.unwrap();
+            assert!(s
+                .transition(
+                    "cas2",
+                    GlobalStatus::Submitted,
+                    GlobalStatus::Succeed,
+                    TransType::Saga,
+                    ""
+                )
+                .await
+                .unwrap());
+            assert!(s.lock_one_due("w", 60).await.unwrap().is_none(), "{name}");
+            // msg 的 prepared → submitted：变得可调度（Redis 上要进索引）
+            let mut m = g("cas3");
+            m.trans_type = TransType::Msg;
+            m.status = GlobalStatus::Prepared;
+            m.next_cron_time = now() + 600;
+            s.create_global(&m, &[]).await.unwrap();
+            s.schedule_now("cas3").await.unwrap();
+            assert!(s
+                .transition(
+                    "cas3",
+                    GlobalStatus::Prepared,
+                    GlobalStatus::Submitted,
+                    TransType::Msg,
+                    ""
+                )
+                .await
+                .unwrap());
+            assert_eq!(
+                s.lock_one_due("w", 60).await.unwrap().map(|g| g.gid),
+                Some("cas3".into()),
+                "{name}"
+            );
+        }
+    }
+
+    /// 老库升级：trans_global 原先没有 lease_until 列，open 时要自动补上。
+    /// `CREATE TABLE IF NOT EXISTS` 对已有的表什么都不做 —— 补列靠 `add_missing_columns`
+    #[tokio::test]
+    async fn 老库没有lease_until列时open会补上() {
+        let _guard = PG_LOCK.lock().await;
+        let f = std::env::temp_dir().join(format!("dtmrs_mig_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&f);
+        let mut urls = vec![("sqlite", format!("sqlite:{}", f.display()))];
+        for (name, env) in [("postgres", "DTMRS_TEST_PG"), ("mysql", "DTMRS_TEST_MYSQL")] {
+            match std::env::var(env) {
+                Ok(u) => urls.push((name, u)),
+                Err(_) => require_real_db(env),
+            }
+        }
+        for (name, url) in urls {
+            let s = Store::open(&url).await.unwrap();
+            let pool = s.pool().unwrap();
+            for t in ["trans_branch_op", "trans_global"] {
+                sqlx::query(&format!("DELETE FROM {t}"))
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            // 退回到老表结构
+            sqlx::query("ALTER TABLE trans_global DROP COLUMN lease_until")
+                .execute(pool)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: DROP COLUMN 失败: {e}"));
+            drop(s);
+            let s = Store::open(&url)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: 老库打不开: {e}"));
+            s.create_global(&g("mig1"), &[]).await.unwrap();
+            let a = s.lock_one_due("w", 60).await.unwrap();
+            assert!(
+                a.is_some_and(|g| g.lease_until > 0),
+                "{name}: 补上的列要能用"
+            );
+            // 再开一次：列已经在了，补列那步必须安静地跳过
+            Store::open(&url)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: 第二次 open 失败: {e}"));
+        }
+        let _ = std::fs::remove_file(&f);
     }
 
     /// 并发抢占要抢到**不同的**事务，而不是全挤在同一笔上。
@@ -1464,11 +1837,15 @@ dispatch! {
     /// 抢一个到期事务。多实例不重复推进就靠它的原子性
     fn lock_one_due(&self, owner: &str, lease: i64) -> Option<GlobalRow>;
     fn set_global_status(&self, gid: &str, status: GlobalStatus, trans_type: TransType, reason: &str) -> ();
+    /// 比较后再写：当前状态还是 `from` 才改成 `to`，返回改没改成。推进器落状态一律走它
+    fn transition(&self, gid: &str, from: GlobalStatus, to: GlobalStatus, trans_type: TransType, reason: &str) -> bool;
     /// 把 prepared 推成 submitted 并排进调度队列，一次调用做完。见 [`SubmitOutcome`]
     fn submit_prepared(&self, gid: &str, owner: &str, next_cron_time: i64) -> SubmitOutcome;
     fn set_branch_result(&self, gid: &str, branch_id: &str, op: BranchOp, status: BranchStatus, payload: &str) -> ();
     fn set_branch_status(&self, gid: &str, branch_id: &str, op: BranchOp, status: BranchStatus) -> ();
     fn schedule_retry(&self, gid: &str, interval: i64) -> ();
+    /// 推进器推完一轮：放掉 `lease` 这次租约并排下一次。见 SQL 后端同名方法的文档
+    fn release_lease(&self, gid: &str, lease: i64, interval: i64) -> ();
     fn schedule_now(&self, gid: &str) -> ();
     /// 登记分支。**重号但 URL 不同时返回 [`RegisterOutcome::Conflict`]**，
     /// 调用方必须拒绝 —— 见那个类型的文档

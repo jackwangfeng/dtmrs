@@ -29,6 +29,7 @@ fn global(gid: &str, tt: TransType, status: GlobalStatus, payload: String) -> Gl
         next_cron_time: dtmrs_store::now(),
         next_cron_interval: 0,
         owner: String::new(),
+        lease_until: 0,
         rollback_reason: String::new(),
         query_prepared: String::new(),
         create_time: 0,

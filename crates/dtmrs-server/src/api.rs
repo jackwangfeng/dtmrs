@@ -132,6 +132,8 @@ impl Api {
         let Some(d) = &self.inline else { return false };
         g.owner = d.owner.clone();
         g.next_cron_time = dtmrs_store::now() + d.lease;
+        // 租约单独一列（见 GlobalRow::lease_until）；两者相等是「没人插过队」的标记
+        g.lease_until = g.next_cron_time;
         true
     }
 
@@ -404,9 +406,21 @@ impl Api {
         }
     }
 
-    /// 主动中止，触发逆序补偿
+    /// 主动中止，触发逆序补偿。
+    ///
+    /// 改状态是**比较后再写**：读到的是 X 就只在「还是 X」时改成 aborting。
+    /// 读和写之间状态被推进器改了（推完落了终态 / 自己转了 aborting）或被并发的
+    /// submit 改了，就重读一次、按新状态重新判断 —— 不然已经落了 succeed 的事务会被
+    /// 硬拽回 aborting，已 submit 的 tcc 会绕过下面那条守卫。
     pub async fn abort(&self, gid: &str) -> Result<()> {
-        match self.store.get_global(gid).await {
+        // 每一轮都是「读 → 判断 → 比较着写」。输了就说明有人刚改过，重来一次通常就够；
+        // 连输几次说明它在被高频改动，报错比无限转更好
+        for _ in 0..5 {
+            let g = match self.store.get_global(gid).await {
+                Ok(Some(g)) => g,
+                Ok(None) => return Err(ApiError::NotFound("gid 不存在".into())),
+                Err(e) => return Err(internal(e)),
+            };
             // ⚠ tcc / xa / msg 一旦 submit，方向就定了，**不能再 abort**。
             //
             // submit 的含义是「一阶段全成功」（try 全成功 / XA 全 prepare 了 /
@@ -419,46 +433,48 @@ impl Api {
             //
             // saga / workflow 不受限：它们本来就是「边做边决定」，中途 abort
             // 就是逆序补偿，补偿所有分支的规则兜得住
-            Ok(Some(g))
-                if g.status == GlobalStatus::Submitted
-                    && matches!(
-                        g.trans_type,
-                        TransType::Tcc | TransType::Xa | TransType::Msg
-                    ) =>
+            if g.status == GlobalStatus::Submitted
+                && matches!(
+                    g.trans_type,
+                    TransType::Tcc | TransType::Xa | TransType::Msg
+                )
             {
-                Err(ApiError::Conflict(format!(
+                return Err(ApiError::Conflict(format!(
                     "{} 事务已经 submit，方向已定，不能再 abort（只能等它推完）",
                     g.trans_type
-                )))
+                )));
             }
-            Ok(Some(g)) if !g.status.is_final() => {
-                self.store
-                    .set_global_status(gid, GlobalStatus::Aborting, g.trans_type, "调用方主动中止")
-                    .await
-                    .map_err(internal)?;
-                // ⚠ 只有**还没到期**（在退避里）的才需要提前，已经到期的**不能**再 schedule_now。
-                //
-                // 状态一改成 aborting，事务就可调度了，推进器可能在这一刻就抢到它、
-                // 把 next_cron_time 推到租约之后。这时候再无条件 schedule_now，等于把
-                // 刚发出去的租约冲掉：另一个 worker 再抢一次，同一个 cancel 被并发调两遍
-                // （`嵌入式tcc_abort不能冲掉推进器刚抢到的租约`，原先 300 笔里撞上 3 笔）。
-                //
-                // prepared 的 tcc / xa 最常走这条路，而它们的 next_cron_time 就是创建时间
-                // （prepared 时不可调度，没人动过它），本来就已经到期 —— 改完状态就会被
-                // 捞起来，不需要推一把。
-                //
-                // 仍然没堵住的：正在退避、同时又正被 worker 持着租约的事务（比如 saga
-                // 推到一半被 abort）。租约只体现在 next_cron_time 上，跟「退避中」分不出来，
-                // 要彻底解决得给租约单独一个字段。那种情况下多出来的补偿由屏障空转掉
-                if g.next_cron_time > dtmrs_store::now() {
-                    let _ = self.store.schedule_now(gid).await;
-                }
-                Ok(())
+            if g.status.is_final() {
+                return Err(ApiError::Conflict("事务已终结，无法中止".into()));
             }
-            Ok(Some(_)) => Err(ApiError::Conflict("事务已终结，无法中止".into())),
-            Ok(None) => Err(ApiError::NotFound("gid 不存在".into())),
-            Err(e) => Err(internal(e)),
+            // 已经在回滚了：重复 abort 幂等成功（也不能写 —— from 和 to 相同）
+            if g.status == GlobalStatus::Aborting {
+                return Ok(());
+            }
+            if !self
+                .store
+                .transition(
+                    gid,
+                    g.status,
+                    GlobalStatus::Aborting,
+                    g.trans_type,
+                    "调用方主动中止",
+                )
+                .await
+                .map_err(internal)?
+            {
+                continue;
+            }
+            // 推一把，不用等退避。**正被 worker 持着租约的也可以放心调**：抢占只看
+            // lease_until，这里冲不掉它；持有者推完放租约时会看到这次请求，不按退避推迟
+            // （原先租约就是 next_cron_time，这一下会把它冲掉，第二个 worker 并发推同一笔 ——
+            // `嵌入式tcc_abort不能冲掉推进器刚抢到的租约`）
+            let _ = self.store.schedule_now(gid).await;
+            return Ok(());
         }
+        Err(ApiError::Conflict(
+            "事务状态在被并发改动，abort 连续几次都没能生效，稍后重试".into(),
+        ))
     }
 
     /// 立刻重试：把下次调度时间提到现在，并清掉退避累积。

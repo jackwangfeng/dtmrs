@@ -296,12 +296,16 @@ TC 无状态，直接起多个就行，**不需要选主、不需要额外协调
 
 ```sql
 -- 大意（真实实现见 dtmrs-store）
-UPDATE trans_global SET owner=?, next_cron_time=now()+lease
+UPDATE trans_global SET owner=?, lease_until=now()+lease, next_cron_time=now()+lease
 WHERE status IN ('submitted','aborting') AND next_cron_time <= now()
-ORDER BY next_cron_time LIMIT 1
+  AND lease_until <= now()
 ```
 
 抢占式更新是原子的，所以多个实例不会推同一笔。持租约的实例崩了，**租约到期后别的实例自动接手**——这就是崩溃恢复。
+
+> ⚠ **从 0.10 及更早版本升级：所有实例要一起换。** 0.11 给 `trans_global` 加了
+> `lease_until` 列（启动时自动补，不用手动跑 DDL）。老版本不认这一列，
+> 混跑期间老实例仍会用旧方式冲掉新实例的租约。Redis 后端同理（新增的是 hash 字段）。
 
 给每个实例配不同的 `DTMRS_OWNER`（默认按 pid 生成，容器里建议显式设成 pod 名），排查问题时能看出是谁推的。
 

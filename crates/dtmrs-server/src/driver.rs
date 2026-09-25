@@ -196,9 +196,7 @@ impl Driver {
             match dtmrs_core::workflow_advance(status, &compensates) {
                 Advance::Finish(s) => {
                     info!(gid = %g.gid, status = s.as_str(), "workflow 事务终结");
-                    self.store
-                        .set_global_status(&g.gid, s, g.trans_type, "")
-                        .await?;
+                    self.transition(g, status, s, "").await?;
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
@@ -218,21 +216,20 @@ impl Driver {
                     match f(ctx).await {
                         Ok(()) => {
                             info!(gid = %g.gid, workflow = %name, "workflow 跑完");
-                            self.store
-                                .set_global_status(&g.gid, GlobalStatus::Succeed, g.trans_type, "")
+                            // 函数跑的过程中可能被 abort 了 —— 那时这一写会失败，
+                            // 下一轮按 aborting 补偿它已经登记的分支
+                            self.transition(g, status, GlobalStatus::Succeed, "")
                                 .await?;
                             return Ok(());
                         }
                         Err(crate::workflow::WorkflowError::Rollback(reason)) => {
                             info!(gid = %g.gid, workflow = %name, %reason, "workflow 要求回滚");
-                            self.store
-                                .set_global_status(
-                                    &g.gid,
-                                    GlobalStatus::Aborting,
-                                    g.trans_type,
-                                    &reason,
-                                )
-                                .await?;
+                            if !self
+                                .transition(g, status, GlobalStatus::Aborting, &reason)
+                                .await?
+                            {
+                                return Ok(());
+                            }
                             status = GlobalStatus::Aborting;
                             continue;
                         }
@@ -291,8 +288,7 @@ impl Driver {
     async fn process_saga(&self, g: &GlobalRow) -> anyhow::Result<()> {
         let steps: Vec<SagaStep> = serde_json::from_str(&g.payload).unwrap_or_default();
         if steps.is_empty() {
-            self.store
-                .set_global_status(&g.gid, GlobalStatus::Succeed, g.trans_type, "")
+            self.transition(g, g.status, GlobalStatus::Succeed, "")
                 .await?;
             return Ok(());
         }
@@ -304,16 +300,16 @@ impl Driver {
                 Advance::Finish(s) => {
                     if s == GlobalStatus::Aborting {
                         // 防御性分支：状态机发现有 failed 分支但全局还没转 aborting
+                        if !self.transition(g, status, s, "分支已判失败").await? {
+                            return Ok(());
+                        }
                         status = s;
-                        self.store
-                            .set_global_status(&g.gid, s, g.trans_type, "分支已判失败")
-                            .await?;
                         continue;
                     }
                     info!(gid = %g.gid, status = s.as_str(), "事务终结");
-                    self.store
-                        .set_global_status(&g.gid, s, g.trans_type, "")
-                        .await?;
+                    // saga 推到一半被 abort 的话，这里手上还是 submitted、想写 succeed ——
+                    // 那一写会失败，下一轮按 aborting 补偿**所有**分支（包括推完的那些）
+                    self.transition(g, status, s, "").await?;
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
@@ -345,15 +341,18 @@ impl Driver {
                             if op == BranchOp::Action {
                                 // 只有业务**明确**说失败才回滚
                                 info!(gid = %g.gid, branch = %branch_id, "分支要求回滚");
-                                status = GlobalStatus::Aborting;
-                                self.store
-                                    .set_global_status(
-                                        &g.gid,
+                                if !self
+                                    .transition(
+                                        g,
+                                        status,
                                         GlobalStatus::Aborting,
-                                        g.trans_type,
                                         &format!("分支 {branch_id} 返回 FAILURE"),
                                     )
-                                    .await?;
+                                    .await?
+                                {
+                                    return Ok(());
+                                }
+                                status = GlobalStatus::Aborting;
                             } else {
                                 // 补偿都失败了，只能不停重试 —— 这时候需要人介入
                                 warn!(gid = %g.gid, branch = %branch_id, "补偿失败，需要人工介入");
@@ -439,9 +438,7 @@ impl Driver {
             } else {
                 GlobalStatus::Succeed
             };
-            self.store
-                .set_global_status(&g.gid, s, g.trans_type, "")
-                .await?;
+            self.transition(g, g.status, s, "").await?;
             return Ok(());
         }
 
@@ -457,9 +454,7 @@ impl Driver {
             match adv {
                 Advance::Finish(s) => {
                     info!(gid = %g.gid, status = s.as_str(), mode = label, "事务终结");
-                    self.store
-                        .set_global_status(&g.gid, s, g.trans_type, "")
-                        .await?;
+                    self.transition(g, status, s, "").await?;
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
@@ -530,23 +525,27 @@ impl Driver {
             {
                 BranchResult::Success => {
                     info!(gid = %g.gid, "回查：本地事务已提交 → 继续推进");
-                    self.store
-                        .set_global_status(&g.gid, GlobalStatus::Submitted, g.trans_type, "")
-                        .await?;
+                    // 回查的同时调用方可能 abort 了（prepared 的 msg 允许 abort）。
+                    // 这一写要是覆盖掉 aborting，abort 就丢了：调用方以为作废了，消息照发
+                    if !self
+                        .transition(g, status, GlobalStatus::Submitted, "")
+                        .await?
+                    {
+                        return Ok(());
+                    }
                     status = GlobalStatus::Submitted;
                 }
                 BranchResult::Failure => {
                     // 业务方明确说"这单没提交" → 整单作废。msg 没有补偿分支，
                     // 但也不需要：正向分支压根还没跑过
                     info!(gid = %g.gid, "回查：本地事务未提交 → 整单作废");
-                    self.store
-                        .set_global_status(
-                            &g.gid,
-                            GlobalStatus::Failed,
-                            g.trans_type,
-                            "回查得到 FAILURE：本地事务未提交",
-                        )
-                        .await?;
+                    self.transition(
+                        g,
+                        status,
+                        GlobalStatus::Failed,
+                        "回查得到 FAILURE：本地事务未提交",
+                    )
+                    .await?;
                     return Ok(());
                 }
                 BranchResult::Ongoing | BranchResult::Unknown => {
@@ -559,8 +558,7 @@ impl Driver {
 
         let steps: Vec<SagaStep> = serde_json::from_str(&g.payload).unwrap_or_default();
         if steps.is_empty() {
-            self.store
-                .set_global_status(&g.gid, GlobalStatus::Succeed, g.trans_type, "")
+            self.transition(g, status, GlobalStatus::Succeed, "")
                 .await?;
             return Ok(());
         }
@@ -569,9 +567,7 @@ impl Driver {
             match msg_advance(status, &actions) {
                 Advance::Finish(s) => {
                     info!(gid = %g.gid, status = s.as_str(), "消息事务终结");
-                    self.store
-                        .set_global_status(&g.gid, s, g.trans_type, "")
-                        .await?;
+                    self.transition(g, status, s, "").await?;
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
@@ -603,10 +599,42 @@ impl Driver {
         }
     }
 
+    /// 推完这一轮、要退避：放掉**这次**的租约（`g.lease_until` 是令牌）并排下一次。
+    /// 持有期间有人要求立刻处理的话，store 会保留那个时间，不按退避推迟
     async fn retry_later(&self, g: &GlobalRow) -> anyhow::Result<()> {
         let iv = dtmrs_core::next_interval_with(g.next_cron_interval, self.retry);
-        self.store.schedule_retry(&g.gid, iv).await?;
+        self.store.release_lease(&g.gid, g.lease_until, iv).await?;
         Ok(())
+    }
+
+    /// 落全局状态，**比较后再写**：只有当前状态还是 `from` 才写得进去。
+    ///
+    /// 返回 `false` 表示推的过程中状态被推进器之外改过了（abort / submit）。
+    /// 这时已经放掉租约、排到现在，**调用方直接结束这一轮**，下一轮读到新状态再推 ——
+    /// 手上的状态是旧的，接着按它推只会越错越远。
+    ///
+    /// `from == to` 的直接当成功：不需要写，也不能写（见 `Store::transition` 的文档）
+    async fn transition(
+        &self,
+        g: &GlobalRow,
+        from: GlobalStatus,
+        to: GlobalStatus,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        if from == to {
+            return Ok(true);
+        }
+        if self
+            .store
+            .transition(&g.gid, from, to, g.trans_type, reason)
+            .await?
+        {
+            return Ok(true);
+        }
+        info!(gid = %g.gid, from = from.as_str(), to = to.as_str(),
+              "状态已被推进器之外改过（多半是 abort），放掉租约，下一轮按新状态推");
+        self.store.release_lease(&g.gid, g.lease_until, 0).await?;
+        Ok(false)
     }
 
     /// 取每一步的 action / compensate 分支当前状态，按步序对齐

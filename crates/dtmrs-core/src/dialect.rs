@@ -11,10 +11,15 @@
 //! | `INSERT IGNORE` | ❌ | ❌ | ✅ |
 //! | `TEXT PRIMARY KEY` | ✅ | ✅ | ❌ 1170 要 key length |
 //! | `CREATE INDEX IF NOT EXISTS` | ✅ | ✅ | ❌ 1064 语法错误 |
+//! | `UPDATE … SET a=…, b=f(a)` 里 `b` 看到的 `a` | 旧值 | 旧值 | ⚠ **新值**（从左往右求值） |
 //!
 //! 还有一条**踩过就忘不了**的：MySQL 的 `ON DUPLICATE KEY UPDATE` 在重复时
 //! `rows_affected` 返回 **1**（不是 0），拿它做幂等判断会把"已存在"误判成
 //! "刚插入"。所以 MySQL 必须用 `INSERT IGNORE`。
+//!
+//! 表里 UPDATE 那一行也是实测出来的（`release_lease` 把 `lease_until = 0` 挪到 SET
+//! 最前面，sqlite / postgres 全过，只有 MySQL 挂）。**一个 SET 里既要读某列又要改它，
+//! 读它的表达式必须排在改它的赋值前面**，否则 MySQL 上读到的是改过的值。
 //!
 //! # 写 SQL 的规矩
 //!
