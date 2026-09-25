@@ -24,6 +24,20 @@
 //! **3. `list_recent` 的索引有上限。**
 //! 只保留最近 [`RECENT_CAP`] 笔用于管理接口，不是全量历史。
 //!
+//! # 多个环境共用一个 Redis：key 前缀
+//!
+//! 所有 key 默认都在 `dtmrs:` 下。多套环境（或多个互不相干的 TC 集群）共用一个
+//! Redis 时，给每套配一个前缀，它们就彼此看不见 —— 连调度扫描都是按前缀的：
+//!
+//! ```text
+//! DTMRS_DB='redis://127.0.0.1:6379/0?key_prefix=staging:'
+//! ```
+//!
+//! `key_prefix` 由本库从 URL 里拆掉，不会传给 redis 客户端。只收
+//! `[A-Za-z0-9:_.-]`、不能为空：[`RedisStore::flush_prefix`] 按 `KEYS 前缀*` 删，
+//! 空前缀等于删整个库，带 `* ? [` 会误删别人的 key。
+//! 代码里也可以 [`RedisStore::with_prefix`] 之后 `Store::from(..)`。
+//!
 //! # 原子性怎么保证
 //!
 //! 关键操作全走 Lua 脚本。Redis 执行脚本是**单线程且不可打断**的，
@@ -81,18 +95,75 @@ pub struct RedisStore {
     final_ttl: i64,
 }
 
+/// 前缀的字符白名单。理由见模块文档「key 前缀」一节
+pub(crate) fn check_prefix(p: &str) -> std::result::Result<(), String> {
+    if p.is_empty() {
+        return Err("Redis key 前缀不能为空（空前缀下 flush_prefix 会删掉整个库）".into());
+    }
+    if let Some(c) = p
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '.' | '-')))
+    {
+        return Err(format!(
+            "Redis key 前缀 {p:?} 里有不允许的字符 {c:?}：只收 A-Z a-z 0-9 : _ . -"
+        ));
+    }
+    Ok(())
+}
+
+/// 把 URL 里的 `key_prefix=...` 拆出来。返回（交给 redis crate 的 URL，前缀）。
+///
+/// 其它查询参数原样、按原顺序留着 —— 那些是 redis crate 自己的（`protocol` /
+/// unix socket 的 `db` 之类）。值**不做百分号解码**：白名单里本来就没有需要转义的字符，
+/// 带 `%` 的直接被拒，免得「写的和生效的」不是同一个前缀。
+pub(crate) fn split_key_prefix(url: &str) -> std::result::Result<(String, Option<String>), String> {
+    let Some((base, query)) = url.split_once('?') else {
+        return Ok((url.to_string(), None));
+    };
+    let mut prefix = None;
+    let mut rest = Vec::new();
+    for kv in query.split('&') {
+        match kv.strip_prefix("key_prefix=") {
+            Some(v) => {
+                if prefix.is_some() {
+                    return Err("URL 里 key_prefix 出现了不止一次".into());
+                }
+                check_prefix(v)?;
+                prefix = Some(v.to_string());
+            }
+            None => rest.push(kv),
+        }
+    }
+    let url = if rest.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", rest.join("&"))
+    };
+    Ok((url, prefix))
+}
+
 impl RedisStore {
+    /// 连上 Redis。URL 可以带 `key_prefix=`（见模块文档），不带就是 `dtmrs:`。
     pub async fn open(url: &str) -> Result<Self> {
-        let client = redis::Client::open(url)?;
+        let (url, prefix) = split_key_prefix(url).map_err(|m| err(&m))?;
+        let client = redis::Client::open(url.as_str())?;
         let conn = client.get_multiplexed_async_connection().await?;
         Ok(Self {
             conn,
-            prefix: "dtmrs:".to_string(),
+            prefix: prefix.unwrap_or_else(|| "dtmrs:".to_string()),
             final_ttl: DEFAULT_FINAL_TTL,
         })
     }
 
-    /// 改 key 前缀，多个环境共用一个 Redis 时用
+    /// 当前的 key 前缀
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// 改 key 前缀，多个环境共用一个 Redis 时用。之后用 `Store::from(..)` 包成 `Store`。
+    ///
+    /// 字符规则同 URL 里的 `key_prefix`（这里不报错，不合规的前缀会在
+    /// [`Self::flush_prefix`] 时被拒 —— 那是唯一会因此闯祸的地方）。
     pub fn with_prefix(mut self, p: &str) -> Self {
         self.prefix = p.to_string();
         self
@@ -880,6 +951,8 @@ impl RedisStore {
     /// （这条注释一度被挤到了 create_token 头上 —— 中间插进了「访问令牌」那节。
     /// 一个生产用的函数被标成「只给测试用」，比没注释更糟。）
     pub async fn flush_prefix(&self) -> Result<()> {
+        // KEYS 前缀* —— 前缀为空或带通配符时，删的就不只是自己的数据了
+        check_prefix(&self.prefix).map_err(|m| err(&m))?;
         let mut c = self.conn.clone();
         let keys: Vec<String> = c.keys(format!("{}*", self.prefix)).await?;
         if !keys.is_empty() {
@@ -933,6 +1006,54 @@ mod tests {
 
         m.insert("finish_time".to_string(), "123".to_string());
         assert_eq!(RedisStore::global_from(&m).unwrap().finish_time, Some(123));
+    }
+
+    #[test]
+    fn url里的key_prefix被拆出来_其余参数原样留给redis() {
+        let cases = [
+            ("redis://h:6379/0", "redis://h:6379/0", None),
+            (
+                "redis://h:6379/0?key_prefix=app1:",
+                "redis://h:6379/0",
+                Some("app1:"),
+            ),
+            // 其它参数（比如 redis crate 认的 protocol）要原样留着，顺序不变
+            (
+                "redis://h/0?protocol=resp3&key_prefix=a:b:&x=1",
+                "redis://h/0?protocol=resp3&x=1",
+                Some("a:b:"),
+            ),
+            (
+                "rediss://u:p@h/2?key_prefix=t.",
+                "rediss://u:p@h/2",
+                Some("t."),
+            ),
+            (
+                "redis+unix:///tmp/r.sock?db=1&key_prefix=z-",
+                "redis+unix:///tmp/r.sock?db=1",
+                Some("z-"),
+            ),
+        ];
+        for (url, rest, want) in cases {
+            let (r, p) = split_key_prefix(url).unwrap();
+            assert_eq!(r, rest, "{url}");
+            assert_eq!(p.as_deref(), want, "{url}");
+        }
+    }
+
+    #[test]
+    fn 前缀只收白名单字符_空的和通配符一律拒绝() {
+        // flush_prefix 用的是 KEYS 前缀*：空前缀等于删整个库，带 * ? [ 会误删别人的 key
+        for bad in ["", "*", "app*", "a?", "a[b]", "a b", "a\\", "前缀", "a%3A"] {
+            assert!(check_prefix(bad).is_err(), "{bad:?} 应该被拒");
+            let url = format!("redis://h/0?key_prefix={bad}");
+            assert!(split_key_prefix(&url).is_err(), "{url} 应该被拒");
+        }
+        for ok in ["dtmrs:", "app1:", "a.b-c_d:", "X"] {
+            assert!(check_prefix(ok).is_ok(), "{ok:?} 应该放行");
+        }
+        // 同一个参数写两遍多半是拼 URL 时出了错，不猜用哪个
+        assert!(split_key_prefix("redis://h/0?key_prefix=a:&key_prefix=b:").is_err());
     }
 
     #[test]

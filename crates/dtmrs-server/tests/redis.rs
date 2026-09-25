@@ -412,3 +412,67 @@ async fn redis_重号登记要拒绝而同号重试要幂等() {
         );
     }
 }
+
+/// 在测试 URL 后面拼一个 `key_prefix` 参数（URL 本身可能已经带了查询参数）
+fn with_prefix(url: &str, p: &str) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}key_prefix={p}")
+}
+
+#[tokio::test]
+async fn redis_不同key前缀的两套环境互相看不见() {
+    // 多套环境共用一个 Redis 靠的就是这个。原先 with_prefix 构造出来的 RedisStore
+    // 没法包成 Store，URL 里也设不了前缀 —— 实际上只能用默认的 dtmrs:，
+    // staging 和 prod 指向同一个 Redis 就会互相抢事务
+    let Some((_g, _default)) = store("key_prefix").await else {
+        return;
+    };
+    let url = std::env::var("DTMRS_TEST_REDIS").unwrap();
+    let a = Store::open(&with_prefix(&url, "dtmrs-test-a:"))
+        .await
+        .unwrap();
+    let b = Store::open(&with_prefix(&url, "dtmrs-test-b:"))
+        .await
+        .unwrap();
+    for s in [&a, &b] {
+        s.as_redis().unwrap().flush_prefix().await.unwrap();
+    }
+    assert_eq!(a.as_redis().unwrap().prefix(), "dtmrs-test-a:");
+
+    let (g, br) = saga_rows("pfx-1", &[SagaStep::new("http://x/a", "http://x/c")]);
+    a.create_global(&g, &br).await.unwrap();
+
+    assert!(
+        b.get_global("pfx-1").await.unwrap().is_none(),
+        "b 不该看见 a 的事务"
+    );
+    assert!(
+        b.lock_one_due("tc-b", 30).await.unwrap().is_none(),
+        "调度扫描也必须按前缀隔开，否则 b 的 TC 会去推 a 的事务"
+    );
+    // 清 b 不能清到 a
+    b.as_redis().unwrap().flush_prefix().await.unwrap();
+    assert!(
+        a.get_global("pfx-1").await.unwrap().is_some(),
+        "flush b 删到了 a 的数据"
+    );
+    assert_eq!(
+        a.lock_one_due("tc-a", 30).await.unwrap().map(|g| g.gid),
+        Some("pfx-1".to_string())
+    );
+
+    // 代码里配的前缀（with_prefix + From）跟 URL 里配的是同一个东西
+    let a2: Store = dtmrs_store::RedisStore::open(&url)
+        .await
+        .unwrap()
+        .with_prefix("dtmrs-test-a:")
+        .into();
+    assert!(a2.get_global("pfx-1").await.unwrap().is_some());
+
+    // 坏前缀在 open 时就拒掉，不等到 flush 时误删
+    assert!(Store::open(&with_prefix(&url, "*")).await.is_err());
+    assert!(Store::open(&with_prefix(&url, "")).await.is_err());
+    for s in [&a, &b] {
+        s.as_redis().unwrap().flush_prefix().await.unwrap();
+    }
+}

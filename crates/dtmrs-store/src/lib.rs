@@ -1273,6 +1273,8 @@ enum Inner {
 /// redis://...    / rediss://...                    → Redis 后端（要开 redis feature）
 /// ```
 ///
+/// Redis URL 可以带 `?key_prefix=staging:`，多套环境共用一个 Redis 时隔开彼此。
+///
 /// ⚠ Redis 后端跟 SQL 后端有**实打实的语义差异**（持久性更弱、终态会过期），
 /// 用之前务必读 [`redis_store`] 的模块说明。
 #[derive(Clone)]
@@ -1289,6 +1291,17 @@ pub type StoreError = sqlx::Error;
 #[cfg(feature = "redis")]
 fn redis_err(e: redis::RedisError) -> sqlx::Error {
     sqlx::Error::Configuration(Box::new(e))
+}
+
+/// 代码里配好的 Redis 后端（[`RedisStore::with_prefix`] / [`RedisStore::with_ttl`]）
+/// 包成 `Store`。只用 URL 的话 [`Store::open`] 就够了。
+#[cfg(feature = "redis")]
+impl From<RedisStore> for Store {
+    fn from(r: RedisStore) -> Self {
+        Self {
+            inner: Inner::Redis(r),
+        }
+    }
 }
 
 /// 这个 URL 是不是要走 Redis
