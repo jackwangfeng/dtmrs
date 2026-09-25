@@ -49,7 +49,11 @@ typedef int (*dtmrs_handler_ex_fn)(const char *gid,
                                    const char *payload,
                                    void *user_data);
 
-/* 创建句柄。db_url 形如 "sqlite:/tmp/app.db"。失败返回 NULL。 */
+/* 创建句柄。失败返回 NULL。db_url 形如：
+ *   sqlite:/tmp/app.db
+ *   postgres://user:pass@host:5432/db      mysql://user:pass@host:3306/db
+ *   redis://host:6379/0?key_prefix=app1:   （Redis 持久性弱于 SQL，用前读部署文档；
+ *                                           key_prefix 可省，多套环境共用时隔开彼此） */
 DtmrsTc *dtmrs_open(const char *db_url);
 
 /* 注册进程内分支，必须在 dtmrs_start 之前。

@@ -483,6 +483,7 @@ dependencies = [
  "anyhow",
  "dtmrs-core",
  "dtmrs-server",
+ "dtmrs-store",
  "serde_json",
  "tokio",
 ]

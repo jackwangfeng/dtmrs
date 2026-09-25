@@ -23,6 +23,16 @@ name = "dtmrs"
 crate-type = ["cdylib", "staticlib"]
 
 
+[features]
+# Redis 默认开：绑定的用户只会 `cargo build -p dtmrs-ffi --release`，关着的话
+# 传 redis:// 只会收到一句「没开 dtmrs-store 的 redis feature」，想不到是这里。
+# 代价实测 .so 11.7 MB → 12.8 MB（+9.5%），不需要额外的构建工具 ——
+# 这跟 grpc 不一样（又大又要 protoc），所以 grpc 关、redis 开。
+# 嫌大就 --no-default-features。
+default = ["redis"]
+# Redis 存储后端。语义跟 SQL 有差异，见 dtmrs-store::redis_store
+redis = ["dtmrs-server/redis"]
+
 [dependencies]
 dtmrs-core = { path = "../dtmrs-core", version = "0.9.0" }
 # 关掉 grpc：这里要的是尽量小的 .so，而嵌入式宿主基本用 local:// 分支。
@@ -31,3 +41,7 @@ dtmrs-server = { path = "../dtmrs-server", version = "0.9.0", default-features =
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+# 只有 Redis 那条测试用：开头结尾清自己的 key 前缀
+dtmrs-store = { path = "../dtmrs-store", version = "0.9.0" }

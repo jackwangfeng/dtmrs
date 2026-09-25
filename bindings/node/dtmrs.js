@@ -174,7 +174,8 @@ class Xa extends TwoPhase {
 
 class Tc {
   /**
-   * @param {string} dbUrl 形如 'sqlite:/tmp/app.db'，也支持 postgres:// / mysql://
+   * @param {string} dbUrl 形如 'sqlite:/tmp/app.db'，也支持 postgres:// / mysql:// / redis://
+   *   （Redis 可带 ?key_prefix=app1: 跟共用同一个 Redis 的别的环境隔开）
    * @param {object} [opts]
    * @param {string} [opts.libPath] .so 路径，默认自动找
    * @param {number} [opts.pollMs=20] 轮询间隔。越小越跟手，也越费 CPU

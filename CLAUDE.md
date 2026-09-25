@@ -16,7 +16,7 @@ Apache-2.0。只实现 DTM 的协议，不抄它的代码。
 
 ```bash
 cargo build --release                 # 二进制在 target/release/dtmrs
-cargo test --workspace                # 220 个测试（真库那部分会被跳过，见下）
+cargo test --workspace                # 235 个测试（真库那部分会被跳过，见下）
 cargo run --example embedded -p dtmrs-server   # 嵌入式模式的可运行示例
 cargo run --example workflow -p dtmrs-server   # workflow 模式（重放/断点续跑）
 
@@ -119,6 +119,11 @@ crates/
 
 二进制在 `crates/dtmrs`（门面 crate）里，`dtmrs-server` 是纯库 —— 这样
 `cargo install dtmrs` 和 `cargo add dtmrs` 都是那个显而易见的名字。
+
+⚠ `dtmrs-ffi` **默认开 redis feature**（绑定用户不会去调 feature）。副作用：
+`cargo test --workspace` 会把 redis 合并进 store / server，「不带 redis」的构建
+就没人编了 —— 所以 CI 里另有 `--exclude dtmrs-ffi` 的 clippy 和单独的
+`cargo test -p dtmrs-store`。本地改 `cfg(not(feature = "redis"))` 的代码也要这么跑。
 
 ⚠ `dtmrs-ffi` 的 crate-type **刻意不带 rlib**：它的 lib 名是 `dtmrs`（为了产出
 `libdtmrs.so`），带上 rlib 会跟门面 crate 的 rlib 撞同一个输出文件名。

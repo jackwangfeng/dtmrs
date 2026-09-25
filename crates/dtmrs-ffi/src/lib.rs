@@ -270,7 +270,9 @@ fn write_out(s: &str, out: *mut c_char, out_len: usize) -> c_int {
     DTMRS_OK
 }
 
-/// 创建一个 TC 句柄（还没启动）。`db_url` 形如 `sqlite:/tmp/app.db`。
+/// 创建一个 TC 句柄（还没启动）。`db_url` 形如 `sqlite:/tmp/app.db`，也可以是
+/// `postgres://` / `mysql://` / `redis://`（Redis 要 `redis` feature，默认开；
+/// 多套环境共用一个 Redis 时带 `?key_prefix=staging:` 隔开）。
 ///
 /// 失败返回 NULL，用 `dtmrs_last_error()` 看原因。
 #[no_mangle]
@@ -2237,6 +2239,121 @@ mod tests {
         );
         dtmrs_close(tc);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// C 接口对着真 Redis 跑：saga（带 payload）、TCC、msg 回查。
+    ///
+    /// 原先 dtmrs-ffi 没开 redis feature，dtmrs_open("redis://…") 直接报错 ——
+    /// 所有语言绑定都用不了 Redis 后端。用自己的 key_prefix，跟别的测试互不干扰。
+    #[cfg(feature = "redis")]
+    #[test]
+    fn c接口能跑在redis后端上() {
+        let Ok(base) = std::env::var("DTMRS_TEST_REDIS") else {
+            if std::env::var("DTMRS_TEST_REQUIRE_REAL_DB").is_ok() {
+                panic!("设了 DTMRS_TEST_REQUIRE_REAL_DB，却没有 DTMRS_TEST_REDIS");
+            }
+            eprintln!("\n⚠ 跳过 FFI 的 Redis 测试：DTMRS_TEST_REDIS 没配。这不等于通过。\n");
+            return;
+        };
+        let sep = if base.contains('?') { '&' } else { '?' };
+        let url = format!("{base}{sep}key_prefix=dtmrs-t-ffi:");
+        // 开头清一次：上次跑崩留下的事务会被这次的推进器捡起来
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let flush = || {
+            rt.block_on(async {
+                let s = dtmrs_store::Store::open(&url).await.unwrap();
+                s.as_redis().unwrap().flush_prefix().await.unwrap();
+            })
+        };
+        flush();
+
+        let tc = dtmrs_open(cs(&url).as_ptr());
+        assert!(!tc.is_null(), "{}", last_err());
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let seen: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+        let recs: Vec<Box<Rec>> = ["confirm", "cancel", "q"]
+            .into_iter()
+            .map(|n| {
+                Box::new(Rec {
+                    tag: n,
+                    ret: DTMRS_SUCCESS,
+                    log: log.clone(),
+                })
+            })
+            .collect();
+        for r in &recs {
+            let ud = &**r as *const Rec as *mut c_void;
+            assert_eq!(
+                dtmrs_register_ex(tc, cs(r.tag).as_ptr(), Some(rec_handler), ud),
+                DTMRS_OK
+            );
+        }
+        let sud = &seen as *const _ as *mut c_void;
+        assert_eq!(
+            dtmrs_register_ex(tc, cs("a").as_ptr(), Some(record_ex_handler), sud),
+            DTMRS_OK
+        );
+        assert_eq!(
+            dtmrs_register_ex(tc, cs("c").as_ptr(), Some(record_ex_handler), sud),
+            DTMRS_OK
+        );
+        assert_eq!(dtmrs_start(tc), DTMRS_OK, "{}", last_err());
+
+        // saga + payload：payload 在 Redis 上走的是另一套序列化
+        let steps = cs(r#"[{"action":"local://a","compensate":"local://c","payload":"金额=30"}]"#);
+        assert_eq!(
+            dtmrs_submit_saga(tc, cs("r-saga").as_ptr(), steps.as_ptr()),
+            DTMRS_OK
+        );
+        assert_eq!(wait(tc, "r-saga"), "succeed");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [("01-action".to_string(), "金额=30".to_string())]
+        );
+
+        // TCC
+        let g = cs("r-tcc");
+        assert_eq!(dtmrs_tcc_begin(tc, g.as_ptr()), DTMRS_OK);
+        for bid in ["01", "02"] {
+            assert_eq!(
+                dtmrs_tcc_register(
+                    tc,
+                    g.as_ptr(),
+                    cs(bid).as_ptr(),
+                    cs("local://confirm").as_ptr(),
+                    cs("local://cancel").as_ptr()
+                ),
+                DTMRS_OK,
+                "{}",
+                last_err()
+            );
+        }
+        assert_eq!(dtmrs_submit(tc, g.as_ptr()), DTMRS_OK);
+        assert_eq!(wait(tc, "r-tcc"), "succeed");
+        assert_eq!(dtmrs_abort(tc, g.as_ptr()), DTMRS_ERR, "终态不能 abort");
+
+        // msg：prepare 完不 submit，靠回查推下去。prepared 的 msg 能不能被捞起来
+        // 取决于 Lua 里那份 schedulable()
+        let m = cs("r-msg");
+        assert_eq!(
+            dtmrs_msg_prepare(
+                tc,
+                m.as_ptr(),
+                cs(r#"["local://confirm"]"#).as_ptr(),
+                cs("local://q").as_ptr(),
+                0
+            ),
+            DTMRS_OK
+        );
+        assert_eq!(wait(tc, "r-msg"), "succeed");
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["confirm@01", "confirm@02", "q@00", "confirm@01"],
+            "TCC 两个 confirm，然后 msg 先回查再送达"
+        );
+        dtmrs_close(tc);
+        flush();
     }
 
     #[test]

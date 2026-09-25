@@ -13,6 +13,9 @@ Go 做不到这个形态：`c-shared` 会把整个运行时拖进宿主进程。
 宿主自己做（按 gid 的 `begin → register → submit/abort` 一串调用）；workflow 是宿主的
 函数，里面用 `dtmrs_wf_branch` 开分支，崩溃后重放续跑。
 
+存储后端跟独立部署的 TC 一样：sqlite / Postgres / MySQL / Redis。Redis 默认编进去了
+（`.so` 大约多 1 MB），不要的话 `--no-default-features`。
+
 提供两种分支分发方式：**回调式**（Python / Java / C）和**拉取式**
 （Node —— 同步回调里没法 `await`）。workflow 只有回调式。C 头文件见 `dtmrs.h`。
 

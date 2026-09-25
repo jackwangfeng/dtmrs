@@ -2,6 +2,7 @@
  * dtmrs 的 JVM 绑定 —— 把 Rust 写的事务协调器嵌进 JVM 进程，不部署任何服务。
  *
  * <pre>
+ * // 也可以 postgres:// mysql:// redis://（Redis 可带 ?key_prefix=app1:）
  * try (Dtmrs tc = new Dtmrs("sqlite:/tmp/app.db")) {
  *     tc.handler("转出", ctx -&gt; {
  *         jdbc.update("UPDATE account SET balance = balance - 100 WHERE id = 1");

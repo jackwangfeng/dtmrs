@@ -891,6 +891,22 @@ fn global_from_row(r: AnyRow) -> GlobalRow {
 mod tests {
     use super::*;
 
+    /// 没开 redis feature 时传 redis:// 必须明确报错。
+    ///
+    /// 否则 URL 会落到 SQL 那边，被 sqlite 当成文件名静默建一个叫 `redis:` 的库，
+    /// 事务状态全落在那儿，没有任何提示。这个分支只在「不带 redis」的构建里存在 ——
+    /// CI 里 dtmrs-ffi 默认开 redis，--workspace 会把 feature 合并进来，所以得单独
+    /// `cargo test -p dtmrs-store` 才跑得到它
+    #[cfg(not(feature = "redis"))]
+    #[tokio::test]
+    async fn 没开redis_feature时redis_url要明确报错() {
+        let Err(e) = Store::open("redis://127.0.0.1:6379/0").await else {
+            panic!("没开 redis feature 却打开成功了");
+        };
+        assert!(e.to_string().contains("redis"), "{e}");
+        assert!(!std::path::Path::new("redis:").exists());
+    }
+
     /// 每个测试都在**所有可用后端**上跑一遍：sqlite / postgres / mysql / redis。
     ///
     /// 真库靠环境变量开启（`DTMRS_TEST_PG` / `DTMRS_TEST_MYSQL` / `DTMRS_TEST_REDIS`）——

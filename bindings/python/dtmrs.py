@@ -4,7 +4,7 @@
 
     import dtmrs
 
-    tc = dtmrs.Tc("sqlite:/tmp/app.db")
+    tc = dtmrs.Tc("sqlite:/tmp/app.db")   # 也可以 postgres:// mysql:// redis://
 
     @tc.handler("扣款")
     def deduct(ctx):
