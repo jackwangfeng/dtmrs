@@ -74,11 +74,14 @@ public class Dtmrs implements AutoCloseable {
         public final String branchId;
         /** action | compensate | try | confirm | cancel | commit | rollback */
         public final String op;
+        /** 这一步自己的业务数据（{@link #step(String, String, String)} 的第三项），没给就是空串 */
+        public final String payload;
 
-        Ctx(String gid, String branchId, String op) {
+        Ctx(String gid, String branchId, String op, String payload) {
             this.gid = gid;
             this.branchId = branchId;
             this.op = op;
+            this.payload = payload == null ? "" : payload;
         }
 
         @Override
@@ -96,7 +99,7 @@ public class Dtmrs implements AutoCloseable {
     interface Lib extends Library {
         Pointer dtmrs_open(String dbUrl);
 
-        int dtmrs_register(Pointer tc, String name, HandlerFn fn, Pointer ud);
+        int dtmrs_register_ex(Pointer tc, String name, HandlerFn fn, Pointer ud);
 
         int dtmrs_start(Pointer tc);
 
@@ -111,9 +114,9 @@ public class Dtmrs implements AutoCloseable {
         String dtmrs_last_error();
     }
 
-    /** C 那边的函数指针类型 */
+    /** C 那边的函数指针类型（dtmrs_handler_ex_fn，带 payload 的那个） */
     interface HandlerFn extends Callback {
-        int invoke(String gid, String branchId, String op, Pointer ud);
+        int invoke(String gid, String branchId, String op, String payload, Pointer ud);
     }
 
     private final Lib lib;
@@ -167,7 +170,7 @@ public class Dtmrs implements AutoCloseable {
     public Dtmrs handler(String name, Handler h) {
         if (started) throw new IllegalStateException("已经 start 了，不能再注册 handler");
         handlers.put(name, h);
-        HandlerFn fn = (gid, branchId, op, ud) -> {
+        HandlerFn fn = (gid, branchId, op, payload, ud) -> {
             try {
                 Handler target = handlers.get(name);
                 if (target == null) {
@@ -176,7 +179,7 @@ public class Dtmrs implements AutoCloseable {
                     System.err.println("[dtmrs] 分支 " + name + " 没注册，按结果未知处理");
                     return UNKNOWN;
                 }
-                return target.call(new Ctx(gid, branchId, op));
+                return target.call(new Ctx(gid, branchId, op, payload));
             } catch (Throwable t) {
                 // **绝不能让异常穿回 Rust** —— 跨 FFI 边界抛异常是未定义行为。
                 // 而且异常意味着不知道业务做没做，只能按未知处理
@@ -185,7 +188,7 @@ public class Dtmrs implements AutoCloseable {
             }
         };
         keepAlive.put(name, fn); // 别让 GC 回收它，否则下次回调是野指针
-        if (lib.dtmrs_register(tc, name, fn, null) != OK) {
+        if (lib.dtmrs_register_ex(tc, name, fn, null) != OK) {
             throw new IllegalStateException("注册失败: " + lib.dtmrs_last_error());
         }
         return this;
@@ -212,6 +215,14 @@ public class Dtmrs implements AutoCloseable {
      */
     public static String[] step(String action, String compensate) {
         return new String[]{action, compensate};
+    }
+
+    /**
+     * 造一个带业务数据的 SAGA 步骤。{@code payload} 是这一步自己的
+     * （正向和补偿共用），http 分支收到的是请求体，本地分支从 {@link Ctx#payload} 拿。
+     */
+    public static String[] step(String action, String compensate, String payload) {
+        return new String[]{action, compensate, payload};
     }
 
     /**
@@ -242,8 +253,13 @@ public class Dtmrs implements AutoCloseable {
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < steps.size(); i++) {
             if (i > 0) sb.append(',');
-            sb.append("{\"action\":").append(jsonStr(steps.get(i)[0]))
-              .append(",\"compensate\":").append(jsonStr(steps.get(i)[1])).append('}');
+            String[] st = steps.get(i);
+            sb.append("{\"action\":").append(jsonStr(st[0]))
+              .append(",\"compensate\":").append(jsonStr(st[1]));
+            if (st.length > 2 && st[2] != null) {
+                sb.append(",\"payload\":").append(jsonStr(st[2]));
+            }
+            sb.append('}');
         }
         sb.append(']');
         if (lib.dtmrs_submit_saga(tc, gid, sb.toString()) != OK) {

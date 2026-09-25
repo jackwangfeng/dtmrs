@@ -63,6 +63,25 @@ pub type HandlerFn = extern "C" fn(
     user_data: *mut c_void,
 ) -> c_int;
 
+/// 带业务数据的分支处理函数（[`dtmrs_register_ex`] 用）。
+///
+/// 比 [`HandlerFn`] 多一个 `payload`：saga 那步 `step_with` 给的数据，没给就是空串。
+/// 老签名没法加参数 —— 已经编好的宿主按四个参数调，改了就是栈错乱 ——
+/// 所以另起一个类型，两种可以混用。
+pub type HandlerExFn = extern "C" fn(
+    gid: *const c_char,
+    branch_id: *const c_char,
+    op: *const c_char,
+    payload: *const c_char,
+    user_data: *mut c_void,
+) -> c_int;
+
+#[derive(Clone, Copy)]
+enum HostFn {
+    Plain(HandlerFn),
+    Ex(HandlerExFn),
+}
+
 /// 裸函数指针 + 用户数据。跨线程传递需要显式声明安全性。
 ///
 /// # Safety 契约（宿主必须保证）
@@ -71,7 +90,7 @@ pub type HandlerFn = extern "C" fn(
 /// - `ud` 指向的数据在 TC 存活期间有效且线程安全
 #[derive(Clone, Copy)]
 struct HandlerPtr {
-    f: HandlerFn,
+    f: HostFn,
     ud: *mut c_void,
 }
 unsafe impl Send for HandlerPtr {}
@@ -122,6 +141,7 @@ struct PullTask {
     gid: String,
     branch_id: String,
     op: String,
+    payload: String,
 }
 
 /// 拉取式分发的队列。
@@ -166,6 +186,7 @@ impl PullQueue {
             gid: ctx.gid.clone(),
             branch_id: ctx.branch_id.clone(),
             op: ctx.op.as_str().to_string(),
+            payload: ctx.payload.clone(),
         };
         if self.tx.send(task).is_err() {
             self.waiting.lock().unwrap().remove(&id);
@@ -269,9 +290,38 @@ pub extern "C" fn dtmrs_register(
         set_err("handler 是空指针");
         return DTMRS_ERR;
     };
+    push_handler(h, name, HostFn::Plain(f), user_data)
+}
+
+/// 跟 [`dtmrs_register`] 一样，只是回调多一个 `payload` 参数（见 [`HandlerExFn`]）。
+///
+/// 分支要用业务数据（金额、地址）就用这个；只靠 gid/branch_id 做幂等的用哪个都行。
+#[no_mangle]
+pub extern "C" fn dtmrs_register_ex(
+    tc: *mut DtmrsTc,
+    name: *const c_char,
+    f: Option<HandlerExFn>,
+    user_data: *mut c_void,
+) -> c_int {
+    clear_err();
+    let Some(h) = (unsafe { tc.as_mut() }) else {
+        set_err("句柄是空指针");
+        return DTMRS_ERR;
+    };
+    let Some(name) = (unsafe { cstr(name, "name") }) else {
+        return DTMRS_ERR;
+    };
+    let Some(f) = f else {
+        set_err("handler 是空指针");
+        return DTMRS_ERR;
+    };
+    push_handler(h, name, HostFn::Ex(f), user_data)
+}
+
+fn push_handler(h: &mut DtmrsTc, name: &str, f: HostFn, ud: *mut c_void) -> c_int {
     match h.pending.as_mut() {
         Some(v) => {
-            v.push((name.to_string(), HandlerPtr { f, ud: user_data }));
+            v.push((name.to_string(), HandlerPtr { f, ud }));
             DTMRS_OK
         }
         None => {
@@ -354,6 +404,7 @@ pub extern "C" fn dtmrs_next_task(
         "gid": task.gid,
         "branch_id": task.branch_id,
         "op": task.op,
+        "payload": task.payload,
     })
     .to_string();
     if write_out(&json, out, out_len) != DTMRS_OK {
@@ -452,8 +503,19 @@ fn call_host(hp: HandlerPtr, ctx: &BranchCtx) -> BranchResult {
     let gid = CString::new(ctx.gid.as_str()).unwrap_or_default();
     let bid = CString::new(ctx.branch_id.as_str()).unwrap_or_default();
     let op = CString::new(ctx.op.as_str()).unwrap_or_default();
-    // 三个 CString 在本函数栈上活着，回调返回前不会被释放
-    let code = (hp.f)(gid.as_ptr(), bid.as_ptr(), op.as_ptr(), hp.ud);
+    // CString 都在本函数栈上活着，回调返回前不会被释放
+    let code = match hp.f {
+        HostFn::Plain(f) => f(gid.as_ptr(), bid.as_ptr(), op.as_ptr(), hp.ud),
+        HostFn::Ex(f) => {
+            // payload 里带 NUL 就传不过去。**不能退化成空串**：宿主拿到空数据
+            // 可能照样执行（扣 0 元），按未知处理只重试，让人去看日志
+            let Ok(p) = CString::new(ctx.payload.as_str()) else {
+                eprintln!("[dtmrs] 分支 {} 的 payload 含 NUL，C 回调传不了，按结果未知处理", ctx.branch_id);
+                return BranchResult::Unknown;
+            };
+            f(gid.as_ptr(), bid.as_ptr(), op.as_ptr(), p.as_ptr(), hp.ud)
+        }
+    };
     to_branch_result(code)
 }
 
@@ -473,9 +535,13 @@ fn to_branch_result(code: c_int) -> BranchResult {
 /// 提交一个 SAGA。`steps_json` 形如：
 ///
 /// ```json
-/// [{"action":"local://deduct","compensate":"local://deduct_undo"},
+/// [{"action":"local://deduct","compensate":"local://deduct_undo","payload":"{\"amount\":30}"},
 ///  {"action":"http://svc/ship","compensate":"http://svc/unship"}]
 /// ```
+///
+/// `payload` 可省略，是**字符串**（要传 JSON 就先序列化成字符串）。
+/// http 分支收到的是请求体，本地分支从 [`dtmrs_register_ex`] 的回调参数 /
+/// 拉取任务的 `payload` 字段拿到。
 #[no_mangle]
 pub extern "C" fn dtmrs_submit_saga(
     tc: *mut DtmrsTc,
@@ -505,7 +571,9 @@ pub extern "C" fn dtmrs_submit_saga(
     };
     let mut sb = inner.saga(gid);
     for s in &steps {
-        sb = sb.step(&s.action, &s.compensate);
+        // ⚠ 必须是 step_with。原先调的是 step()，JSON 里的 payload 解析出来
+        // 又被丢掉，分支永远收到 {} —— 不报错，所以一直没人发现
+        sb = sb.step_with(&s.action, &s.compensate, &s.payload);
     }
     match h.rt.block_on(sb.submit()) {
         Ok(()) => DTMRS_OK,
@@ -873,6 +941,102 @@ mod tests {
         assert!(n >= 1);
         dtmrs_close(tc);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 记下 ex 回调收到的 (branch_id-op, payload)
+    extern "C" fn record_ex_handler(
+        _g: *const c_char,
+        b: *const c_char,
+        o: *const c_char,
+        p: *const c_char,
+        ud: *mut c_void,
+    ) -> c_int {
+        let s = |x: *const c_char| unsafe { CStr::from_ptr(x) }.to_str().unwrap().to_string();
+        let seen = unsafe { &*(ud as *const Mutex<Vec<(String, String)>>) };
+        seen.lock()
+            .unwrap()
+            .push((format!("{}-{}", s(b), s(o)), s(p)));
+        DTMRS_SUCCESS
+    }
+
+    #[test]
+    fn c接口提交的每步payload不能被丢掉() {
+        // 原先 dtmrs_submit_saga 解析出 payload 之后调的是 step() 而不是
+        // step_with()，JSON 里写了也被静默丢掉，分支永远收到 {}
+        let (url, path) = db("payload");
+        let tc = dtmrs_open(url.as_ptr());
+        let seen: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+        let ud = &seen as *const _ as *mut c_void;
+        assert_eq!(
+            dtmrs_register_ex(tc, cs("a").as_ptr(), Some(record_ex_handler), ud),
+            DTMRS_OK
+        );
+        assert_eq!(
+            dtmrs_register_ex(tc, cs("c").as_ptr(), Some(record_ex_handler), ud),
+            DTMRS_OK
+        );
+        assert_eq!(dtmrs_start(tc), DTMRS_OK);
+        let steps = cs(r#"[{"action":"local://a","compensate":"local://c","payload":"{\"amount\":30}"},
+                           {"action":"local://a","compensate":"local://c"}]"#);
+        assert_eq!(
+            dtmrs_submit_saga(tc, cs("ffi-payload").as_ptr(), steps.as_ptr()),
+            DTMRS_OK
+        );
+        assert_eq!(wait(tc, "ffi-payload"), "succeed");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ("01-action".to_string(), r#"{"amount":30}"#.to_string()),
+                // 没写 payload 的那步收到空串
+                ("02-action".to_string(), String::new()),
+            ]
+        );
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 拉取式的任务里带着payload() {
+        let (url, path) = db("pull_payload");
+        let tc = dtmrs_open(url.as_ptr());
+        assert_eq!(dtmrs_register_pull(tc, cs("act").as_ptr()), DTMRS_OK);
+        assert_eq!(dtmrs_register_pull(tc, cs("undo").as_ptr()), DTMRS_OK);
+        assert_eq!(dtmrs_start(tc), DTMRS_OK);
+        let steps = cs(r#"[{"action":"local://act","compensate":"local://undo","payload":"订单-7"}]"#);
+        assert_eq!(
+            dtmrs_submit_saga(tc, cs("pull-payload").as_ptr(), steps.as_ptr()),
+            DTMRS_OK
+        );
+        let mut buf = vec![0u8; 512];
+        let r = dtmrs_next_task(tc, 5000, buf.as_mut_ptr() as *mut c_char, buf.len());
+        assert_eq!(r, 1, "应该取到任务");
+        let v: serde_json::Value = serde_json::from_str(
+            unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["payload"], "订单-7");
+        dtmrs_reply(tc, v["task_id"].as_u64().unwrap(), DTMRS_SUCCESS);
+        assert_eq!(wait(tc, "pull-payload"), "succeed");
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 等终态，返回状态字符串。等不到返回 last_error，让断言信息有用
+    fn wait(tc: *mut DtmrsTc, gid: &str) -> String {
+        let mut buf = [0u8; 64];
+        if dtmrs_wait_final(tc, cs(gid).as_ptr(), 8000, buf.as_mut_ptr() as *mut c_char, 64)
+            != DTMRS_OK
+        {
+            return format!("ERR: {}", unsafe { CStr::from_ptr(dtmrs_last_error()) }
+                .to_str()
+                .unwrap());
+        }
+        unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     #[test]

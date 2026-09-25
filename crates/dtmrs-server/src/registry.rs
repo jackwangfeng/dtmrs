@@ -28,6 +28,9 @@ pub struct BranchCtx {
     pub branch_id: String,
     pub op: BranchOp,
     pub trans_type: String,
+    /// 这个分支自己的业务数据，跟 http 分支收到的请求体是同一份
+    /// （saga 是 `step_with` 给的，正向和补偿共用；没给就是空串，不是 `{}`）
+    pub payload: String,
 }
 
 type BoxFut = Pin<Box<dyn Future<Output = BranchResult> + Send>>;
@@ -254,6 +257,7 @@ mod tests {
             branch_id: "01".into(),
             op: BranchOp::Action,
             trans_type: "saga".into(),
+            payload: String::new(),
         };
         assert_eq!(h(ctx).await, BranchResult::Success);
         assert!(r.get("nope").is_none());

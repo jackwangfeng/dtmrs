@@ -646,7 +646,7 @@ impl Driver {
         payload: &str,
     ) -> BranchResult {
         match parse_target(url) {
-            Target::Local(name) => self.call_local(g, branch_id, op, &name).await,
+            Target::Local(name) => self.call_local(g, branch_id, op, &name, payload).await,
             Target::Http(u) => self.call_http(g, branch_id, op, &u, payload).await,
             #[cfg(feature = "grpc")]
             Target::Grpc(t) => {
@@ -678,6 +678,7 @@ impl Driver {
         branch_id: &str,
         op: BranchOp,
         name: &str,
+        payload: &str,
     ) -> BranchResult {
         let Some(h) = self.registry.get(name) else {
             // 漏注册（比如新版本删了 handler）。**必须当 Unknown 而不是 Failure**：
@@ -691,6 +692,7 @@ impl Driver {
             branch_id: branch_id.to_string(),
             op,
             trans_type: g.trans_type.to_string(),
+            payload: payload.to_string(),
         };
         let r = h(ctx).await;
         info!(gid = %g.gid, branch = %branch_id, op = op.as_str(),

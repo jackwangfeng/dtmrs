@@ -32,6 +32,7 @@
 """
 
 import ctypes
+import json
 import os
 import sys
 import traceback
@@ -44,11 +45,13 @@ UNKNOWN = 3
 _OK = 0
 _ERR = -1
 
+# 对应 C 的 dtmrs_handler_ex_fn（带 payload 的那个）
 HANDLER = ctypes.CFUNCTYPE(
     ctypes.c_int,               # 返回码
     ctypes.c_char_p,            # gid
     ctypes.c_char_p,            # branch_id
     ctypes.c_char_p,            # op
+    ctypes.c_char_p,            # payload
     ctypes.c_void_p,            # user_data
 )
 
@@ -70,15 +73,28 @@ def _find_lib():
     )
 
 
+def _step(s):
+    action, compensate, *rest = s
+    d = {"action": action, "compensate": compensate}
+    if rest:
+        p = rest[0]
+        d["payload"] = p if isinstance(p, str) else json.dumps(p, ensure_ascii=False)
+    return d
+
+
 class Ctx:
-    """分支调用上下文。业务侧做幂等要用 (gid, branch_id, op)。"""
+    """分支调用上下文。业务侧做幂等要用 (gid, branch_id, op)。
 
-    __slots__ = ("gid", "branch_id", "op")
+    payload 是这一步自己的业务数据（submit_saga 的第三项），没给就是空串。
+    """
 
-    def __init__(self, gid, branch_id, op):
+    __slots__ = ("gid", "branch_id", "op", "payload")
+
+    def __init__(self, gid, branch_id, op, payload=""):
         self.gid = gid
         self.branch_id = branch_id
         self.op = op
+        self.payload = payload
 
     def __repr__(self):
         return f"Ctx(gid={self.gid!r}, branch_id={self.branch_id!r}, op={self.op!r})"
@@ -99,8 +115,8 @@ class Tc:
         L = self._lib
         L.dtmrs_open.argtypes = [ctypes.c_char_p]
         L.dtmrs_open.restype = ctypes.c_void_p
-        L.dtmrs_register.argtypes = [ctypes.c_void_p, ctypes.c_char_p, HANDLER, ctypes.c_void_p]
-        L.dtmrs_register.restype = ctypes.c_int
+        L.dtmrs_register_ex.argtypes = [ctypes.c_void_p, ctypes.c_char_p, HANDLER, ctypes.c_void_p]
+        L.dtmrs_register_ex.restype = ctypes.c_int
         L.dtmrs_start.argtypes = [ctypes.c_void_p]
         L.dtmrs_start.restype = ctypes.c_int
         L.dtmrs_submit_saga.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
@@ -129,9 +145,10 @@ class Tc:
         return deco
 
     def register(self, name, fn):
-        def bridge(gid, branch_id, op, _ud):
+        def bridge(gid, branch_id, op, payload, _ud):
             try:
-                return int(fn(Ctx(gid.decode(), branch_id.decode(), op.decode())))
+                ctx = Ctx(gid.decode(), branch_id.decode(), op.decode(), payload.decode())
+                return int(fn(ctx))
             except Exception:
                 # 异常 = 不知道到底做了没有。**当 UNKNOWN，绝不当 FAILURE** ——
                 # 误判失败会把一笔本该成功的事务回滚掉。
@@ -140,7 +157,7 @@ class Tc:
 
         cb = HANDLER(bridge)
         self._keep.append(cb)          # 防 GC
-        if self._lib.dtmrs_register(self._h, name.encode(), cb, None) != _OK:
+        if self._lib.dtmrs_register_ex(self._h, name.encode(), cb, None) != _OK:
             raise RuntimeError(self._err())
 
     def start(self):
@@ -149,13 +166,13 @@ class Tc:
         self._started = True
 
     def submit_saga(self, gid, steps):
-        """steps: [(action, compensate), ...]，每项可以是 local:// 或 http://"""
-        import json
+        """steps: [(action, compensate), ...] 或 [(action, compensate, payload), ...]
 
-        payload = json.dumps(
-            [{"action": a, "compensate": c} for a, c in steps], ensure_ascii=False
-        )
-        if self._lib.dtmrs_submit_saga(self._h, gid.encode(), payload.encode()) != _OK:
+        地址可以是 local:// 或 http://。payload 是这一步自己的数据（字符串；
+        传 dict/list 会被转成 JSON），正向和补偿共用。
+        """
+        body = json.dumps([_step(s) for s in steps], ensure_ascii=False)
+        if self._lib.dtmrs_submit_saga(self._h, gid.encode(), body.encode()) != _OK:
             raise RuntimeError(self._err())
 
     def status(self, gid):

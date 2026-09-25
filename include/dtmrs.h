@@ -41,6 +41,14 @@ typedef int (*dtmrs_handler_fn)(const char *gid,
                                 const char *op,
                                 void *user_data);
 
+/* 带业务数据的 handler：多一个 payload（saga 那步给的数据，没给就是空串 ""）。
+ * 老的 dtmrs_handler_fn 签名不能改（已编好的宿主按四个参数调），所以另起一个。 */
+typedef int (*dtmrs_handler_ex_fn)(const char *gid,
+                                   const char *branch_id,
+                                   const char *op,
+                                   const char *payload,
+                                   void *user_data);
+
 /* 创建句柄。db_url 形如 "sqlite:/tmp/app.db"。失败返回 NULL。 */
 DtmrsTc *dtmrs_open(const char *db_url);
 
@@ -49,12 +57,18 @@ DtmrsTc *dtmrs_open(const char *db_url);
 int dtmrs_register(DtmrsTc *tc, const char *name,
                    dtmrs_handler_fn fn, void *user_data);
 
+/* 同上，回调能拿到 payload。两种可以混用，各管各的名字。 */
+int dtmrs_register_ex(DtmrsTc *tc, const char *name,
+                      dtmrs_handler_ex_fn fn, void *user_data);
+
 /* 启动推进器。上次进程留下的未终结事务会被自动接着推。 */
 int dtmrs_start(DtmrsTc *tc);
 
 /* 提交 SAGA。steps_json 形如：
- *   [{"action":"local://deduct","compensate":"local://deduct_undo"},
+ *   [{"action":"local://deduct","compensate":"local://deduct_undo","payload":"{\"amount\":30}"},
  *    {"action":"http://svc/ship","compensate":"http://svc/unship"}]
+ * payload 可省略，是字符串，这一步的正向和补偿共用。http 分支收到的是请求体，
+ * 本地分支从 dtmrs_register_ex 的回调参数 / 拉取任务的 payload 字段拿到。
  * 若有 local:// 名字没注册，这里就会失败（而不是等推到一半才发现）。 */
 int dtmrs_submit_saga(DtmrsTc *tc, const char *gid, const char *steps_json);
 
@@ -80,7 +94,7 @@ int dtmrs_submit_saga(DtmrsTc *tc, const char *gid, const char *steps_json);
 int dtmrs_register_pull(DtmrsTc *tc, const char *name);
 
 /* 取一个待办分支，JSON 写入 out：
- *   {"task_id":7,"name":"deduct","gid":"order-1","branch_id":"01","op":"action"}
+ *   {"task_id":7,"name":"deduct","gid":"order-1","branch_id":"01","op":"action","payload":""}
  * 返回 1=取到, 0=没有, DTMRS_ERR=出错。
  *
  * timeout_ms 传 0 表示**不阻塞**，立刻返回。事件循环型宿主必须传 0 ——

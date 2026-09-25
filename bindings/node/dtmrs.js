@@ -80,6 +80,8 @@ class Ctx {
     this.branchId = t.branch_id;
     /** action | compensate | try | confirm | cancel | commit | rollback */
     this.op = t.op;
+    /** 这一步自己的业务数据（submitSaga 每步的第三项），没给就是空串 */
+    this.payload = t.payload ?? '';
   }
   toString() {
     return `Ctx(gid=${this.gid} branch=${this.branchId} op=${this.op})`;
@@ -211,13 +213,17 @@ class Tc {
   /**
    * 提交一个 SAGA。
    * @param {string} gid 全局事务号。建议直接用业务单号 —— 那样天然幂等
-   * @param {Array<[string,string]>|Array<{action:string,compensate:string}>} steps
-   *   每步是 [正向, 补偿]。地址可以是 local:// 、http:// 或 grpc:// ，能混用
+   * @param {Array<[string,string,any?]>|Array<{action:string,compensate:string,payload?:any}>} steps
+   *   每步是 [正向, 补偿, 数据?]。地址可以是 local:// 、http:// 或 grpc:// ，能混用。
+   *   数据是这一步自己的（正向和补偿共用），不是字符串会被 JSON.stringify
    */
   async submitSaga(gid, steps) {
-    const norm = steps.map((s) =>
-      Array.isArray(s) ? { action: s[0], compensate: s[1] } : s
-    );
+    const norm = steps.map((s) => {
+      const o = Array.isArray(s) ? { action: s[0], compensate: s[1], payload: s[2] } : { ...s };
+      if (o.payload === undefined) delete o.payload;
+      else if (typeof o.payload !== 'string') o.payload = JSON.stringify(o.payload);
+      return o;
+    });
     if (this.f.submitSaga(this.tc, gid, JSON.stringify(norm)) !== OK) {
       throw new Error(`提交失败: ${this.lastError()}`);
     }
