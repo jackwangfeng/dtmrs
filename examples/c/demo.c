@@ -35,6 +35,33 @@ static int ex_handler(const char *gid, const char *branch_id, const char *op,
 /* 自己的「一阶段」。真实业务里是冻结库存 / 写本地订单表 */
 static int my_try(const char *bid) { printf("  [try] 分支 %s 冻结资源\n", bid); return 1; }
 
+/* workflow 分支函数体：结果写进 out，重放时原样还回来、不再执行 */
+static int wf_deduct(const char *gid, const char *bid, char *out, size_t n, void *ud) {
+    (void)gid; (void)ud;
+    printf("  [wf 扣款] 分支 %s\n", bid);
+    snprintf(out, n, "流水-%s", bid);
+    return DTMRS_SUCCESS;
+}
+
+static int wf_ship(const char *gid, const char *bid, char *out, size_t n, void *ud) {
+    (void)gid; (void)out; (void)n; (void)ud;
+    printf("  [wf 发货] 分支 %s\n", bid);
+    return DTMRS_SUCCESS;
+}
+
+/* workflow 函数：步骤由代码决定。收到 ERR 立刻返回 */
+static int wf_order(DtmrsWf *wf, const char *gid, const char *input, void *ud) {
+    (void)gid; (void)ud;
+    char sn[64];
+    if (dtmrs_wf_branch(wf, "扣款", "local://c1", wf_deduct, NULL, sn, sizeof sn) != DTMRS_OK)
+        return DTMRS_UNKNOWN;
+    printf("  [wf] 扣款流水 %s，input=%s\n", sn, input);
+    if (strstr(input, "ship") &&
+        dtmrs_wf_branch(wf, "发货", "local://c1", wf_ship, NULL, NULL, 0) != DTMRS_OK)
+        return DTMRS_UNKNOWN;
+    return DTMRS_SUCCESS;
+}
+
 int main(void) {
     remove("/tmp/dtmrs_c_demo.db");
     DtmrsTc *tc = dtmrs_open("sqlite:/tmp/dtmrs_c_demo.db");
@@ -49,6 +76,7 @@ int main(void) {
     dtmrs_register_ex(tc, "cancel", ex_handler, NULL);
     dtmrs_register_ex(tc, "notify", ex_handler, NULL);
     dtmrs_register_ex(tc, "query", ex_handler, NULL);
+    dtmrs_register_workflow(tc, "下单", wf_order, NULL);
     if (dtmrs_start(tc) != DTMRS_OK) {
         fprintf(stderr, "start 失败: %s\n", dtmrs_last_error()); return 1;
     }
@@ -98,7 +126,12 @@ int main(void) {
     dtmrs_wait_final(tc, "c-msg", 5000, st, sizeof st);
     printf("  结果: %s\n", st);
 
-    puts("⑥ 错误处理");
+    puts("⑥ workflow：步骤由函数决定");
+    dtmrs_submit_workflow(tc, "c-wf", "下单", "{\"ship\":true}");
+    dtmrs_wait_final(tc, "c-wf", 5000, st, sizeof st);
+    printf("  结果: %s\n", st);
+
+    puts("⑦ 错误处理");
     if (dtmrs_submit_saga(tc, "c-3", "{坏 json}") != DTMRS_OK)
         printf("  坏 JSON 被拒: %s\n", dtmrs_last_error());
 

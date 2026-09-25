@@ -16,7 +16,7 @@ Apache-2.0。只实现 DTM 的协议，不抄它的代码。
 
 ```bash
 cargo build --release                 # 二进制在 target/release/dtmrs
-cargo test --workspace                # 156 个测试（真库那部分会被跳过，见下）
+cargo test --workspace                # 220 个测试（真库那部分会被跳过，见下）
 cargo run --example embedded -p dtmrs-server   # 嵌入式模式的可运行示例
 cargo run --example workflow -p dtmrs-server   # workflow 模式（重放/断点续跑）
 
@@ -181,11 +181,21 @@ crates/
   handler。`submit()` 时就检查名字是否都注册了，漏注册按「结果未知」处理只重试。
 - FFI 的回调一律走 `spawn_blocking` —— 宿主 handler 是同步的还可能抢 GIL，
   直接在 tokio worker 上调会卡死运行时。
-- **FFI 有两套分发，别混淆**：回调式（`dtmrs_register`，Python/Java/C 用）和
+- **FFI 有两套分发，别混淆**：回调式（`dtmrs_register` / 带 payload 的
+  `dtmrs_register_ex`，Python/Java/C 用；老签名不能改，已编好的宿主按四个参数调）和
   拉取式（`dtmrs_register_pull` + `next_task` + `reply`，Node 用）。
   Node 必须用拉取式不是因为跨线程回调不行（实测可以），而是因为 C ABI 的回调
   必须同步返回 int，而 Node 的业务代码全是 async。改这块前先读
   `bindings/node/dtmrs.js` 的文件头。
+- **FFI 的 TCC / XA / msg 是按 gid 的无状态调用**（`dtmrs_tcc_begin` → `_register`
+  → `dtmrs_submit` / `dtmrs_abort`），分支号由宿主给 —— 库里没法安全地替它编号
+  （并发 try 时同地址撞号查不出来）。绑定层各自维护计数器。判断全走 `api.rs`，
+  `embedded.rs` 只加 `local://` 漏注册的自查，别在 FFI / embedded 里另写规则。
+- **FFI 的 workflow 是回调里再调回来**：宿主函数跑在 `spawn_blocking` 线程上，
+  `dtmrs_wf_branch` 在那条线程上 `block_on`。`DtmrsWf.err` 是**粘性**的：
+  任何分支出过错，之后的 `dtmrs_wf_branch` 一律不执行，宿主函数的返回值也不算数 ——
+  宿主不检查返回值（或 Python 裸 `except:` 吞掉停止信号）时靠它兜住。
+  Java 的分支回调是嵌套回调，必须 `Native.detach(false)`，否则 JNA 每次都报 detach 失败。
 - **workflow 模式靠重放**：函数会被从头跑多次，已成功的分支走记忆化。改
   `workflow.rs` 时记住两条不变量：补偿必须**先于**正向动作登记（否则动作超时
   或崩溃会漏掉补偿）；分岔检测发现名字对不上时**既不能成功也不能回滚**，

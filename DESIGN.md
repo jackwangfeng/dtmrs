@@ -179,6 +179,7 @@ TC 崩溃后重启，所有未终结事务会被 cron 重新捞起继续推进�
 | **Node / JVM 绑定** | ✅ 第四版 |
 | **Redis 存储（秒杀类尖峰）** | ✅ 第五版 |
 | **workflow 模式（重放 + 结果记忆化）** | ✅ 第五版 |
+| **嵌入式 / C ABI 补齐五种模式**（原先只有 saga；另修 saga payload 被丢） | ✅ 第六版 |
 
 ## 七、工程结构
 
@@ -196,7 +197,8 @@ dtmrs/
                      axum HTTP + tonic gRPC + cron 调度器 + 嵌入式门面
     dtmrs-barrier/   客户端子事务屏障库
     dtmrs-xa/        业务方 XA 助手（pg / mysql 两套语法）
-    dtmrs-ffi/       C ABI（cdylib + staticlib），回调式 + 拉取式两种分发
+    dtmrs-ffi/       C ABI（cdylib + staticlib），回调式 + 拉取式两种分发。
+                     五种模式都导出了；workflow 只有回调式（函数体要同步跑完）
   tests/             端到端：正常提交 / 分支失败补偿 / 崩溃恢复 / 幂等
 ```
 

@@ -294,7 +294,30 @@ let tc = Embedded::builder("sqlite:app.db")
     .start().await?;
 ```
 
-Python / Node / JVM 见 [README 的绑定章节](../README.zh-CN.md#任何语言都能嵌c-abi)。
+五种模式在嵌入式和各语言绑定里都能用。TCC / XA / 二阶段消息的一阶段是你自己做的，
+绑定把「先登记、再做一阶段，失败就 abort」包成了一个块，顺序由结构保证：
+
+| | Rust | Python | Node | Java | C |
+|---|---|---|---|---|---|
+| SAGA | `tc.saga(gid).step_with(..)` | `submit_saga` | `submitSaga` | `submitSaga` | `dtmrs_submit_saga` |
+| TCC | `tc.tcc(gid)` → `try_branch` | `with tc.tcc(gid) as t` | `tccGlobal` | `tccGlobal` | `dtmrs_tcc_begin` / `_register` |
+| XA | `tc.xa(gid)` → `prepare_branch` | `with tc.xa(gid) as x` | `xaGlobal` | `xaGlobal` | `dtmrs_xa_begin` / `_register` |
+| msg | `tc.msg(gid)..do_and_submit` | `msg_do_and_submit` | `msgDoAndSubmit` | `msgDoAndSubmit` | `dtmrs_msg_prepare` |
+| workflow | `.workflow(..)` | `@tc.workflow` | — | `tc.workflow` | `dtmrs_register_workflow` |
+
+```python
+with tc.tcc("order-1") as t:          # 正常结束 → submit；抛异常 → abort
+    t.try_branch("local://冻结确认", "local://冻结撤销", freeze)   # 先登记，再调 freeze(branch_id)
+```
+
+- 分支的业务数据：saga 每步可以带 payload（Python 是步骤的第三项），
+  本地 handler 从 `ctx.payload` 拿到，http 分支收到的是请求体。
+- 上面「prepared 没有自动回收」那条在嵌入式下**同样成立**：`with` / `tccGlobal`
+  挡得住异常，挡不住 `kill -9`。
+- Node 没有 workflow：它的函数体要在 C 回调里同步跑完，而 Node 的业务代码是 async 的。
+
+可运行的例子：`bindings/python/example.py`、`bindings/node/example.js`、
+`bindings/java/Example.java`、`examples/c/demo.c`；C 接口的完整说明在 `include/dtmrs.h`。
 
 > **一个必须知道的约束**：`local://` 分支存的是**名字**（闭包没法持久化），重启后必须注册同名 handler。漏注册会按「结果未知」处理——只重试不回滚，因为这是部署问题不是业务失败。
 

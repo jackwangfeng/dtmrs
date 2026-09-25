@@ -31,6 +31,14 @@ TCC / XA / 二阶段消息的一阶段是你自己做的：
     # 二阶段消息：本地事务成功就 submit，失败就 abort，不知道就交给回查
     tc.msg_do_and_submit("order-1003", ["local://加积分"], "local://查订单", write_order)
 
+    # workflow：步骤由函数自己决定，崩溃后重放续跑（已成功的分支不重做）
+    @tc.workflow("下单")
+    def place_order(wf):
+        sn = wf.branch("扣款", lambda bid: (dtmrs.SUCCESS, "流水号-1"), on_rollback="local://退款")
+        if need_ship(sn):
+            wf.branch("发货", ship, on_rollback="local://退货")
+    tc.submit_workflow("order-1004", "下单", input='{"sku": 7}')
+
 ⚠ 两个必须知道的事情
 
 1. **handler 会被 Rust 侧的任意线程调用**，不是你的主线程。
@@ -56,6 +64,16 @@ UNKNOWN = 3
 
 _OK = 0
 _ERR = -1
+
+# workflow 函数：int (*)(DtmrsWf *wf, const char *gid, const char *input, void *ud)
+WORKFLOW = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p)
+
+# workflow 分支函数体：int (*)(gid, branch_id, char *out, size_t out_len, void *ud)
+# out 声明成 void*（我们要往里写，不是读 C 字符串）
+WF_BRANCH = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
+    ctypes.c_void_p)
 
 # 对应 C 的 dtmrs_handler_ex_fn（带 payload 的那个）
 HANDLER = ctypes.CFUNCTYPE(
@@ -195,6 +213,57 @@ class Xa(_TwoPhase):
         return self._branch(commit, rollback, prepare_fn)
 
 
+class WorkflowStop(BaseException):
+    """workflow 要停在这里（回滚 / 重试 / 重放走岔）。由 wf.branch() 抛出。
+
+    **继承 BaseException 而不是 Exception**：业务代码里常见的 `except Exception`
+    不会把它吞掉。别捕获它 —— 就算捕获了继续开分支，库那边也不会再执行任何分支。
+    """
+
+
+class Workflow:
+    """传给 workflow 函数的上下文。只在那次调用期间有效。"""
+
+    def __init__(self, tc, ptr, gid, input):
+        self._tc = tc
+        self._ptr = ptr
+        self.gid = gid
+        self.input = input
+
+    def branch(self, name, fn, on_rollback=None):
+        """开一个分支，返回它的结果数据（字符串）。
+
+        name 是逻辑名字，重放时用来做分岔检测，要稳定。fn(branch_id) 返回结果码，
+        或 (结果码, 数据)；数据会被记下，**重放时 fn 不会再被调用**，直接返回上次的数据。
+        on_rollback 是回滚时调的地址（local:// / http://）；有副作用的分支一定要给。
+
+        分支没成功（或重放走岔）时抛 WorkflowStop —— 让它往外传就好。
+        """
+        def body(_gid, branch_id, out, out_len, _ud):
+            try:
+                r = fn(branch_id.decode())
+                code, data = (r if isinstance(r, tuple) else (r, ""))
+                raw = (data or "").encode()
+                if len(raw) + 1 > out_len:
+                    # 截断会让记下的数据跟真实结果对不上，重放时就是错的。宁可重试
+                    print(f"[dtmrs] 分支 {name} 的结果数据太长（{len(raw)} 字节），按结果未知处理",
+                          file=sys.stderr)
+                    return UNKNOWN
+                ctypes.memmove(out, raw + b"\0", len(raw) + 1)
+                return int(code)
+            except Exception:
+                # 不知道做没做 → 重放，绝不回滚
+                traceback.print_exc(file=sys.stderr)
+                return UNKNOWN
+
+        cb = WF_BRANCH(body)
+        buf = ctypes.create_string_buffer(4097)
+        comp = on_rollback.encode() if on_rollback else None
+        if self._tc._lib.dtmrs_wf_branch(self._ptr, name.encode(), comp, cb, None, buf, len(buf)) != _OK:
+            raise WorkflowStop(self._tc._err())
+        return buf.value.decode()
+
+
 class Tc:
     def __init__(self, db_url, lib_path=None):
         self._lib = ctypes.CDLL(lib_path or _find_lib())
@@ -230,6 +299,14 @@ class Tc:
         L.dtmrs_msg_prepare.argtypes = [
             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
         L.dtmrs_msg_prepare.restype = ctypes.c_int
+        L.dtmrs_register_workflow.argtypes = [ctypes.c_void_p, ctypes.c_char_p, WORKFLOW, ctypes.c_void_p]
+        L.dtmrs_register_workflow.restype = ctypes.c_int
+        L.dtmrs_submit_workflow.argtypes = [ctypes.c_void_p] + [ctypes.c_char_p] * 3
+        L.dtmrs_submit_workflow.restype = ctypes.c_int
+        L.dtmrs_wf_branch.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, WF_BRANCH, ctypes.c_void_p,
+            ctypes.c_char_p, ctypes.c_size_t]
+        L.dtmrs_wf_branch.restype = ctypes.c_int
         L.dtmrs_close.argtypes = [ctypes.c_void_p]
         L.dtmrs_close.restype = None
         L.dtmrs_last_error.argtypes = []
@@ -263,6 +340,37 @@ class Tc:
         self._keep.append(cb)          # 防 GC
         if self._lib.dtmrs_register_ex(self._h, name.encode(), cb, None) != _OK:
             raise RuntimeError(self._err())
+
+    def workflow(self, name):
+        """装饰器：注册一个 workflow 函数 fn(wf)。必须在 start() 之前。
+
+        函数正常返回（或返回 SUCCESS）= 跑完了；返回 FAILURE = 整单回滚；
+        抛异常 = 重放（不回滚）。**函数会被从头跑多次**，必须是确定性的，
+        副作用都放进 wf.branch() 里。重启后要注册同名函数。
+        """
+
+        def deco(fn):
+            def bridge(wf_ptr, gid, input, _ud):
+                wf = Workflow(self, wf_ptr, gid.decode(), input.decode())
+                try:
+                    r = fn(wf)
+                    return SUCCESS if r is None else int(r)
+                except WorkflowStop:
+                    return UNKNOWN  # 库里已经记下了真正的原因，这个返回值不算数
+                except Exception:
+                    traceback.print_exc(file=sys.stderr)
+                    return UNKNOWN
+
+            cb = WORKFLOW(bridge)
+            self._keep.append(cb)  # 防 GC
+            self._call("dtmrs_register_workflow", name.encode(), cb, None)
+            return fn
+
+        return deco
+
+    def submit_workflow(self, gid, name, input=""):
+        """提交一个 workflow 事务。name 没注册会当场报错。幂等。"""
+        self._call("dtmrs_submit_workflow", gid.encode(), name.encode(), input.encode())
 
     def start(self):
         if self._lib.dtmrs_start(self._h) != _OK:

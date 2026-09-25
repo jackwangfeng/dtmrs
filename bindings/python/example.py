@@ -3,6 +3,7 @@
 
 跑之前先编：cargo build -p dtmrs-ffi --release
 """
+import json
 import os
 import sqlite3
 import time
@@ -118,6 +119,21 @@ def query_order(ctx):
     return dtmrs.SUCCESS if ctx.gid in orders else dtmrs.FAILURE
 
 
+# ---- workflow：步骤由函数决定，崩溃后重放续跑 ----
+@tc.workflow("转账流程")
+def transfer_flow(wf):
+    req = json.loads(wf.input)
+
+    def out(bid):
+        move(1, 2, 100)
+        return dtmrs.SUCCESS, "流水-" + bid     # 结果数据，重放时原样还回来
+
+    sn = wf.branch("转出", out, on_rollback="local://转出撤销")
+    print(f"  [workflow] 转出完成，流水号 {sn}")
+    if req["risky"]:                           # 控制流是真的控制流
+        wf.branch("风控", lambda bid: dtmrs.FAILURE)
+
+
 tc.start()
 print(f"TC 已在本进程内启动（库: {DB}）")
 print("初始余额:", balances())
@@ -188,5 +204,14 @@ tc.msg_prepare("py-msg-2", ["local://加积分"], "local://查订单", grace_sec
 orders.add("py-msg-2")   # 本地事务提交了，然后……没调 submit
 print("  结果:", tc.wait_final("py-msg-2", 5000), "（回查说已提交，消息照样送达）")
 
+print("\n⑩ workflow：普通转账跑完")
+tc.submit_workflow("py-wf-1", "转账流程", json.dumps({"risky": False}))
+print("  结果:", tc.wait_final("py-wf-1", 5000), " 余额:", balances())
+
+print("\n⑪ workflow：风控拒绝 → 已做的「转出」被补偿")
+tc.submit_workflow("py-wf-2", "转账流程", json.dumps({"risky": True}))
+print("  结果:", tc.wait_final("py-wf-2", 5000), " 余额:", balances())
+
 tc.close()
-print("\n最终余额:", balances(), "（① 转了 100，⑥ 转了 30，其余都被补偿/撤销抹平）")
+print("\n最终余额:", balances(), "（① 100 + ⑥ 30 + ⑩ 100，其余都被补偿/撤销抹平）")
+assert balances() == {1: 770, 2: 230}

@@ -5,10 +5,11 @@
  *   cargo build -p dtmrs-ffi --release
  *   cd bindings/java && ./run.sh
  *
- * 三个场景，账户余额是真的在动：
- *   ① 正常转账
- *   ② 风控拒绝 → 逆序补偿，钱退回来
- *   ③ 下游超时 → 只重试，不回滚
+ * 账户余额是真的在动：
+ *   ①–④ SAGA：正常 / 风控拒绝逆序补偿 / 超时只重试 / 抛异常只重试
+ *   ⑤⑥ TCC：try 全成功 confirm / 有 try 失败则全部 cancel
+ *   ⑦⑧ 二阶段消息：正常送达 / 崩在 submit 之前靠回查续推
+ *   ⑨⑩ workflow：跑完 / 风控拒绝补偿已做的步骤
  */
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -105,6 +106,19 @@ public class Example {
                 return orders.contains(ctx.gid) ? Dtmrs.SUCCESS : Dtmrs.FAILURE;
             });
 
+            // ---- workflow：步骤由函数决定，崩溃后重放续跑 ----
+            tc.workflow("转账流程", wf -> {
+                String sn = wf.branchWith("转出", "local://转出撤销", bid -> {
+                    move(1, 2, 100);
+                    return Dtmrs.out(Dtmrs.SUCCESS, "流水-" + bid); // 重放时原样还回来
+                });
+                SEEN.add("[workflow] 转出完成，流水号 " + sn);
+                if (wf.input.contains("risky")) { // 控制流是真的控制流
+                    wf.branch("风控", null, bid -> Dtmrs.FAILURE);
+                }
+                return Dtmrs.SUCCESS;
+            });
+
             tc.start();
             System.out.println("初始余额: " + balances());
 
@@ -181,6 +195,18 @@ public class Example {
             st = tc.waitFinal("java-msg-2", 8000);
             flush();
             System.out.println("  结果: " + st + "  ← 回查说已提交，消息照样送达");
+
+            System.out.println("\n⑨ workflow：普通转账跑完");
+            tc.submitWorkflow("java-wf-1", "转账流程", "{}");
+            st = tc.waitFinal("java-wf-1", 8000);
+            flush();
+            System.out.println("  结果: " + st + "  余额: " + balances());
+
+            System.out.println("\n⑩ workflow：风控拒绝 → 已做的「转出」被补偿");
+            tc.submitWorkflow("java-wf-2", "转账流程", "{\"risky\":true}");
+            st = tc.waitFinal("java-wf-2", 8000);
+            flush();
+            System.out.println("  结果: " + st + "  余额: " + balances());
         }
     }
 }

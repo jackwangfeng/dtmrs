@@ -18,6 +18,14 @@
  *
  *     // 二阶段消息：本地事务成功就 submit，失败就 abort，不知道就交给回查
  *     tc.msgDoAndSubmit("order-3", List.of("local://加积分"), "local://查订单", () -&gt; writeOrder());
+ *
+ *     // workflow：步骤由函数自己决定，崩溃后重放续跑（已成功的分支不重做）。start 之前注册
+ *     tc.workflow("下单", wf -&gt; {
+ *         String sn = wf.branchWith("扣款", "local://退款", bid -&gt; Dtmrs.out(Dtmrs.SUCCESS, "流水号-1"));
+ *         if (needShip(sn)) wf.branch("发货", "local://退货", bid -&gt; ship());
+ *         return Dtmrs.SUCCESS;
+ *     });
+ *     tc.submitWorkflow("order-4", "下单", "{\"sku\":7}");
  * }
  * </pre>
  *
@@ -126,6 +134,13 @@ public class Dtmrs implements AutoCloseable {
 
         int dtmrs_submit(Pointer tc, String gid);
 
+        int dtmrs_register_workflow(Pointer tc, String name, WorkflowCb fn, Pointer ud);
+
+        int dtmrs_submit_workflow(Pointer tc, String gid, String name, String input);
+
+        int dtmrs_wf_branch(Pointer wf, String name, String compensate, WfBranchCb fn, Pointer ud,
+                            byte[] out, long outLen);
+
         int dtmrs_abort(Pointer tc, String gid);
 
         int dtmrs_status(Pointer tc, String gid, byte[] out, long outLen);
@@ -135,6 +150,16 @@ public class Dtmrs implements AutoCloseable {
         void dtmrs_close(Pointer tc);
 
         String dtmrs_last_error();
+    }
+
+    /** dtmrs_workflow_fn */
+    interface WorkflowCb extends Callback {
+        int invoke(Pointer wf, String gid, String input, Pointer ud);
+    }
+
+    /** dtmrs_wf_branch_fn */
+    interface WfBranchCb extends Callback {
+        int invoke(String gid, String branchId, Pointer out, long outLen, Pointer ud);
     }
 
     /** C 那边的函数指针类型（dtmrs_handler_ex_fn，带 payload 的那个） */
@@ -154,6 +179,7 @@ public class Dtmrs implements AutoCloseable {
      */
     private final Map<String, HandlerFn> keepAlive = new ConcurrentHashMap<>();
     private final Map<String, Handler> handlers = new ConcurrentHashMap<>();
+    private final Map<String, WorkflowCb> keepAliveWf = new ConcurrentHashMap<>();
 
     public Dtmrs(String dbUrl) {
         this(dbUrl, findLib());
@@ -472,6 +498,134 @@ public class Dtmrs implements AutoCloseable {
         return code;
     }
 
+    // ---------------- workflow ----------------
+
+    /** workflow 函数。返回 SUCCESS=跑完了、FAILURE=整单回滚；抛异常=重放（不回滚） */
+    public interface WorkflowFn {
+        int run(Workflow wf) throws Exception;
+    }
+
+    /** 带结果数据的分支函数体，见 {@link Workflow#branchWith} */
+    public interface WfBody {
+        Out call(String branchId) throws Exception;
+    }
+
+    /** 分支结果：结果码 + 要记下的数据（重放时原样还回来） */
+    public static final class Out {
+        final int code;
+        final String data;
+
+        Out(int code, String data) {
+            this.code = code;
+            this.data = data == null ? "" : data;
+        }
+    }
+
+    public static Out out(int code) {
+        return new Out(code, "");
+    }
+
+    public static Out out(int code, String data) {
+        return new Out(code, data);
+    }
+
+    /**
+     * workflow 要停在这里（回滚 / 重试 / 重放走岔），由分支方法抛出。
+     *
+     * <p><b>继承 Error 而不是 Exception</b>：业务代码里常见的 {@code catch (Exception e)}
+     * 不会把它吞掉。别捕获它 —— 就算捕获了继续开分支，库那边也不会再执行任何分支。
+     */
+    public static final class WorkflowStop extends Error {
+        WorkflowStop(String msg) {
+            super(msg);
+        }
+    }
+
+    /** 传给 workflow 函数的上下文，只在那次调用期间有效 */
+    public final class Workflow {
+        public final String gid;
+        public final String input;
+        private final Pointer wf;
+
+        Workflow(Pointer wf, String gid, String input) {
+            this.wf = wf;
+            this.gid = gid;
+            this.input = input;
+        }
+
+        /** 开一个分支（不带结果数据）。见 {@link #branchWith} */
+        public void branch(String name, String compensate, Phase1 fn) {
+            branchWith(name, compensate, bid -> out(fn.call(bid)));
+        }
+
+        /**
+         * 开一个分支，返回它的结果数据。
+         *
+         * @param name       逻辑名字，重放时用来做分岔检测，要稳定
+         * @param compensate 回滚时调的地址；null = 不补偿（只适合没副作用的步骤）
+         * @param fn         函数体。重放时这个分支上次成功过就<b>不会被调用</b>，直接返回上次的数据
+         * @throws WorkflowStop 分支没成功或重放走岔 —— 让它往外传就好
+         */
+        public String branchWith(String name, String compensate, WfBody fn) {
+            WfBranchCb cb = (g, bid, outp, outLen, ud) -> {
+                // 这个回调**嵌套**在 workflow 回调里：线程已经被外层 attach 着、还有 Java
+                // 栈帧。JNA 默认回调一返回就 detach，这一下必然失败（打出
+                // "JNA: could not detach thread"）。告诉它别 detach —— 线程会保持 attach，
+                // 这没关系：阻塞线程池里的线程本来就会反复回调进 JVM
+                Native.detach(false);
+                try {
+                    Out o = fn.call(bid);
+                    byte[] raw = o.data.getBytes(StandardCharsets.UTF_8);
+                    if (raw.length + 1 > outLen) {
+                        // 截断会让记下的数据跟真实结果对不上，重放时就是错的。宁可重试
+                        System.err.println("[dtmrs] 分支 " + name + " 的结果数据太长，按结果未知处理");
+                        return UNKNOWN;
+                    }
+                    outp.write(0, raw, 0, raw.length);
+                    outp.setByte(raw.length, (byte) 0);
+                    return o.code;
+                } catch (Throwable t) {
+                    // 不知道做没做 → 重放，绝不回滚。异常也绝不能穿回 Rust
+                    System.err.println("[dtmrs] 分支 " + name + " 抛异常，按结果未知处理: " + t);
+                    return UNKNOWN;
+                }
+            };
+            byte[] buf = new byte[4097];
+            if (lib.dtmrs_wf_branch(wf, name, compensate, cb, null, buf, buf.length) != OK) {
+                throw new WorkflowStop(lib.dtmrs_last_error());
+            }
+            return cstr(buf);
+        }
+    }
+
+    /**
+     * 注册一个 workflow 函数。必须在 {@link #start()} 之前。
+     *
+     * <p><b>函数会被从头跑多次</b>（重放），必须是确定性的，副作用都放进分支里。
+     * 重启后要注册同名函数。
+     */
+    public Dtmrs workflow(String name, WorkflowFn fn) {
+        if (started) throw new IllegalStateException("已经 start 了，不能再注册 workflow");
+        WorkflowCb cb = (wfp, gid, input, ud) -> {
+            try {
+                return fn.run(new Workflow(wfp, gid, input));
+            } catch (WorkflowStop s) {
+                return UNKNOWN; // 库里已经记下了真正的原因，这个返回值不算数
+            } catch (Throwable t) {
+                System.err.println("[dtmrs] workflow " + name + " 抛异常，会重放: " + t);
+                return UNKNOWN;
+            }
+        };
+        keepAliveWf.put(name, cb); // 同 keepAlive：被 GC 掉就是野指针
+        check(lib.dtmrs_register_workflow(tc, name, cb, null), "注册 workflow");
+        return this;
+    }
+
+    /** 提交一个 workflow 事务。name 没注册会当场报错。幂等 */
+    public void submitWorkflow(String gid, String name, String input) {
+        check(lib.dtmrs_submit_workflow(tc, gid, name, input == null ? "" : input), "提交 workflow");
+    }
+
     /** tcc / xa / msg 的二阶段提交（幂等） */
     public void submit(String gid) {
         check(lib.dtmrs_submit(tc, gid), "提交");
@@ -510,6 +664,7 @@ public class Dtmrs implements AutoCloseable {
         closed = true;
         lib.dtmrs_close(tc);
         keepAlive.clear();
+        keepAliveWf.clear();
     }
 
     private static String cstr(byte[] b) {

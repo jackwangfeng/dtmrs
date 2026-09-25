@@ -119,6 +119,62 @@ int dtmrs_submit(DtmrsTc *tc, const char *gid);
 /* 主动中止：逆序撤销所有已登记分支。tcc / xa / msg 已 submit 的会返回 DTMRS_ERR。 */
 int dtmrs_abort(DtmrsTc *tc, const char *gid);
 
+/* ---- workflow ------------------------------------------------------------
+ *
+ * 把整个事务写成一个函数，步骤由函数自己决定（可以有 if、循环、依赖前一步的结果）。
+ * 崩溃后靠**重放**续跑：函数会被从头再调，已成功的分支不重新执行，而是把上次
+ * 记下的结果直接还给你。所以函数必须是确定性的，副作用都要放进分支里。
+ *
+ *   static int deduct(const char *gid, const char *bid, char *out, size_t n, void *ud) {
+ *       ... 扣款 ...
+ *       snprintf(out, n, "流水号-123");     // 结果数据，重放时原样还回来
+ *       return DTMRS_SUCCESS;
+ *   }
+ *   static int order(DtmrsWf *wf, const char *gid, const char *input, void *ud) {
+ *       char sn[64];
+ *       if (dtmrs_wf_branch(wf, "扣款", "local://退款", deduct, NULL, sn, sizeof sn) != DTMRS_OK)
+ *           return DTMRS_UNKNOWN;          // 收到 ERR 立刻返回；返回什么都行，以分支的原因为准
+ *       if (need_ship(sn) && dtmrs_wf_branch(wf, "发货", "local://退货", ship, NULL, NULL, 0) != DTMRS_OK)
+ *           return DTMRS_UNKNOWN;
+ *       return DTMRS_SUCCESS;
+ *   }
+ *   dtmrs_register_workflow(tc, "下单", order, NULL);   // start 之前
+ *   dtmrs_start(tc);
+ *   dtmrs_submit_workflow(tc, "order-1", "下单", "{\"sku\":7}");
+ *
+ * 只有回调式；拉取式（Node）没有 workflow —— 函数体得在回调里同步跑完。
+ */
+
+typedef struct DtmrsWf DtmrsWf;
+
+/* workflow 函数。返回 DTMRS_SUCCESS=跑完了、DTMRS_FAILURE=业务要求整单回滚、
+ * 其它=过会儿重放。**有任何一次 dtmrs_wf_branch 返回过 ERR，这个返回值就不算数。** */
+typedef int (*dtmrs_workflow_fn)(DtmrsWf *wf, const char *gid, const char *input,
+                                 void *user_data);
+
+/* 分支函数体。结果数据写进 out（'\0' 结尾，最多 1024 字符，可以不写）。 */
+typedef int (*dtmrs_wf_branch_fn)(const char *gid, const char *branch_id,
+                                  char *out, size_t out_len, void *user_data);
+
+/* 注册 workflow 函数，必须在 dtmrs_start 之前。重启后要注册同名函数。 */
+int dtmrs_register_workflow(DtmrsTc *tc, const char *name,
+                            dtmrs_workflow_fn fn, void *user_data);
+
+/* 提交 workflow 事务。name 没注册当场报错。幂等。 */
+int dtmrs_submit_workflow(DtmrsTc *tc, const char *gid, const char *name,
+                          const char *input);
+
+/* 在 workflow 函数里开一个分支。只能在 workflow 函数执行期间、用传进来的 wf 调。
+ *   name        逻辑名字，用于重放分岔检测，要稳定
+ *   compensate  回滚时调的地址（local:// / http://），NULL 或 "" = 不补偿
+ *   fn          函数体；重放时这个分支上次成功过就**不会被调用**
+ *   out/out_len 结果数据（新跑的或上次记下的），可传 NULL
+ * 返回 DTMRS_OK = 分支成功。DTMRS_ERR = workflow 要停在这里（回滚 / 重试 / 重放走岔），
+ * 原因见 dtmrs_last_error()。收到 ERR 要立刻返回 —— 之后再开的分支一律不会执行。 */
+int dtmrs_wf_branch(DtmrsWf *wf, const char *name, const char *compensate,
+                    dtmrs_wf_branch_fn fn, void *user_data,
+                    char *out, size_t out_len);
+
 /* ---- 拉取式分支分发 ----------------------------------------------------
  *
  * dtmrs_register 是「推」：库回调你。简单，但回调必须**同步返回**一个 int。

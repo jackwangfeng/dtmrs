@@ -35,6 +35,7 @@
 use dtmrs_core::{BranchResult, SagaStep};
 use dtmrs_server::embedded::Embedded;
 use dtmrs_server::registry::BranchCtx;
+use dtmrs_server::workflow::{WorkflowCtx, WorkflowError, WorkflowResult};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -96,6 +97,36 @@ struct HandlerPtr {
 unsafe impl Send for HandlerPtr {}
 unsafe impl Sync for HandlerPtr {}
 
+/// 宿主的 workflow 函数。在里面用 [`dtmrs_wf_branch`] 开分支。
+///
+/// 返回 `DTMRS_SUCCESS` = 跑完了；`DTMRS_FAILURE` = 业务要求整单回滚；
+/// 其它 = 过会儿重放。**任何一次 `dtmrs_wf_branch` 返回过 `DTMRS_ERR`，
+/// 这里的返回值就不再算数** —— 以那次的原因为准（回滚 / 重试 / 分岔停下）。
+pub type WorkflowFn = extern "C" fn(
+    wf: *mut DtmrsWf,
+    gid: *const c_char,
+    input: *const c_char,
+    user_data: *mut c_void,
+) -> c_int;
+
+/// workflow 分支的函数体。结果数据写进 `out`（`\0` 结尾，可以不写），
+/// 重放时原样还给调用方，不再执行。
+pub type WfBranchFn = extern "C" fn(
+    gid: *const c_char,
+    branch_id: *const c_char,
+    out: *mut c_char,
+    out_len: usize,
+    user_data: *mut c_void,
+) -> c_int;
+
+#[derive(Clone, Copy)]
+struct WorkflowPtr {
+    f: WorkflowFn,
+    ud: *mut c_void,
+}
+unsafe impl Send for WorkflowPtr {}
+unsafe impl Sync for WorkflowPtr {}
+
 thread_local! {
     static LAST_ERR: RefCell<CString> = RefCell::new(CString::new("").unwrap());
 }
@@ -122,6 +153,8 @@ pub struct DtmrsTc {
     pending: Option<Vec<(String, HandlerPtr)>>,
     /// start 之前收集走拉取式的分支名
     pending_pull: Option<Vec<String>>,
+    /// start 之前收集的 workflow 函数
+    pending_wf: Option<Vec<(String, WorkflowPtr)>>,
     db: String,
     tc: Option<Embedded>,
     pull: Arc<PullQueue>,
@@ -262,6 +295,7 @@ pub extern "C" fn dtmrs_open(db_url: *const c_char) -> *mut DtmrsTc {
         rt,
         pending: Some(Vec::new()),
         pending_pull: Some(Vec::new()),
+        pending_wf: Some(Vec::new()),
         db: db.to_string(),
         tc: None,
         pull: Arc::new(PullQueue::new()),
@@ -456,8 +490,21 @@ pub extern "C" fn dtmrs_start(tc: *mut DtmrsTc) -> c_int {
         return DTMRS_ERR;
     };
     let pending_pull = h.pending_pull.take().unwrap_or_default();
+    let pending_wf = h.pending_wf.take().unwrap_or_default();
 
     let mut b = Embedded::builder(&h.db).tick(Duration::from_millis(50));
+
+    for (name, wp) in pending_wf {
+        b = b.workflow(&name, move |ctx: WorkflowCtx| async move {
+            // 跟分支回调同一个理由：宿主函数同步、会阻塞、还可能抢 GIL
+            let rt = tokio::runtime::Handle::current();
+            match tokio::task::spawn_blocking(move || run_host_workflow(wp, ctx, rt)).await {
+                Ok(r) => r,
+                // 宿主函数 panic 了。不知道跑到哪了 —— **重放，不回滚**
+                Err(e) => Err(WorkflowError::Retry(format!("宿主 workflow 函数异常终止: {e}"))),
+            }
+        });
+    }
 
     // 拉取式的分支：handler 只负责挂进队列然后等宿主回话
     for name in pending_pull {
@@ -779,6 +826,213 @@ pub extern "C" fn dtmrs_abort(tc: *mut DtmrsTc, gid: *const c_char) -> c_int {
     };
     let inner = h.tc.as_ref().unwrap();
     run(h, inner.abort(gid))
+}
+
+// ---------------- workflow ----------------
+//
+// workflow 的「步骤」是宿主的代码，所以是**回调里再调回来**：
+//
+//   推进器 ──► 宿主的 workflow 函数(wf, gid, input)
+//                 ├─ dtmrs_wf_branch(wf, "建订单", "local://取消订单", 函数体, …)
+//                 │     重放命中 → 不跑函数体，把上次的结果写进 out
+//                 │     没命中   → 先登记补偿，再跑函数体，记下结果
+//                 └─ dtmrs_wf_branch(wf, "扣款", …)
+//
+// workflow 函数跑在阻塞线程池上（spawn_blocking），dtmrs_wf_branch 在那条线程上
+// block_on —— 阻塞线程不在异步上下文里，可以这么做。
+//
+// 只有回调式；**拉取式（Node）不支持 workflow**：函数体必须在 C 回调里同步跑完，
+// 而 Node 的业务代码是 async 的，在同步回调里等不了 Promise。
+
+/// 传给宿主 workflow 函数的不透明句柄，只在那次调用期间有效。
+pub struct DtmrsWf {
+    ctx: WorkflowCtx,
+    rt: tokio::runtime::Handle,
+    /// 第一次出错就记下来，之后的 `dtmrs_wf_branch` **一律不跑**、直接返回 ERR。
+    ///
+    /// 宿主可能没检查返回值（或者 Python 里一个裸 `except:` 把停止信号吞了），
+    /// 接着去开下一个分支。那样的话：回滚时会多出一个本不该执行的分支；分岔时
+    /// 会在已经对不上号的位置上继续执行。都得靠这里挡住，不能指望宿主自觉。
+    err: Option<WorkflowError>,
+}
+
+/// 分支结果数据的缓冲区。库里那一列上限是 1024 **字符**，UTF-8 最多 4 字节一个
+const WF_OUT_CAP: usize = 1024 * 4 + 1;
+
+fn run_host_workflow(
+    wp: WorkflowPtr,
+    ctx: WorkflowCtx,
+    rt: tokio::runtime::Handle,
+) -> WorkflowResult<()> {
+    let (Ok(gid), Ok(input)) = (CString::new(ctx.gid.as_str()), CString::new(ctx.input.as_str()))
+    else {
+        return Err(WorkflowError::Retry("gid / input 含 NUL，C 回调传不了".into()));
+    };
+    let mut wf = DtmrsWf { ctx, rt, err: None };
+    let code = (wp.f)(&mut wf, gid.as_ptr(), input.as_ptr(), wp.ud);
+    // 分支出过错就以它为准，宿主的返回值不算数（见 WorkflowFn 的文档）
+    if let Some(e) = wf.err {
+        return Err(e);
+    }
+    match code {
+        DTMRS_SUCCESS => Ok(()),
+        DTMRS_FAILURE => Err(WorkflowError::Rollback("workflow 函数返回 FAILURE".into())),
+        // ONGOING / UNKNOWN / 野值：都是重放，绝不回滚
+        c => Err(WorkflowError::Retry(format!("workflow 函数返回 {c}"))),
+    }
+}
+
+/// 注册一个 workflow 函数。必须在 `dtmrs_start` 之前调。
+///
+/// 跟 `local://` 分支同一个约束：库里存的是**名字**，重启后必须注册同名函数。
+#[no_mangle]
+pub extern "C" fn dtmrs_register_workflow(
+    tc: *mut DtmrsTc,
+    name: *const c_char,
+    f: Option<WorkflowFn>,
+    user_data: *mut c_void,
+) -> c_int {
+    clear_err();
+    let Some(h) = (unsafe { tc.as_mut() }) else {
+        set_err("句柄是空指针");
+        return DTMRS_ERR;
+    };
+    let Some(name) = (unsafe { cstr(name, "name") }) else {
+        return DTMRS_ERR;
+    };
+    let Some(f) = f else {
+        set_err("workflow 函数是空指针");
+        return DTMRS_ERR;
+    };
+    match h.pending_wf.as_mut() {
+        Some(v) => {
+            v.push((name.to_string(), WorkflowPtr { f, ud: user_data }));
+            DTMRS_OK
+        }
+        None => {
+            set_err("已经 start 了，不能再注册 workflow");
+            DTMRS_ERR
+        }
+    }
+}
+
+/// 提交一个 workflow 事务。`name` 没注册会当场报错。`input` 原样传给函数。幂等。
+#[no_mangle]
+pub extern "C" fn dtmrs_submit_workflow(
+    tc: *mut DtmrsTc,
+    gid: *const c_char,
+    name: *const c_char,
+    input: *const c_char,
+) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let (Some(gid), Some(name), Some(input)) =
+        (unsafe { (cstr(gid, "gid"), cstr(name, "name"), cstr(input, "input")) })
+    else {
+        return DTMRS_ERR;
+    };
+    let inner = h.tc.as_ref().unwrap();
+    run(h, inner.submit_workflow(gid, name, input))
+}
+
+/// 在 workflow 函数里开一个分支。**只能在 workflow 函数执行期间、用传进来的 `wf` 调。**
+///
+/// - `name`：分支的逻辑名字，用来做重放分岔检测。取稳定的名字，别带时间戳
+/// - `compensate`：回滚时调的地址（`local://…` / `http://…`）；NULL 或空串 = 不补偿
+///   （只适合没有副作用的步骤）
+/// - `f`：函数体。重放时如果这个分支上次已经成功，**不会被调用**
+/// - `out` / `out_len`：函数体写的（或上次记下的）结果数据写到这里；可以传 NULL
+///
+/// 返回 `DTMRS_OK` 表示分支成功（新跑的或重放命中的）。返回 `DTMRS_ERR` 表示
+/// **workflow 要停在这里**（回滚 / 重试 / 分岔），原因在 `dtmrs_last_error()`。
+/// 收到 ERR 应该立刻从 workflow 函数返回 —— 不返回的话之后的分支也一律不会执行。
+#[no_mangle]
+pub extern "C" fn dtmrs_wf_branch(
+    wf: *mut DtmrsWf,
+    name: *const c_char,
+    compensate: *const c_char,
+    f: Option<WfBranchFn>,
+    user_data: *mut c_void,
+    out: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    clear_err();
+    let Some(wf) = (unsafe { wf.as_mut() }) else {
+        set_err("wf 是空指针");
+        return DTMRS_ERR;
+    };
+    if let Some(e) = &wf.err {
+        set_err(format!("workflow 已经要停下了，不再执行新分支: {e}"));
+        return DTMRS_ERR;
+    }
+    let Some(name) = (unsafe { cstr(name, "name") }) else {
+        return DTMRS_ERR;
+    };
+    let compensate = if compensate.is_null() {
+        ""
+    } else {
+        match unsafe { cstr(compensate, "compensate") } {
+            Some(c) => c,
+            None => return DTMRS_ERR,
+        }
+    };
+    let Some(f) = f else {
+        set_err("分支函数是空指针");
+        return DTMRS_ERR;
+    };
+
+    // run_with 不把分支号交给函数体，按同样的规则先算出来（下一个序号）
+    let bid = dtmrs_server::driver::branch_id(wf.ctx.branch_count());
+    let (Ok(gid_c), Ok(bid_c)) = (CString::new(wf.ctx.gid.as_str()), CString::new(bid.as_str()))
+    else {
+        set_err("gid 含 NUL");
+        return DTMRS_ERR;
+    };
+    let mut b = wf.ctx.branch(name);
+    if !compensate.is_empty() {
+        b = b.on_rollback(compensate);
+    }
+    let body = || async {
+        let mut buf = vec![0u8; WF_OUT_CAP];
+        let code = f(
+            gid_c.as_ptr(),
+            bid_c.as_ptr(),
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len(),
+            user_data,
+        );
+        // 宿主可能没写 \0 就写满了 —— 兜底截在最后一个字节
+        *buf.last_mut().unwrap() = 0;
+        let data = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+            .to_string_lossy()
+            .into_owned();
+        (to_branch_result(code), data)
+    };
+    match wf.rt.block_on(b.run_with(body)) {
+        Ok(data) => {
+            if out.is_null() {
+                return DTMRS_OK;
+            }
+            if write_out(&data, out, out_len) != DTMRS_OK {
+                // 分支本身已经成功并记下了，只是宿主接不住结果。**重放，不回滚**：
+                // 宿主改大缓冲区后重放会命中记忆化，不会重做
+                let e = WorkflowError::Retry(format!("分支 {bid} 的结果写不进 out: {}", last_err_string()));
+                set_err(e.to_string());
+                wf.err = Some(e);
+                return DTMRS_ERR;
+            }
+            DTMRS_OK
+        }
+        Err(e) => {
+            set_err(e.to_string());
+            wf.err = Some(e);
+            DTMRS_ERR
+        }
+    }
+}
+
+fn last_err_string() -> String {
+    LAST_ERR.with(|e| e.borrow().to_string_lossy().into_owned())
 }
 
 /// 查当前状态，写进 `out`（`prepared|submitted|aborting|succeed|failed`）。
@@ -1448,6 +1702,230 @@ mod tests {
         assert_eq!(p(r#"["local://act"]"#, ""), DTMRS_ERR, "没有回查地址就没法决断");
         assert_eq!(p(r#"["local://没注册"]"#, "local://q"), DTMRS_ERR);
         assert_eq!(p(r#"["local://act"]"#, "local://q"), DTMRS_OK);
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ---------------- workflow ----------------
+
+    /// 宿主 workflow 函数的状态（user_data 指向它）
+    #[derive(Default)]
+    struct Wf {
+        runs: AtomicU64,
+        /// 每个分支函数体被真正执行的次数，按分支号下标
+        body: [AtomicU64; 3],
+        /// 第几种剧本
+        mode: u8,
+        /// 宿主看到的东西：分支 out、input、dtmrs_last_error
+        seen: Mutex<Vec<String>>,
+    }
+
+    fn wf_of(ud: *mut c_void) -> &'static Wf {
+        unsafe { &*(ud as *const Wf) }
+    }
+
+    extern "C" fn body_ok(_g: *const c_char, b: *const c_char, out: *mut c_char, len: usize, ud: *mut c_void) -> c_int {
+        let w = wf_of(ud);
+        let b = unsafe { CStr::from_ptr(b) }.to_str().unwrap();
+        let i: usize = b.parse::<usize>().unwrap() - 1;
+        w.body[i].fetch_add(1, Ordering::SeqCst);
+        write_out(&format!("结果-{b}"), out, len);
+        DTMRS_SUCCESS
+    }
+
+    extern "C" fn body_fail(_g: *const c_char, _b: *const c_char, _o: *mut c_char, _l: usize, ud: *mut c_void) -> c_int {
+        wf_of(ud).body[1].fetch_add(1, Ordering::SeqCst);
+        DTMRS_FAILURE
+    }
+
+    /// 第一次结果未知，之后成功
+    extern "C" fn body_flaky(g: *const c_char, b: *const c_char, o: *mut c_char, l: usize, ud: *mut c_void) -> c_int {
+        let w = wf_of(ud);
+        if w.body[1].load(Ordering::SeqCst) == 0 {
+            w.body[1].fetch_add(1, Ordering::SeqCst);
+            return DTMRS_UNKNOWN;
+        }
+        body_ok(g, b, o, l, ud)
+    }
+
+    fn wf_branch(wf: *mut DtmrsWf, name: &str, f: WfBranchFn, ud: *mut c_void) -> Result<String, String> {
+        let mut out = [0u8; 256];
+        let r = dtmrs_wf_branch(wf, cs(name).as_ptr(), cs("local://undo").as_ptr(), Some(f), ud,
+            out.as_mut_ptr() as *mut c_char, out.len());
+        if r == DTMRS_OK {
+            Ok(unsafe { CStr::from_ptr(out.as_ptr() as *const c_char) }.to_str().unwrap().to_string())
+        } else {
+            Err(last_err())
+        }
+    }
+
+    extern "C" fn host_workflow(wf: *mut DtmrsWf, _gid: *const c_char, input: *const c_char, ud: *mut c_void) -> c_int {
+        let w = wf_of(ud);
+        let run = w.runs.fetch_add(1, Ordering::SeqCst);
+        let seen = |s: String| w.seen.lock().unwrap().push(s);
+        match w.mode {
+            // 正常：两步，第一步的结果拿得到
+            0 => {
+                seen(format!("input={}", unsafe { CStr::from_ptr(input) }.to_str().unwrap()));
+                let a = wf_branch(wf, "建订单", body_ok, ud).unwrap();
+                seen(format!("out={a}"));
+                wf_branch(wf, "扣款", body_ok, ud).unwrap();
+                DTMRS_SUCCESS
+            }
+            // 第二步失败 → 宿主**不理会**错误继续开第三步，还返回 SUCCESS
+            1 => {
+                wf_branch(wf, "建订单", body_ok, ud).unwrap();
+                if let Err(e) = wf_branch(wf, "扣款", body_fail, ud) {
+                    seen(format!("err={e}"));
+                }
+                if let Err(e) = wf_branch(wf, "发货", body_ok, ud) {
+                    seen(format!("err3={e}"));
+                }
+                DTMRS_SUCCESS
+            }
+            // 第二步第一次结果未知 → 重放
+            2 => {
+                wf_branch(wf, "建订单", body_ok, ud).unwrap();
+                match wf_branch(wf, "扣款", body_flaky, ud) {
+                    Ok(_) => DTMRS_SUCCESS,
+                    Err(_) => DTMRS_SUCCESS, // 返回值不算数，以分支的错误为准
+                }
+            }
+            // 不确定的函数：第一次走 A，重放时走 B
+            3 => {
+                let name = if run == 0 { "A" } else { "B" };
+                match wf_branch(wf, name, body_ok, ud) {
+                    Ok(_) if run == 0 => DTMRS_UNKNOWN, // 逼它重放
+                    Ok(_) => DTMRS_SUCCESS,
+                    Err(e) => {
+                        seen(format!("err={e}"));
+                        DTMRS_SUCCESS // 同样不算数
+                    }
+                }
+            }
+            // 野值
+            _ => {
+                wf_branch(wf, "建订单", body_ok, ud).unwrap();
+                42
+            }
+        }
+    }
+
+    /// 开 TC、注册 undo 补偿和一个 workflow，提交一笔。Box 的理由同 `tc_with`
+    #[allow(clippy::vec_box)]
+    fn wf_run(name: &str, mode: u8) -> (*mut DtmrsTc, Box<Wf>, Log, Vec<Box<Rec>>, std::path::PathBuf) {
+        let (url, path) = db(name);
+        let tc = dtmrs_open(url.as_ptr());
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let undo = Box::new(Rec { tag: "undo", ret: DTMRS_SUCCESS, log: log.clone() });
+        dtmrs_register_ex(tc, cs("undo").as_ptr(), Some(rec_handler), &*undo as *const Rec as *mut c_void);
+        let w = Box::new(Wf { mode, ..Default::default() });
+        assert_eq!(
+            dtmrs_register_workflow(tc, cs("下单").as_ptr(), Some(host_workflow), &*w as *const Wf as *mut c_void),
+            DTMRS_OK
+        );
+        assert_eq!(dtmrs_start(tc), DTMRS_OK);
+        assert_eq!(
+            dtmrs_submit_workflow(tc, cs(name).as_ptr(), cs("下单").as_ptr(), cs("订单-7").as_ptr()),
+            DTMRS_OK, "{}", last_err()
+        );
+        (tc, w, log, vec![undo], path)
+    }
+
+    fn wait_ms(tc: *mut DtmrsTc, gid: &str, ms: c_int) -> String {
+        let mut buf = [0u8; 64];
+        dtmrs_wait_final(tc, cs(gid).as_ptr(), ms, buf.as_mut_ptr() as *mut c_char, 64);
+        let mut st = [0u8; 64];
+        dtmrs_status(tc, cs(gid).as_ptr(), st.as_mut_ptr() as *mut c_char, 64);
+        unsafe { CStr::from_ptr(st.as_ptr() as *const c_char) }.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn c接口跑通workflow_分支结果能拿到() {
+        let (tc, w, log, _k, path) = wf_run("wf-ok", 0);
+        assert_eq!(wait_ms(tc, "wf-ok", 8000), "succeed");
+        assert_eq!(*w.seen.lock().unwrap(), ["input=订单-7", "out=结果-01"]);
+        assert_eq!(w.body[0].load(Ordering::SeqCst), 1);
+        assert_eq!(w.body[1].load(Ordering::SeqCst), 1);
+        assert!(log.lock().unwrap().is_empty(), "成功了不该补偿");
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口workflow分支失败则逆序补偿_宿主不理会错误也开不了新分支() {
+        let (tc, w, log, _k, path) = wf_run("wf-rb", 1);
+        assert_eq!(wait_ms(tc, "wf-rb", 8000), "failed", "宿主返回 SUCCESS 不算数");
+        // 失败的那步也补：它的补偿在动作之前就登记了，动作可能做了一半
+        assert_eq!(*log.lock().unwrap(), ["undo@02", "undo@01"]);
+        assert_eq!(w.body[2].load(Ordering::SeqCst), 0, "第三步绝不能执行");
+        let seen = w.seen.lock().unwrap().clone();
+        assert!(seen.iter().any(|s| s.starts_with("err=") && s.contains("FAILURE")), "{seen:?}");
+        assert!(seen.iter().any(|s| s.starts_with("err3=") && s.contains("停下")), "{seen:?}");
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口workflow重放时已成功的分支不重跑() {
+        // 第一次跑到第二步结果未知 → 退避（默认 10 秒）后重放。这条要等十来秒
+        let (tc, w, log, _k, path) = wf_run("wf-replay", 2);
+        assert_eq!(wait_ms(tc, "wf-replay", 20000), "succeed");
+        assert_eq!(w.runs.load(Ordering::SeqCst), 2, "函数被从头跑了两次");
+        assert_eq!(w.body[0].load(Ordering::SeqCst), 1, "第一步重放时命中记忆化，不重做");
+        assert_eq!(w.body[1].load(Ordering::SeqCst), 2);
+        assert!(log.lock().unwrap().is_empty(), "结果未知绝不能触发补偿");
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口workflow重放走岔时停下_既不成功也不回滚() {
+        let (tc, w, log, _k, path) = wf_run("wf-diverge", 3);
+        // 等到第二次跑（退避 10 秒）并且确认它停住了
+        let t0 = std::time::Instant::now();
+        while w.runs.load(Ordering::SeqCst) < 2 && t0.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(wait_ms(tc, "wf-diverge", 0), "submitted", "分岔了不能判成功（宿主返回 SUCCESS 也不行）");
+        assert!(log.lock().unwrap().is_empty(), "分岔了也不能回滚");
+        let seen = w.seen.lock().unwrap().clone();
+        assert!(seen.iter().any(|s| s.contains("走岔")), "{seen:?}");
+        assert_eq!(w.body[0].load(Ordering::SeqCst), 1, "B 不能在 A 的位置上执行");
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口workflow函数返回野值只重放不回滚() {
+        let (tc, w, log, _k, path) = wf_run("wf-bogus", 9);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(wait_ms(tc, "wf-bogus", 0), "submitted");
+        assert!(w.runs.load(Ordering::SeqCst) >= 1);
+        assert!(log.lock().unwrap().is_empty());
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口workflow的错误路径() {
+        let (url, path) = db("wf_err");
+        let tc = dtmrs_open(url.as_ptr());
+        assert_eq!(dtmrs_register_workflow(tc, cs("w").as_ptr(), None, std::ptr::null_mut()), DTMRS_ERR);
+        assert_eq!(dtmrs_submit_workflow(tc, cs("g").as_ptr(), cs("w").as_ptr(), cs("").as_ptr()), DTMRS_ERR, "没 start");
+        assert_eq!(dtmrs_start(tc), DTMRS_OK);
+        assert_eq!(
+            dtmrs_register_workflow(tc, cs("w").as_ptr(), Some(host_workflow), std::ptr::null_mut()),
+            DTMRS_ERR, "start 之后不能再注册"
+        );
+        assert_eq!(dtmrs_submit_workflow(tc, cs("g").as_ptr(), cs("没注册").as_ptr(), cs("").as_ptr()), DTMRS_ERR);
+        assert!(last_err().contains("没注册"), "{}", last_err());
+        assert_eq!(
+            dtmrs_wf_branch(std::ptr::null_mut(), cs("a").as_ptr(), std::ptr::null(), Some(body_ok),
+                std::ptr::null_mut(), std::ptr::null_mut(), 0),
+            DTMRS_ERR
+        );
         dtmrs_close(tc);
         let _ = std::fs::remove_file(path);
     }
