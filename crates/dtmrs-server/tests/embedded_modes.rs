@@ -429,3 +429,48 @@ async fn 嵌入式msg_本地事务不能在prepare之前跑() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn 嵌入式tcc_abort不能冲掉推进器刚抢到的租约() {
+    // Api::abort 原先是「改成 aborting」+「schedule_now」两步。改完状态的那一刻
+    // 事务就可调度了，推进器可能马上抢到它、把 next_cron_time 推到租约之后；
+    // 紧接着 schedule_now 又把它拨回现在 —— 租约被冲掉，另一个 worker 再抢一次，
+    // 同一个 cancel 被并发调两遍。屏障能兜住多余的那次，但「同一笔事务同一时刻
+    // 只有一个 worker 在推」是租约存在的全部意义。
+    //
+    // 窗口很窄（整套测试跑 150 遍才撞上 1 次），所以这里把推进器轮询压到 1ms、
+    // 连着 abort 几百笔来放大它
+    common::for_each_backend("abort_lease", |be| async move {
+        let log = Log::default();
+        let tc = Embedded::builder(&be.url)
+            .handler("confirm", recorder(&log, "confirm", BranchResult::Success))
+            .handler("cancel", recorder(&log, "cancel", BranchResult::Success))
+            .tick(Duration::from_millis(1))
+            .start()
+            .await
+            .unwrap();
+        const N: usize = 300;
+        for i in 0..N {
+            let gid = format!("lease-{i}");
+            tc.tcc(&gid).await.unwrap();
+            tc.register_tcc_branch(&gid, "01", "local://confirm", "local://cancel")
+                .await
+                .unwrap();
+            tc.abort(&gid).await.unwrap();
+        }
+        for i in 0..N {
+            let s = tc
+                .wait_final(&format!("lease-{i}"), Duration::from_secs(20))
+                .await
+                .unwrap();
+            assert_eq!(s, GlobalStatus::Failed, "[{}] lease-{i}", be.label);
+        }
+        assert_eq!(
+            count(&log, "cancel"),
+            N,
+            "[{}] 每笔的 cancel 必须正好一次：多出来的是两个 worker 并发推了同一笔",
+            be.label
+        );
+    })
+    .await;
+}

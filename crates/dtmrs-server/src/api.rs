@@ -436,7 +436,23 @@ impl Api {
                     .set_global_status(gid, GlobalStatus::Aborting, g.trans_type, "调用方主动中止")
                     .await
                     .map_err(internal)?;
-                let _ = self.store.schedule_now(gid).await;
+                // ⚠ 只有**还没到期**（在退避里）的才需要提前，已经到期的**不能**再 schedule_now。
+                //
+                // 状态一改成 aborting，事务就可调度了，推进器可能在这一刻就抢到它、
+                // 把 next_cron_time 推到租约之后。这时候再无条件 schedule_now，等于把
+                // 刚发出去的租约冲掉：另一个 worker 再抢一次，同一个 cancel 被并发调两遍
+                // （`嵌入式tcc_abort不能冲掉推进器刚抢到的租约`，原先 300 笔里撞上 3 笔）。
+                //
+                // prepared 的 tcc / xa 最常走这条路，而它们的 next_cron_time 就是创建时间
+                // （prepared 时不可调度，没人动过它），本来就已经到期 —— 改完状态就会被
+                // 捞起来，不需要推一把。
+                //
+                // 仍然没堵住的：正在退避、同时又正被 worker 持着租约的事务（比如 saga
+                // 推到一半被 abort）。租约只体现在 next_cron_time 上，跟「退避中」分不出来，
+                // 要彻底解决得给租约单独一个字段。那种情况下多出来的补偿由屏障空转掉
+                if g.next_cron_time > dtmrs_store::now() {
+                    let _ = self.store.schedule_now(gid).await;
+                }
                 Ok(())
             }
             Ok(Some(_)) => Err(ApiError::Conflict("事务已终结，无法中止".into())),
