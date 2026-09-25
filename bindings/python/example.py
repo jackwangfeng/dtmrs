@@ -81,6 +81,43 @@ def downstream_timeout(ctx):
     return dtmrs.UNKNOWN
 
 
+# ---- TCC：try 由我们自己跑，TC 只管 confirm / cancel ----
+frozen = {}   # (gid, branch_id) → 冻结的金额。真实业务里这是一张表
+
+
+@tc.handler("冻结确认")
+def freeze_confirm(ctx):
+    log("冻结确认", ctx)
+    amt = frozen.pop((ctx.gid, ctx.branch_id), 0)
+    move(1, 2, amt)
+    return dtmrs.SUCCESS
+
+
+@tc.handler("冻结撤销")
+def freeze_cancel(ctx):
+    log("冻结撤销", ctx)
+    # try 可能根本没跑成（空回滚），pop 不到也要返回成功
+    frozen.pop((ctx.gid, ctx.branch_id), None)
+    return dtmrs.SUCCESS
+
+
+# ---- 二阶段消息：本地事务 + 保证送达 ----
+orders = set()
+
+
+@tc.handler("加积分")
+def add_points(ctx):
+    log("加积分", ctx)
+    return dtmrs.SUCCESS
+
+
+@tc.handler("查订单")
+def query_order(ctx):
+    # 回查：本地事务到底提交了没有
+    log("查订单", ctx)
+    return dtmrs.SUCCESS if ctx.gid in orders else dtmrs.FAILURE
+
+
 tc.start()
 print(f"TC 已在本进程内启动（库: {DB}）")
 print("初始余额:", balances())
@@ -116,5 +153,40 @@ try:
 except RuntimeError as e:
     print("  提交被拒:", e)
 
+print("\n⑥ TCC：两个 try 都成功 → confirm")
+def freeze(gid, amt):
+    def try_fn(bid):
+        frozen[(gid, bid)] = amt
+        return dtmrs.SUCCESS
+    return try_fn
+
+with tc.tcc("py-tcc-1") as t:
+    t.try_branch("local://冻结确认", "local://冻结撤销", freeze("py-tcc-1", 10))
+    t.try_branch("local://冻结确认", "local://冻结撤销", freeze("py-tcc-1", 20))
+print("  结果:", tc.wait_final("py-tcc-1", 5000), " 余额:", balances())
+
+print("\n⑦ TCC：第二个 try 失败 → with 块自动 abort，两个分支都 cancel")
+try:
+    with tc.tcc("py-tcc-2") as t:
+        t.try_branch("local://冻结确认", "local://冻结撤销", freeze("py-tcc-2", 10))
+        t.try_branch("local://冻结确认", "local://冻结撤销", lambda bid: dtmrs.FAILURE)
+except dtmrs.BranchFailed as e:
+    print("  ", e)
+print("  结果:", tc.wait_final("py-tcc-2", 5000), " 余额:", balances(), " 残留冻结:", frozen)
+assert not frozen, "cancel 必须清掉所有冻结"
+
+print("\n⑧ 二阶段消息：本地事务成功 → 消息送达")
+def write_order():
+    orders.add("py-msg-1")
+    return dtmrs.SUCCESS
+
+tc.msg_do_and_submit("py-msg-1", ["local://加积分"], "local://查订单", write_order)
+print("  结果:", tc.wait_final("py-msg-1", 5000))
+
+print("\n⑨ 二阶段消息：本地事务提交了但进程「崩」在 submit 之前 → 靠回查继续推")
+tc.msg_prepare("py-msg-2", ["local://加积分"], "local://查订单", grace_secs=0)
+orders.add("py-msg-2")   # 本地事务提交了，然后……没调 submit
+print("  结果:", tc.wait_final("py-msg-2", 5000), "（回查说已提交，消息照样送达）")
+
 tc.close()
-print("\n最终余额:", balances(), "（应回到 1000/0 的净效果：只有 ① 成功转了 100）")
+print("\n最终余额:", balances(), "（① 转了 100，⑥ 转了 30，其余都被补偿/撤销抹平）")

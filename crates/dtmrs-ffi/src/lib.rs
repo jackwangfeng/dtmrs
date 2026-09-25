@@ -584,6 +584,203 @@ pub extern "C" fn dtmrs_submit_saga(
     }
 }
 
+// ---------------- TCC / XA / 二阶段消息 ----------------
+//
+// 这几种模式的一阶段是**宿主自己做**的（跑 try / 业务 SQL + PREPARE / 本地事务），
+// 所以 C 接口是按 gid 的一串无状态调用，不是 saga 那样一次提交：
+//
+//   TCC:  tcc_begin → (tcc_register 01 → 宿主跑 try) × N → submit 或 abort
+//   XA:   xa_begin  → (xa_register  01 → 宿主做 PREPARE) × N → submit 或 abort
+//   msg:  msg_prepare → 宿主跑本地事务 → submit / abort / 什么都不做（交给回查）
+//
+// **分支号由宿主给**（01、02……）。库里没法替宿主编号：两次 register 之间没有
+// 共享状态，按「当前最大号 +1」编在并发 try 时会撞号。撞号本身会被 api 层拒掉
+// （地址不同时），但地址相同的两个分支撞号是查不出来的 —— 第二个会被当成重试。
+//
+// 业务判断（分支号格式、重号、终态 / 已 submit 不能 abort）全在 dtmrs-server 的
+// api 层，跟 HTTP / gRPC 同一套，这里只做参数搬运。
+
+/// 取已启动的 TC。只读借用 —— 这些调用可能来自宿主的多个线程
+fn started<'a>(tc: *mut DtmrsTc) -> Option<&'a DtmrsTc> {
+    let Some(h) = (unsafe { tc.as_ref() }) else {
+        set_err("句柄是空指针");
+        return None;
+    };
+    if h.tc.is_none() {
+        set_err("还没 start");
+        return None;
+    }
+    Some(h)
+}
+
+/// 跑一个异步操作，错误写进 last_error
+fn run(h: &DtmrsTc, fut: impl std::future::Future<Output = anyhow::Result<()>>) -> c_int {
+    match h.rt.block_on(fut) {
+        Ok(()) => DTMRS_OK,
+        Err(e) => {
+            set_err(format!("{e}"));
+            DTMRS_ERR
+        }
+    }
+}
+
+/// 开一个 TCC 事务。幂等：同一个 gid 再调一次不报错。
+#[no_mangle]
+pub extern "C" fn dtmrs_tcc_begin(tc: *mut DtmrsTc, gid: *const c_char) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(gid) = (unsafe { cstr(gid, "gid") }) else {
+        return DTMRS_ERR;
+    };
+    let inner = h.tc.as_ref().unwrap();
+    run(h, async { inner.tcc(gid).await.map(|_| ()) })
+}
+
+/// 登记一个 TCC 分支。**返回 OK 之后才能去跑这个分支的 try** ——
+/// 反过来的话 try 冻结的资源 TC 不知道，回滚时没人 cancel。
+///
+/// `branch_id` 从 `"01"` 开始、两位补零、每个分支各用各的。同一个分支原样重试
+/// 登记是幂等的；同一个号配了不同的地址会报错（两个分支撞号）。
+#[no_mangle]
+pub extern "C" fn dtmrs_tcc_register(
+    tc: *mut DtmrsTc,
+    gid: *const c_char,
+    branch_id: *const c_char,
+    confirm: *const c_char,
+    cancel: *const c_char,
+) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let (Some(gid), Some(bid), Some(c), Some(x)) = (unsafe {
+        (
+            cstr(gid, "gid"),
+            cstr(branch_id, "branch_id"),
+            cstr(confirm, "confirm"),
+            cstr(cancel, "cancel"),
+        )
+    }) else {
+        return DTMRS_ERR;
+    };
+    let inner = h.tc.as_ref().unwrap();
+    run(h, inner.register_tcc_branch(gid, bid, c, x))
+}
+
+/// 开一个 XA 事务。幂等。
+#[no_mangle]
+pub extern "C" fn dtmrs_xa_begin(tc: *mut DtmrsTc, gid: *const c_char) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(gid) = (unsafe { cstr(gid, "gid") }) else {
+        return DTMRS_ERR;
+    };
+    let inner = h.tc.as_ref().unwrap();
+    run(h, async { inner.xa(gid).await.map(|_| ()) })
+}
+
+/// 登记一个 XA 分支。**返回 OK 之后才能做这个分支的一阶段**（业务 SQL + PREPARE）——
+/// 反过来会留下 TC 不知道的 prepared 事务，永久持锁。分支号规则同 TCC。
+#[no_mangle]
+pub extern "C" fn dtmrs_xa_register(
+    tc: *mut DtmrsTc,
+    gid: *const c_char,
+    branch_id: *const c_char,
+    commit: *const c_char,
+    rollback: *const c_char,
+) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let (Some(gid), Some(bid), Some(c), Some(r)) = (unsafe {
+        (
+            cstr(gid, "gid"),
+            cstr(branch_id, "branch_id"),
+            cstr(commit, "commit"),
+            cstr(rollback, "rollback"),
+        )
+    }) else {
+        return DTMRS_ERR;
+    };
+    let inner = h.tc.as_ref().unwrap();
+    run(h, inner.register_xa_branch(gid, bid, c, r))
+}
+
+/// 二阶段消息的 prepare。`actions_json` 是要送达的分支地址数组：
+///
+/// ```json
+/// ["local://add_points", "http://notify/send"]
+/// ```
+///
+/// `query_prepared` **必填**：进程崩在本地事务和 submit 之间时，TC 靠它问
+/// 「本地事务提交了没有」。回查 handler 返回 SUCCESS=已提交（继续发）、
+/// FAILURE=没提交（作废），其它=不知道（过会儿再问）。
+///
+/// `grace_secs` 是 prepare 之后多久才开始回查，传负数用默认值（10 秒）。
+///
+/// 返回 OK 之后才能跑本地事务。之后：成功 → `dtmrs_submit`；明确失败 →
+/// `dtmrs_abort`；不知道 → **什么都别调**，交给回查。
+#[no_mangle]
+pub extern "C" fn dtmrs_msg_prepare(
+    tc: *mut DtmrsTc,
+    gid: *const c_char,
+    actions_json: *const c_char,
+    query_prepared: *const c_char,
+    grace_secs: c_int,
+) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let (Some(gid), Some(js), Some(q)) = (unsafe {
+        (
+            cstr(gid, "gid"),
+            cstr(actions_json, "actions_json"),
+            cstr(query_prepared, "query_prepared"),
+        )
+    }) else {
+        return DTMRS_ERR;
+    };
+    let actions: Vec<String> = match serde_json::from_str(js) {
+        Ok(v) => v,
+        Err(e) => {
+            set_err(format!("actions_json 解析失败（要的是字符串数组）: {e}"));
+            return DTMRS_ERR;
+        }
+    };
+    let inner = h.tc.as_ref().unwrap();
+    let mut b = inner.msg(gid).query_prepared(q);
+    for a in &actions {
+        b = b.action(a);
+    }
+    if grace_secs >= 0 {
+        b = b.grace_secs(grace_secs as i64);
+    }
+    run(h, b.prepare())
+}
+
+/// 二阶段提交 tcc / xa / msg：一阶段全成功了，交给 TC 推。幂等。
+#[no_mangle]
+pub extern "C" fn dtmrs_submit(tc: *mut DtmrsTc, gid: *const c_char) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(gid) = (unsafe { cstr(gid, "gid") }) else {
+        return DTMRS_ERR;
+    };
+    let inner = h.tc.as_ref().unwrap();
+    run(h, inner.submit(gid))
+}
+
+/// 主动中止：TC 逆序撤销**所有**已登记的分支。
+///
+/// ⚠ tcc / xa / msg **submit 之后不能 abort**，会返回 DTMRS_ERR ——
+/// 方向已定，这时 abort 就是一半 confirm 一半 cancel。
+#[no_mangle]
+pub extern "C" fn dtmrs_abort(tc: *mut DtmrsTc, gid: *const c_char) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(gid) = (unsafe { cstr(gid, "gid") }) else {
+        return DTMRS_ERR;
+    };
+    let inner = h.tc.as_ref().unwrap();
+    run(h, inner.abort(gid))
+}
+
 /// 查当前状态，写进 `out`（`prepared|submitted|aborting|succeed|failed`）。
 /// gid 不存在返回 `DTMRS_ERR`。
 #[no_mangle]
@@ -1037,6 +1234,222 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string()
+    }
+
+    /// 调用记录，形如 `"confirm@01"`，按调用顺序
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// 按 (tag@分支号) 记下调用顺序；tag 由 user_data 指向的 Rec 给
+    struct Rec {
+        tag: &'static str,
+        ret: c_int,
+        log: Log,
+    }
+
+    extern "C" fn rec_handler(
+        _g: *const c_char,
+        b: *const c_char,
+        _o: *const c_char,
+        _p: *const c_char,
+        ud: *mut c_void,
+    ) -> c_int {
+        let r = unsafe { &*(ud as *const Rec) };
+        let b = unsafe { CStr::from_ptr(b) }.to_str().unwrap();
+        r.log.lock().unwrap().push(format!("{}@{b}", r.tag));
+        r.ret
+    }
+
+    /// 开一个 TC，按 (名字, 返回码) 注册一组记录型 handler
+    ///
+    /// Box 不是多余的：user_data 存的是 Rec 的地址，Vec 扩容会把裸 Rec 搬走，
+    /// 回调拿到的就是野指针
+    #[allow(clippy::vec_box)]
+    fn tc_with(name: &str, hs: &[(&'static str, c_int)]) -> (*mut DtmrsTc, Log, Vec<Box<Rec>>, std::path::PathBuf) {
+        let (url, path) = db(name);
+        let tc = dtmrs_open(url.as_ptr());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut keep = Vec::new();
+        for (n, ret) in hs {
+            let r = Box::new(Rec { tag: n, ret: *ret, log: log.clone() });
+            let ud = &*r as *const Rec as *mut c_void;
+            assert_eq!(dtmrs_register_ex(tc, cs(n).as_ptr(), Some(rec_handler), ud), DTMRS_OK);
+            keep.push(r);
+        }
+        assert_eq!(dtmrs_start(tc), DTMRS_OK);
+        (tc, log, keep, path)
+    }
+
+    fn last_err() -> String {
+        unsafe { CStr::from_ptr(dtmrs_last_error()) }.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn c接口跑通tcc() {
+        let (tc, log, _k, path) = tc_with("tcc", &[("confirm", DTMRS_SUCCESS), ("cancel", DTMRS_SUCCESS)]);
+        let gid = cs("ffi-tcc");
+        assert_eq!(dtmrs_tcc_begin(tc, gid.as_ptr()), DTMRS_OK);
+        assert_eq!(dtmrs_tcc_begin(tc, gid.as_ptr()), DTMRS_OK, "begin 要幂等");
+        for bid in ["01", "02"] {
+            assert_eq!(
+                dtmrs_tcc_register(tc, gid.as_ptr(), cs(bid).as_ptr(),
+                    cs("local://confirm").as_ptr(), cs("local://cancel").as_ptr()),
+                DTMRS_OK, "{}", last_err()
+            );
+            // （宿主在这里跑 try）
+        }
+        assert_eq!(dtmrs_submit(tc, gid.as_ptr()), DTMRS_OK);
+        assert_eq!(wait(tc, "ffi-tcc"), "succeed");
+        assert_eq!(*log.lock().unwrap(), ["confirm@01", "confirm@02"]);
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口tcc_abort后逆序cancel每个分支() {
+        let (tc, log, _k, path) = tc_with("tcc_rb", &[("confirm", DTMRS_SUCCESS), ("cancel", DTMRS_SUCCESS)]);
+        let gid = cs("ffi-tcc-rb");
+        dtmrs_tcc_begin(tc, gid.as_ptr());
+        for bid in ["01", "02"] {
+            dtmrs_tcc_register(tc, gid.as_ptr(), cs(bid).as_ptr(),
+                cs("local://confirm").as_ptr(), cs("local://cancel").as_ptr());
+        }
+        // 第 2 个 try 失败了
+        assert_eq!(dtmrs_abort(tc, gid.as_ptr()), DTMRS_OK);
+        assert_eq!(wait(tc, "ffi-tcc-rb"), "failed");
+        assert_eq!(*log.lock().unwrap(), ["cancel@02", "cancel@01"]);
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口tcc_submit之后不能abort_confirm失败也绝不cancel() {
+        let (tc, log, _k, path) = tc_with("tcc_cf", &[("confirm", DTMRS_FAILURE), ("cancel", DTMRS_SUCCESS)]);
+        let gid = cs("ffi-tcc-cf");
+        dtmrs_tcc_begin(tc, gid.as_ptr());
+        dtmrs_tcc_register(tc, gid.as_ptr(), cs("01").as_ptr(),
+            cs("local://confirm").as_ptr(), cs("local://cancel").as_ptr());
+        assert_eq!(dtmrs_submit(tc, gid.as_ptr()), DTMRS_OK);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(dtmrs_abort(tc, gid.as_ptr()), DTMRS_ERR, "已 submit 必须拒绝 abort");
+        assert!(last_err().contains("submit"), "{}", last_err());
+        std::thread::sleep(Duration::from_millis(200));
+        let l = log.lock().unwrap().clone();
+        assert!(l.iter().all(|s| s.starts_with("confirm@")), "confirm 失败绝不能转 cancel: {l:?}");
+        assert!(!l.is_empty());
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口tcc的登记错误都要报出来() {
+        let (tc, _log, _k, path) = tc_with("tcc_err", &[("confirm", DTMRS_SUCCESS), ("cancel", DTMRS_SUCCESS)]);
+        let reg = |gid: &str, bid: &str, c: &str| {
+            dtmrs_tcc_register(tc, cs(gid).as_ptr(), cs(bid).as_ptr(), cs(c).as_ptr(), cs("local://cancel").as_ptr())
+        };
+        // 没 begin
+        assert_eq!(reg("ffi-nobegin", "01", "local://confirm"), DTMRS_ERR);
+        dtmrs_tcc_begin(tc, cs("ffi-tcc-err").as_ptr());
+        // 分支号格式不对（会让推进器把事务当成空事务直接判成功）
+        assert_eq!(reg("ffi-tcc-err", "inventory", "local://confirm"), DTMRS_ERR);
+        // 漏注册的 handler
+        assert_eq!(reg("ffi-tcc-err", "01", "local://没注册"), DTMRS_ERR);
+        assert!(last_err().contains("没注册"), "{}", last_err());
+        // 撞号：同号不同地址
+        assert_eq!(reg("ffi-tcc-err", "01", "local://confirm"), DTMRS_OK);
+        assert_eq!(reg("ffi-tcc-err", "01", "local://confirm"), DTMRS_OK, "原样重试要幂等");
+        assert_eq!(reg("ffi-tcc-err", "01", "local://cancel"), DTMRS_ERR, "撞号必须报错");
+        // 空指针
+        assert_eq!(dtmrs_tcc_begin(std::ptr::null_mut(), cs("x").as_ptr()), DTMRS_ERR);
+        assert_eq!(dtmrs_tcc_begin(tc, std::ptr::null()), DTMRS_ERR);
+        assert_eq!(dtmrs_tcc_register(tc, cs("x").as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null()), DTMRS_ERR);
+        assert_eq!(dtmrs_submit(tc, std::ptr::null()), DTMRS_ERR);
+        assert_eq!(dtmrs_abort(std::ptr::null_mut(), cs("x").as_ptr()), DTMRS_ERR);
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口没start就调二阶段接口会报错而不是崩() {
+        let (url, path) = db("nostart");
+        let tc = dtmrs_open(url.as_ptr());
+        assert_eq!(dtmrs_tcc_begin(tc, cs("x").as_ptr()), DTMRS_ERR);
+        assert_eq!(dtmrs_xa_begin(tc, cs("x").as_ptr()), DTMRS_ERR);
+        assert_eq!(dtmrs_submit(tc, cs("x").as_ptr()), DTMRS_ERR);
+        assert!(last_err().contains("start"), "{}", last_err());
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口跑通xa_commit和rollback() {
+        let (tc, log, _k, path) = tc_with("xa", &[("commit", DTMRS_SUCCESS), ("rollback", DTMRS_SUCCESS)]);
+        for (gid, ok, want, calls) in [
+            ("ffi-xa-ok", true, "succeed", vec!["commit@01", "commit@02"]),
+            ("ffi-xa-rb", false, "failed", vec!["rollback@02", "rollback@01"]),
+        ] {
+            log.lock().unwrap().clear();
+            let g = cs(gid);
+            assert_eq!(dtmrs_xa_begin(tc, g.as_ptr()), DTMRS_OK);
+            for bid in ["01", "02"] {
+                assert_eq!(
+                    dtmrs_xa_register(tc, g.as_ptr(), cs(bid).as_ptr(),
+                        cs("local://commit").as_ptr(), cs("local://rollback").as_ptr()),
+                    DTMRS_OK, "{}", last_err()
+                );
+            }
+            let r = if ok { dtmrs_submit(tc, g.as_ptr()) } else { dtmrs_abort(tc, g.as_ptr()) };
+            assert_eq!(r, DTMRS_OK);
+            assert_eq!(wait(tc, gid), want);
+            assert_eq!(*log.lock().unwrap(), calls, "{gid}");
+        }
+        // XA 分支不能拿 tcc 的接口登记（缺 commit/rollback 会留下永久持锁的 prepared）
+        dtmrs_xa_begin(tc, cs("ffi-xa-wrong").as_ptr());
+        assert_eq!(
+            dtmrs_tcc_register(tc, cs("ffi-xa-wrong").as_ptr(), cs("01").as_ptr(),
+                cs("local://commit").as_ptr(), cs("local://rollback").as_ptr()),
+            DTMRS_ERR
+        );
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口跑通msg() {
+        let (tc, log, _k, path) = tc_with("msg", &[("act", DTMRS_SUCCESS), ("q", DTMRS_SUCCESS)]);
+        let g = cs("ffi-msg");
+        let actions = cs(r#"["local://act","local://act"]"#);
+        assert_eq!(dtmrs_msg_prepare(tc, g.as_ptr(), actions.as_ptr(), cs("local://q").as_ptr(), -1), DTMRS_OK, "{}", last_err());
+        // （宿主在这里提交本地事务）
+        assert_eq!(dtmrs_submit(tc, g.as_ptr()), DTMRS_OK);
+        assert_eq!(wait(tc, "ffi-msg"), "succeed");
+        assert_eq!(*log.lock().unwrap(), ["act@01", "act@02"]);
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口msg_宿主不知道本地事务结果时靠回查决断() {
+        // 宿主崩在本地事务和 submit 之间 —— 这里就是 prepare 完什么都不调
+        let (tc, log, _k, path) = tc_with("msg_q", &[("act", DTMRS_SUCCESS), ("q", DTMRS_SUCCESS)]);
+        let g = cs("ffi-msg-q");
+        assert_eq!(dtmrs_msg_prepare(tc, g.as_ptr(), cs(r#"["local://act"]"#).as_ptr(), cs("local://q").as_ptr(), 0), DTMRS_OK);
+        assert_eq!(wait(tc, "ffi-msg-q"), "succeed");
+        assert_eq!(*log.lock().unwrap(), ["q@00", "act@01"], "先回查、再送达");
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口msg的参数错误都要报出来() {
+        let (tc, _log, _k, path) = tc_with("msg_err", &[("act", DTMRS_SUCCESS), ("q", DTMRS_SUCCESS)]);
+        let p = |a: &str, q: &str| dtmrs_msg_prepare(tc, cs("ffi-msg-err").as_ptr(), cs(a).as_ptr(), cs(q).as_ptr(), -1);
+        assert_eq!(p(r#"{"a":1}"#, "local://q"), DTMRS_ERR, "不是数组");
+        assert_eq!(p("[]", "local://q"), DTMRS_ERR, "没有消息");
+        assert_eq!(p(r#"["local://act"]"#, ""), DTMRS_ERR, "没有回查地址就没法决断");
+        assert_eq!(p(r#"["local://没注册"]"#, "local://q"), DTMRS_ERR);
+        assert_eq!(p(r#"["local://act"]"#, "local://q"), DTMRS_OK);
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

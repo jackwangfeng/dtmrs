@@ -9,6 +9,15 @@
  *     });
  *     tc.start();
  *     tc.submitSaga("order-1", Dtmrs.step("local://转出", "local://转出撤销"));
+ *
+ *     // TCC：body 正常返回 → submit；抛异常（包括某个 try 没成功）→ abort
+ *     tc.tccGlobal("order-2", t -&gt; {
+ *         t.tryBranch("local://冻结确认", "local://冻结撤销", bid -&gt; freeze(bid));
+ *     });
+ *     // XA 同形：xaGlobal + prepareBranch
+ *
+ *     // 二阶段消息：本地事务成功就 submit，失败就 abort，不知道就交给回查
+ *     tc.msgDoAndSubmit("order-3", List.of("local://加积分"), "local://查订单", () -&gt; writeOrder());
  * }
  * </pre>
  *
@@ -104,6 +113,20 @@ public class Dtmrs implements AutoCloseable {
         int dtmrs_start(Pointer tc);
 
         int dtmrs_submit_saga(Pointer tc, String gid, String stepsJson);
+
+        int dtmrs_tcc_begin(Pointer tc, String gid);
+
+        int dtmrs_tcc_register(Pointer tc, String gid, String branchId, String confirm, String cancel);
+
+        int dtmrs_xa_begin(Pointer tc, String gid);
+
+        int dtmrs_xa_register(Pointer tc, String gid, String branchId, String commit, String rollback);
+
+        int dtmrs_msg_prepare(Pointer tc, String gid, String actionsJson, String queryPrepared, int graceSecs);
+
+        int dtmrs_submit(Pointer tc, String gid);
+
+        int dtmrs_abort(Pointer tc, String gid);
 
         int dtmrs_status(Pointer tc, String gid, byte[] out, long outLen);
 
@@ -265,6 +288,198 @@ public class Dtmrs implements AutoCloseable {
         if (lib.dtmrs_submit_saga(tc, gid, sb.toString()) != OK) {
             throw new IllegalStateException("提交失败: " + lib.dtmrs_last_error());
         }
+    }
+
+    // ---------------- TCC / XA / 二阶段消息 ----------------
+
+    /** 一阶段（try / XA prepare）逻辑。拿到分支号，返回 SUCCESS / FAILURE / ONGOING / UNKNOWN */
+    public interface Phase1 {
+        int call(String branchId) throws Exception;
+    }
+
+    /** 本地事务（二阶段消息用）。返回 SUCCESS / FAILURE / ONGOING / UNKNOWN */
+    public interface LocalTx {
+        int call() throws Exception;
+    }
+
+    /** tccGlobal / xaGlobal 的事务体 */
+    public interface Body<T> {
+        void run(T t) throws Exception;
+    }
+
+    /** 一阶段没返回 SUCCESS。在 tccGlobal / xaGlobal 里抛出会触发 abort */
+    public static final class BranchFailed extends RuntimeException {
+        public final String branchId;
+        public final int code;
+
+        BranchFailed(String branchId, int code) {
+            super("分支 " + branchId + " 一阶段返回 " + code + "（不是 SUCCESS），整单回滚");
+            this.branchId = branchId;
+            this.code = code;
+        }
+    }
+
+    private void check(int rc, String what) {
+        if (rc != OK) throw new IllegalStateException(what + "失败: " + lib.dtmrs_last_error());
+    }
+
+    /** 跑宿主的一阶段。抛异常 = 不知道做没做 → UNKNOWN（TCC/XA 里照样回滚，cancel 兜得住） */
+    private static int callPhase1(Phase1 fn, String bid) {
+        try {
+            return fn.call(bid);
+        } catch (Throwable t) {
+            System.err.println("[dtmrs] 分支 " + bid + " 的一阶段抛异常，按结果未知处理: " + t);
+            return UNKNOWN;
+        }
+    }
+
+    /** TCC 和 XA 共用：分支号自动编（01、02……），先登记、登记成功才跑一阶段 */
+    public abstract class TwoPhase {
+        public final String gid;
+        private int next = 0;
+
+        TwoPhase(String gid) {
+            this.gid = gid;
+        }
+
+        abstract int doRegister(String bid, String fwd, String bwd);
+
+        /** 只登记下一个分支，返回分支号。一阶段自己去做 —— <b>必须在这之后</b> */
+        public synchronized String register(String fwd, String bwd) {
+            String bid = String.format("%02d", next + 1);
+            check(doRegister(bid, fwd, bwd), "登记分支");
+            next++; // 登记成功才占号：失败了重试还用同一个号
+            return bid;
+        }
+
+        String branch(String fwd, String bwd, Phase1 fn) {
+            String bid = register(fwd, bwd);
+            int code = callPhase1(fn, bid);
+            if (code != SUCCESS) throw new BranchFailed(bid, code);
+            return bid;
+        }
+
+        public void submit() {
+            Dtmrs.this.submit(gid);
+        }
+
+        public void abort() {
+            Dtmrs.this.abort(gid);
+        }
+    }
+
+    /** 一个进行中的 TCC 事务，由 {@link #tcc} 开 */
+    public final class Tcc extends TwoPhase {
+        Tcc(String gid) {
+            super(gid);
+        }
+
+        int doRegister(String bid, String c, String x) {
+            return lib.dtmrs_tcc_register(tc, gid, bid, c, x);
+        }
+
+        /** 先登记、再跑 tryFn。try 没返回 SUCCESS（含抛异常）就抛 {@link BranchFailed} */
+        public String tryBranch(String confirm, String cancel, Phase1 tryFn) {
+            return branch(confirm, cancel, tryFn);
+        }
+    }
+
+    /** 一个进行中的 XA 事务，由 {@link #xa} 开 */
+    public final class Xa extends TwoPhase {
+        Xa(String gid) {
+            super(gid);
+        }
+
+        int doRegister(String bid, String c, String r) {
+            return lib.dtmrs_xa_register(tc, gid, bid, c, r);
+        }
+
+        /** 先登记、再跑 prepareFn（业务 SQL + PREPARE）。没 SUCCESS 就抛 {@link BranchFailed} */
+        public String prepareBranch(String commit, String rollback, Phase1 prepareFn) {
+            return branch(commit, rollback, prepareFn);
+        }
+    }
+
+    /** 开一个 TCC 事务（幂等）。多数时候用 {@link #tccGlobal} 更省心 */
+    public Tcc tcc(String gid) {
+        check(lib.dtmrs_tcc_begin(tc, gid), "开 TCC 事务");
+        return new Tcc(gid);
+    }
+
+    /** 开一个 XA 事务（幂等） */
+    public Xa xa(String gid) {
+        check(lib.dtmrs_xa_begin(tc, gid), "开 XA 事务");
+        return new Xa(gid);
+    }
+
+    /**
+     * TCC 全局事务：body 正常返回 → submit；抛异常（包括 {@link BranchFailed}）→ abort，
+     * 再把异常原样抛出。超时也是 abort：还没 submit，cancel 会覆盖每个分支
+     */
+    public void tccGlobal(String gid, Body<Tcc> body) throws Exception {
+        global(tcc(gid), body);
+    }
+
+    /** XA 全局事务，语义同 {@link #tccGlobal} */
+    public void xaGlobal(String gid, Body<Xa> body) throws Exception {
+        global(xa(gid), body);
+    }
+
+    private <T extends TwoPhase> void global(T t, Body<T> body) throws Exception {
+        try {
+            body.run(t);
+        } catch (Exception e) {
+            t.abort();
+            throw e;
+        }
+        t.submit();
+    }
+
+    /**
+     * 二阶段消息的 prepare。之后自己跑本地事务，再 submit / abort / 什么都不做。
+     *
+     * @param queryPrepared 必填：崩在本地事务和 submit 之间时 TC 靠它回查 ——
+     *                      回查 handler 返回 SUCCESS=本地已提交、FAILURE=没提交、其它=过会再问
+     * @param graceSecs     prepare 后多久开始回查，负数用默认 10 秒
+     */
+    public void msgPrepare(String gid, List<String> actions, String queryPrepared, int graceSecs) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < actions.size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append(jsonStr(actions.get(i)));
+        }
+        sb.append(']');
+        check(lib.dtmrs_msg_prepare(tc, gid, sb.toString(), queryPrepared, graceSecs), "msg prepare");
+    }
+
+    /**
+     * prepare → 跑 localTx → SUCCESS 就 submit、FAILURE 就 abort、
+     * 其它（含抛异常）什么都不做，交给回查决断。返回 localTx 的结果码。
+     * prepare 失败会直接抛异常，localTx <b>不会跑</b>
+     */
+    public int msgDoAndSubmit(String gid, List<String> actions, String queryPrepared, LocalTx localTx) {
+        msgPrepare(gid, actions, queryPrepared, -1);
+        int code;
+        try {
+            code = localTx.call();
+        } catch (Throwable t) {
+            // 本地事务抛异常 = 不知道提交了没有。不能猜，交给回查
+            System.err.println("[dtmrs] " + gid + " 的本地事务抛异常，交给回查决断: " + t);
+            return UNKNOWN;
+        }
+        if (code == SUCCESS) submit(gid);
+        else if (code == FAILURE) abort(gid);
+        return code;
+    }
+
+    /** tcc / xa / msg 的二阶段提交（幂等） */
+    public void submit(String gid) {
+        check(lib.dtmrs_submit(tc, gid), "提交");
+    }
+
+    /** 主动中止。tcc / xa / msg 已 submit 的会抛异常 —— 方向已定，不能再回滚 */
+    public void abort(String gid) {
+        check(lib.dtmrs_abort(tc, gid), "中止");
     }
 
     /** 查状态：prepared | submitted | aborting | succeed | failed */

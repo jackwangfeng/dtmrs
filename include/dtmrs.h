@@ -72,6 +72,53 @@ int dtmrs_start(DtmrsTc *tc);
  * 若有 local:// 名字没注册，这里就会失败（而不是等推到一半才发现）。 */
 int dtmrs_submit_saga(DtmrsTc *tc, const char *gid, const char *steps_json);
 
+/* ---- TCC / XA / 二阶段消息 --------------------------------------------
+ *
+ * 这三种模式的一阶段是**你自己做**的，所以是按 gid 的一串调用，不是一次提交：
+ *
+ *   TCC:  dtmrs_tcc_begin → (dtmrs_tcc_register "01" → 你跑 try) × N
+ *                         → 全成功 dtmrs_submit，否则 dtmrs_abort
+ *   XA:   dtmrs_xa_begin  → (dtmrs_xa_register  "01" → 你做业务 SQL + PREPARE) × N
+ *                         → 全成功 dtmrs_submit，否则 dtmrs_abort
+ *   msg:  dtmrs_msg_prepare → 你提交本地事务
+ *                         → 成功 dtmrs_submit / 明确失败 dtmrs_abort / 不知道就什么都别调
+ *
+ * 三条铁律（都会被库挡住，但知道为什么更好）：
+ *   1. **先 register 再做一阶段**。反过来 try 冻结的资源 / PREPARE 的 xid TC 不知道，
+ *      回滚时没人收尾 —— XA 会留下永久持锁的 prepared 事务。
+ *   2. **一阶段不是 SUCCESS 就 abort**，包括超时（UNKNOWN）：还没 submit，
+ *      cancel/rollback 会撤掉每个分支，多余的由屏障空转掉。
+ *   3. **submit 之后不能 abort**（返回 DTMRS_ERR）：方向已定，
+ *      confirm/commit 失败也只会无限重试，绝不转 cancel/rollback。
+ *
+ * 分支号由你给：从 "01" 开始、两位补零、每个分支各用各的。原样重试 register
+ * 是幂等的；同一个号配了不同地址会报错（两个分支撞号）。
+ */
+
+/* 开 TCC / XA 事务。幂等。 */
+int dtmrs_tcc_begin(DtmrsTc *tc, const char *gid);
+int dtmrs_xa_begin(DtmrsTc *tc, const char *gid);
+
+/* 登记分支。返回 DTMRS_OK 之后才能做这个分支的一阶段。 */
+int dtmrs_tcc_register(DtmrsTc *tc, const char *gid, const char *branch_id,
+                       const char *confirm, const char *cancel);
+int dtmrs_xa_register(DtmrsTc *tc, const char *gid, const char *branch_id,
+                      const char *commit, const char *rollback);
+
+/* 二阶段消息。actions_json 是要送达的地址数组：["local://add_points","http://x/y"]
+ * query_prepared 必填：崩在本地事务和 submit 之间时 TC 靠它问「本地提交了没有」，
+ *   回查 handler 返回 SUCCESS=已提交（继续发）、FAILURE=没提交（作废）、其它=过会再问。
+ *   回查调用的 branch_id 是 "00"。
+ * grace_secs：prepare 后多久开始回查，负数用默认（10 秒）。 */
+int dtmrs_msg_prepare(DtmrsTc *tc, const char *gid, const char *actions_json,
+                      const char *query_prepared, int grace_secs);
+
+/* tcc / xa / msg 的二阶段提交。幂等。 */
+int dtmrs_submit(DtmrsTc *tc, const char *gid);
+
+/* 主动中止：逆序撤销所有已登记分支。tcc / xa / msg 已 submit 的会返回 DTMRS_ERR。 */
+int dtmrs_abort(DtmrsTc *tc, const char *gid);
+
 /* ---- 拉取式分支分发 ----------------------------------------------------
  *
  * dtmrs_register 是「推」：库回调你。简单，但回调必须**同步返回**一个 int。

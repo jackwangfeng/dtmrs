@@ -19,6 +19,18 @@
     tc.start()
     tc.submit_saga("order-1001", [("local://扣款", "local://扣款撤销")])
 
+TCC / XA / 二阶段消息的一阶段是你自己做的：
+
+    # TCC：with 块正常结束 → submit；抛异常（包括某个 try 没成功）→ abort
+    with tc.tcc("order-1002") as t:
+        t.try_branch("local://冻结确认", "local://冻结撤销", lambda bid: freeze(bid))
+        t.try_branch("local://扣款确认", "local://扣款撤销", lambda bid: hold(bid))
+
+    # XA 同形：prepare_branch(commit, rollback, fn)，fn 里做业务 SQL + PREPARE
+
+    # 二阶段消息：本地事务成功就 submit，失败就 abort，不知道就交给回查
+    tc.msg_do_and_submit("order-1003", ["local://加积分"], "local://查订单", write_order)
+
 ⚠ 两个必须知道的事情
 
 1. **handler 会被 Rust 侧的任意线程调用**，不是你的主线程。
@@ -100,6 +112,89 @@ class Ctx:
         return f"Ctx(gid={self.gid!r}, branch_id={self.branch_id!r}, op={self.op!r})"
 
 
+class BranchFailed(Exception):
+    """一阶段（try / XA prepare）没返回 SUCCESS。在 with 块里抛出会触发 abort。"""
+
+    def __init__(self, branch_id, code):
+        super().__init__(f"分支 {branch_id} 一阶段返回 {code}（不是 SUCCESS），整单回滚")
+        self.branch_id = branch_id
+        self.code = code
+
+
+def _call_phase1(fn, branch_id):
+    """跑宿主的一阶段。异常 = 不知道做没做 → UNKNOWN（在 TCC/XA 里照样回滚，cancel 兜得住）"""
+    try:
+        return int(fn(branch_id))
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        return UNKNOWN
+
+
+class _TwoPhase:
+    """TCC 和 XA 共用：分支号自动编（01、02……），先登记、登记成功才跑一阶段。"""
+
+    _begin = _register = None  # 子类给 C 函数名
+
+    def __init__(self, tc, gid):
+        self._tc = tc
+        self.gid = gid
+        self._next = 0
+        tc._call(self._begin, gid.encode())
+
+    def register(self, fwd, bwd):
+        """只登记下一个分支，返回分支号。一阶段自己去做 —— **必须在这之后**。"""
+        bid = f"{self._next + 1:02d}"
+        self._tc._call(self._register, self.gid.encode(), bid.encode(), fwd.encode(), bwd.encode())
+        # 登记成功才占号：失败了重试还用同一个号
+        self._next += 1
+        return bid
+
+    def _branch(self, fwd, bwd, fn):
+        bid = self.register(fwd, bwd)
+        code = _call_phase1(fn, bid)
+        if code != SUCCESS:
+            raise BranchFailed(bid, code)
+        return bid
+
+    def submit(self):
+        self._tc.submit(self.gid)
+
+    def abort(self):
+        self._tc.abort(self.gid)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # 一阶段有任何没成功（包括抛异常）→ abort；全成功 → submit。
+        # 超时也是 abort：还没 submit，撤销会覆盖每个分支，多余的由屏障空转掉
+        if exc_type is None:
+            self.submit()
+        else:
+            self.abort()
+        return False
+
+
+class Tcc(_TwoPhase):
+    """一个进行中的 TCC 事务，由 Tc.tcc() 开。"""
+
+    _begin, _register = "dtmrs_tcc_begin", "dtmrs_tcc_register"
+
+    def try_branch(self, confirm, cancel, try_fn):
+        """先登记、再跑 try_fn(branch_id)。try 没返回 SUCCESS（含抛异常）就抛 BranchFailed。"""
+        return self._branch(confirm, cancel, try_fn)
+
+
+class Xa(_TwoPhase):
+    """一个进行中的 XA 事务，由 Tc.xa() 开。"""
+
+    _begin, _register = "dtmrs_xa_begin", "dtmrs_xa_register"
+
+    def prepare_branch(self, commit, rollback, prepare_fn):
+        """先登记、再跑 prepare_fn(branch_id)（业务 SQL + PREPARE）。没 SUCCESS 就抛 BranchFailed。"""
+        return self._branch(commit, rollback, prepare_fn)
+
+
 class Tc:
     def __init__(self, db_url, lib_path=None):
         self._lib = ctypes.CDLL(lib_path or _find_lib())
@@ -126,6 +221,15 @@ class Tc:
         L.dtmrs_wait_final.argtypes = [
             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
         L.dtmrs_wait_final.restype = ctypes.c_int
+        for n in ("dtmrs_tcc_begin", "dtmrs_xa_begin", "dtmrs_submit", "dtmrs_abort"):
+            getattr(L, n).argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            getattr(L, n).restype = ctypes.c_int
+        for n in ("dtmrs_tcc_register", "dtmrs_xa_register"):
+            getattr(L, n).argtypes = [ctypes.c_void_p] + [ctypes.c_char_p] * 4
+            getattr(L, n).restype = ctypes.c_int
+        L.dtmrs_msg_prepare.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+        L.dtmrs_msg_prepare.restype = ctypes.c_int
         L.dtmrs_close.argtypes = [ctypes.c_void_p]
         L.dtmrs_close.restype = None
         L.dtmrs_last_error.argtypes = []
@@ -174,6 +278,56 @@ class Tc:
         body = json.dumps([_step(s) for s in steps], ensure_ascii=False)
         if self._lib.dtmrs_submit_saga(self._h, gid.encode(), body.encode()) != _OK:
             raise RuntimeError(self._err())
+
+    def _call(self, fn_name, *args):
+        if getattr(self._lib, fn_name)(self._h, *args) != _OK:
+            raise RuntimeError(self._err())
+
+    def tcc(self, gid):
+        """开一个 TCC 事务（幂等）。推荐当 with 用，见模块文档。"""
+        return Tcc(self, gid)
+
+    def xa(self, gid):
+        """开一个 XA 事务（幂等）。用法同 tcc()，一阶段是业务 SQL + PREPARE。"""
+        return Xa(self, gid)
+
+    def msg_prepare(self, gid, actions, query_prepared, grace_secs=-1):
+        """二阶段消息的 prepare。之后自己跑本地事务，再 submit / abort / 什么都不做。
+
+        query_prepared 必填：崩在本地事务和 submit 之间时 TC 靠它回查。回查 handler
+        返回 SUCCESS=本地已提交、FAILURE=没提交、其它=过会再问。grace_secs<0 用默认 10 秒。
+        """
+        self._call("dtmrs_msg_prepare", gid.encode(),
+                   json.dumps(list(actions), ensure_ascii=False).encode(),
+                   query_prepared.encode(), int(grace_secs))
+
+    def msg_do_and_submit(self, gid, actions, query_prepared, local_tx, grace_secs=-1):
+        """prepare → 跑 local_tx() → SUCCESS 就 submit、FAILURE 就 abort、
+        其它（含抛异常）什么都不做，交给回查决断。返回 local_tx 的结果码。
+
+        prepare 失败会直接抛异常，local_tx **不会跑** —— 跑了就是本地已提交、
+        TC 却不知道有这笔消息。
+        """
+        self.msg_prepare(gid, actions, query_prepared, grace_secs)
+        try:
+            code = int(local_tx())
+        except Exception:
+            # 本地事务抛异常 = 不知道提交了没有。不能猜，交给回查
+            traceback.print_exc(file=sys.stderr)
+            return UNKNOWN
+        if code == SUCCESS:
+            self.submit(gid)
+        elif code == FAILURE:
+            self.abort(gid)
+        return code
+
+    def submit(self, gid):
+        """tcc / xa / msg 的二阶段提交（幂等）"""
+        self._call("dtmrs_submit", gid.encode())
+
+    def abort(self, gid):
+        """主动中止。tcc / xa / msg 已 submit 的会抛异常 —— 方向已定，不能再回滚"""
+        self._call("dtmrs_abort", gid.encode())
 
     def status(self, gid):
         buf = ctypes.create_string_buffer(64)

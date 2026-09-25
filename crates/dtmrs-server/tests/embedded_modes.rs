@@ -21,7 +21,11 @@ fn tmp_db(name: &str) -> (String, std::path::PathBuf) {
 /// 所有 handler 的调用记录，形如 `"confirm@01"`，按调用顺序
 type Log = Arc<Mutex<Vec<String>>>;
 
-fn recorder(log: &Log, tag: &'static str, r: BranchResult) -> impl Fn(BranchCtx) -> std::future::Ready<BranchResult> + Send + Sync + 'static {
+fn recorder(
+    log: &Log,
+    tag: &'static str,
+    r: BranchResult,
+) -> impl Fn(BranchCtx) -> std::future::Ready<BranchResult> + Send + Sync + 'static {
     let log = log.clone();
     move |ctx: BranchCtx| {
         log.lock().unwrap().push(format!("{tag}@{}", ctx.branch_id));
@@ -30,7 +34,11 @@ fn recorder(log: &Log, tag: &'static str, r: BranchResult) -> impl Fn(BranchCtx)
 }
 
 fn count(log: &Log, tag: &str) -> usize {
-    log.lock().unwrap().iter().filter(|s| s.starts_with(&format!("{tag}@"))).count()
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.starts_with(&format!("{tag}@")))
+        .count()
 }
 
 fn calls(log: &Log, tag: &str) -> Vec<String> {
@@ -68,7 +76,9 @@ async fn 嵌入式tcc_try全成功后confirm每个分支() {
     let mut t = tc.tcc("tcc-ok").await.unwrap();
     for _ in 0..2 {
         let r = t
-            .try_branch("local://confirm", "local://cancel", |_bid| async { BranchResult::Success })
+            .try_branch("local://confirm", "local://cancel", |_bid| async {
+                BranchResult::Success
+            })
             .await
             .unwrap();
         assert_eq!(r, BranchResult::Success);
@@ -78,7 +88,10 @@ async fn 嵌入式tcc_try全成功后confirm每个分支() {
     assert_eq!(count(&log, "confirm"), 0, "submit 之前不该 confirm");
     t.submit().await.unwrap();
 
-    let s = tc.wait_final("tcc-ok", Duration::from_secs(10)).await.unwrap();
+    let s = tc
+        .wait_final("tcc-ok", Duration::from_secs(10))
+        .await
+        .unwrap();
     assert_eq!(s, GlobalStatus::Succeed);
     assert_eq!(calls(&log, "confirm"), ["confirm@01", "confirm@02"]);
     assert_eq!(count(&log, "cancel"), 0);
@@ -94,19 +107,30 @@ async fn 嵌入式tcc_try失败则逆序cancel所有分支_包括失败的那个
     let tc = start(&db, &log, BranchResult::Success).await;
 
     let mut t = tc.tcc("tcc-rb").await.unwrap();
-    t.try_branch("local://confirm", "local://cancel", |_| async { BranchResult::Success })
-        .await
-        .unwrap();
+    t.try_branch("local://confirm", "local://cancel", |_| async {
+        BranchResult::Success
+    })
+    .await
+    .unwrap();
     let r = t
-        .try_branch("local://confirm", "local://cancel", |_| async { BranchResult::Failure })
+        .try_branch("local://confirm", "local://cancel", |_| async {
+            BranchResult::Failure
+        })
         .await
         .unwrap();
     assert_eq!(r, BranchResult::Failure);
     t.abort().await.unwrap();
 
-    let s = tc.wait_final("tcc-rb", Duration::from_secs(10)).await.unwrap();
+    let s = tc
+        .wait_final("tcc-rb", Duration::from_secs(10))
+        .await
+        .unwrap();
     assert_eq!(s, GlobalStatus::Failed);
-    assert_eq!(calls(&log, "cancel"), ["cancel@02", "cancel@01"], "逆序、全部");
+    assert_eq!(
+        calls(&log, "cancel"),
+        ["cancel@02", "cancel@01"],
+        "逆序、全部"
+    );
     assert_eq!(count(&log, "confirm"), 0);
     let _ = std::fs::remove_file(path);
 }
@@ -118,20 +142,28 @@ async fn 嵌入式tcc_confirm失败绝不能触发cancel() {
     let tc = start(&db, &log, BranchResult::Failure).await;
 
     let mut t = tc.tcc("tcc-cf").await.unwrap();
-    t.try_branch("local://confirm", "local://cancel", |_| async { BranchResult::Success })
-        .await
-        .unwrap();
+    t.try_branch("local://confirm", "local://cancel", |_| async {
+        BranchResult::Success
+    })
+    .await
+    .unwrap();
     t.submit().await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(tc.status("tcc-cf").await.unwrap(), Some(GlobalStatus::Submitted));
+    assert_eq!(
+        tc.status("tcc-cf").await.unwrap(),
+        Some(GlobalStatus::Submitted)
+    );
     assert!(count(&log, "confirm") >= 1);
     // 默认退避 10 秒起，这里等不到第二次 confirm；看它确实排上了重试
     let g = tc.store().get_global("tcc-cf").await.unwrap().unwrap();
     assert!(g.next_cron_interval > 0, "confirm 失败要退避重试");
     assert_eq!(count(&log, "cancel"), 0, "confirm 失败绝不能转 cancel");
     // 方向已定，调用方想「救一下」而去 abort 也必须被拒
-    assert!(tc.abort("tcc-cf").await.is_err(), "已 submit 的 tcc 不能 abort");
+    assert!(
+        tc.abort("tcc-cf").await.is_err(),
+        "已 submit 的 tcc 不能 abort"
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -147,13 +179,20 @@ async fn 嵌入式tcc_登记失败时绝不能跑try() {
     let ran = Arc::new(Mutex::new(false));
     let r2 = ran.clone();
     let err = t
-        .try_branch("local://confirm", "local://没注册的cancel", move |_| async move {
-            *r2.lock().unwrap() = true;
-            BranchResult::Success
-        })
+        .try_branch(
+            "local://confirm",
+            "local://没注册的cancel",
+            move |_| async move {
+                *r2.lock().unwrap() = true;
+                BranchResult::Success
+            },
+        )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("没注册的cancel"), "要点名是哪个: {err}");
+    assert!(
+        err.to_string().contains("没注册的cancel"),
+        "要点名是哪个: {err}"
+    );
     assert!(!*ran.lock().unwrap(), "登记失败了，try 一次都不能跑");
     let _ = std::fs::remove_file(path);
 }
@@ -191,12 +230,17 @@ async fn 嵌入式xa_一阶段全成功后commit每个分支() {
 
     let mut x = tc.xa("xa-ok").await.unwrap();
     for _ in 0..2 {
-        x.prepare_branch("local://commit", "local://rollback", |_| async { BranchResult::Success })
-            .await
-            .unwrap();
+        x.prepare_branch("local://commit", "local://rollback", |_| async {
+            BranchResult::Success
+        })
+        .await
+        .unwrap();
     }
     x.submit().await.unwrap();
-    let s = tc.wait_final("xa-ok", Duration::from_secs(10)).await.unwrap();
+    let s = tc
+        .wait_final("xa-ok", Duration::from_secs(10))
+        .await
+        .unwrap();
     assert_eq!(s, GlobalStatus::Succeed);
     assert_eq!(calls(&log, "commit"), ["commit@01", "commit@02"]);
     assert_eq!(count(&log, "rollback"), 0);
@@ -211,19 +255,26 @@ async fn 嵌入式xa_一阶段失败则rollback每个分支() {
     let tc = start(&db, &log, BranchResult::Success).await;
 
     let mut x = tc.xa("xa-rb").await.unwrap();
-    x.prepare_branch("local://commit", "local://rollback", |_| async { BranchResult::Success })
-        .await
-        .unwrap();
+    x.prepare_branch("local://commit", "local://rollback", |_| async {
+        BranchResult::Success
+    })
+    .await
+    .unwrap();
     // 一阶段超时：结果未知。XA 还没 submit，回滚是安全的（rollback 对没 prepare
     // 的 xid 是空操作），所以调用方照样 abort
     let r = x
-        .prepare_branch("local://commit", "local://rollback", |_| async { BranchResult::Unknown })
+        .prepare_branch("local://commit", "local://rollback", |_| async {
+            BranchResult::Unknown
+        })
         .await
         .unwrap();
     assert_eq!(r, BranchResult::Unknown);
     x.abort().await.unwrap();
 
-    let s = tc.wait_final("xa-rb", Duration::from_secs(10)).await.unwrap();
+    let s = tc
+        .wait_final("xa-rb", Duration::from_secs(10))
+        .await
+        .unwrap();
     assert_eq!(s, GlobalStatus::Failed);
     assert_eq!(calls(&log, "rollback"), ["rollback@02", "rollback@01"]);
     assert_eq!(count(&log, "commit"), 0);
@@ -236,12 +287,17 @@ async fn 嵌入式xa_commit失败绝不能触发rollback() {
     let log = Log::default();
     let tc = start(&db, &log, BranchResult::Failure).await;
     let mut x = tc.xa("xa-cf").await.unwrap();
-    x.prepare_branch("local://commit", "local://rollback", |_| async { BranchResult::Success })
-        .await
-        .unwrap();
+    x.prepare_branch("local://commit", "local://rollback", |_| async {
+        BranchResult::Success
+    })
+    .await
+    .unwrap();
     x.submit().await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(tc.status("xa-cf").await.unwrap(), Some(GlobalStatus::Submitted));
+    assert_eq!(
+        tc.status("xa-cf").await.unwrap(),
+        Some(GlobalStatus::Submitted)
+    );
     assert!(count(&log, "commit") >= 1);
     let g = tc.store().get_global("xa-cf").await.unwrap().unwrap();
     assert!(g.next_cron_interval > 0, "commit 失败要退避重试");
@@ -266,7 +322,10 @@ async fn 嵌入式msg_本地事务成功后送达每条消息() {
         .await
         .unwrap();
     assert_eq!(r, BranchResult::Success);
-    let s = tc.wait_final("msg-ok", Duration::from_secs(10)).await.unwrap();
+    let s = tc
+        .wait_final("msg-ok", Duration::from_secs(10))
+        .await
+        .unwrap();
     assert_eq!(s, GlobalStatus::Succeed);
     assert_eq!(calls(&log, "action"), ["action@01", "action@02"]);
     assert_eq!(count(&log, "query"), 0, "正常 submit 了就不该回查");
@@ -285,7 +344,10 @@ async fn 嵌入式msg_本地事务明确失败则整单作废_一条消息都不
         .do_and_submit(|| async { BranchResult::Failure })
         .await
         .unwrap();
-    let s = tc.wait_final("msg-fail", Duration::from_secs(10)).await.unwrap();
+    let s = tc
+        .wait_final("msg-fail", Duration::from_secs(10))
+        .await
+        .unwrap();
     assert_eq!(s, GlobalStatus::Failed);
     assert_eq!(count(&log, "action"), 0);
     let _ = std::fs::remove_file(path);

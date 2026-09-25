@@ -80,6 +80,31 @@ public class Example {
                 throw new RuntimeException("业务代码炸了");
             });
 
+            // ---- TCC：try 我们自己跑，TC 只管 confirm / cancel ----
+            Map<String, Integer> frozen = new ConcurrentHashMap<>(); // 真实业务里是一张表
+            tc.handler("冻结确认", ctx -> {
+                SEEN.add("[冻结确认] gid=" + ctx.gid + " branch=" + ctx.branchId);
+                frozen.remove(ctx.gid + "/" + ctx.branchId);
+                return Dtmrs.SUCCESS;
+            });
+            tc.handler("冻结撤销", ctx -> {
+                SEEN.add("[冻结撤销] gid=" + ctx.gid + " branch=" + ctx.branchId);
+                // try 可能根本没跑成（空回滚），删不到也要返回成功
+                frozen.remove(ctx.gid + "/" + ctx.branchId);
+                return Dtmrs.SUCCESS;
+            });
+
+            // ---- 二阶段消息 ----
+            java.util.Set<String> orders = ConcurrentHashMap.newKeySet();
+            tc.handler("加积分", ctx -> {
+                SEEN.add("[加积分] gid=" + ctx.gid + " branch=" + ctx.branchId);
+                return Dtmrs.SUCCESS;
+            });
+            tc.handler("查订单", ctx -> {
+                SEEN.add("[查订单] gid=" + ctx.gid + " branch=" + ctx.branchId);
+                return orders.contains(ctx.gid) ? Dtmrs.SUCCESS : Dtmrs.FAILURE;
+            });
+
             tc.start();
             System.out.println("初始余额: " + balances());
 
@@ -108,6 +133,54 @@ public class Example {
             Thread.sleep(600);
             System.out.println("  状态: " + tc.status("java-4") + "  ← 异常不等于业务失败");
             flush();
+
+            System.out.println("\n⑤ TCC：两个 try 都成功 → confirm");
+            tc.tccGlobal("java-tcc-1", t -> {
+                t.tryBranch("local://冻结确认", "local://冻结撤销", bid -> {
+                    frozen.put("java-tcc-1/" + bid, 10);
+                    return Dtmrs.SUCCESS;
+                });
+                t.tryBranch("local://冻结确认", "local://冻结撤销", bid -> {
+                    frozen.put("java-tcc-1/" + bid, 20);
+                    return Dtmrs.SUCCESS;
+                });
+            });
+            st = tc.waitFinal("java-tcc-1", 8000);
+            flush();
+            System.out.println("  结果: " + st);
+
+            System.out.println("\n⑥ TCC：第二个 try 失败 → 自动 abort，两个分支都 cancel");
+            try {
+                tc.tccGlobal("java-tcc-2", t -> {
+                    t.tryBranch("local://冻结确认", "local://冻结撤销", bid -> {
+                        frozen.put("java-tcc-2/" + bid, 10);
+                        return Dtmrs.SUCCESS;
+                    });
+                    t.tryBranch("local://冻结确认", "local://冻结撤销", bid -> Dtmrs.FAILURE);
+                });
+            } catch (Dtmrs.BranchFailed e) {
+                System.out.println("  " + e.getMessage());
+            }
+            st = tc.waitFinal("java-tcc-2", 8000);
+            flush();
+            System.out.println("  结果: " + st + "  残留冻结: " + frozen);
+            if (!frozen.isEmpty()) throw new IllegalStateException("cancel 必须清掉所有冻结");
+
+            System.out.println("\n⑦ 二阶段消息：本地事务成功 → 消息送达");
+            tc.msgDoAndSubmit("java-msg-1", List.of("local://加积分"), "local://查订单", () -> {
+                orders.add("java-msg-1");
+                return Dtmrs.SUCCESS;
+            });
+            st = tc.waitFinal("java-msg-1", 8000);
+            flush();
+            System.out.println("  结果: " + st);
+
+            System.out.println("\n⑧ 二阶段消息：本地事务提交了但「崩」在 submit 之前 → 靠回查继续推");
+            tc.msgPrepare("java-msg-2", List.of("local://加积分"), "local://查订单", 0);
+            orders.add("java-msg-2"); // 本地事务提交了，然后……没调 submit
+            st = tc.waitFinal("java-msg-2", 8000);
+            flush();
+            System.out.println("  结果: " + st + "  ← 回查说已提交，消息照样送达");
         }
     }
 }

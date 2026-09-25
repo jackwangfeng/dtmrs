@@ -12,6 +12,15 @@
  *   await tc.start();
  *   await tc.submitSaga('order-1', [['local://转出', 'local://转出撤销']]);
  *
+ *   // TCC：回调正常返回 → submit；抛异常（包括某个 try 没成功）→ abort
+ *   await tc.tccGlobal('order-2', async (t) => {
+ *     await t.tryBranch('local://冻结确认', 'local://冻结撤销', async (bid) => freeze(bid));
+ *   });
+ *   // XA 同形：xaGlobal + prepareBranch
+ *
+ *   // 二阶段消息：本地事务成功就 submit，失败就 abort，不知道就交给回查
+ *   await tc.msgDoAndSubmit('order-3', ['local://加积分'], 'local://查订单', writeOrder);
+ *
  * 跑之前先编：cargo build -p dtmrs-ffi --release
  *
  * ## 为什么用「拉取式」而不是回调
@@ -88,6 +97,74 @@ class Ctx {
   }
 }
 
+/** 一阶段（try / XA prepare）没返回 SUCCESS。在 tccGlobal / xaGlobal 里抛出会触发 abort */
+class BranchFailed extends Error {
+  constructor(branchId, code) {
+    super(`分支 ${branchId} 一阶段返回 ${code}（不是 SUCCESS），整单回滚`);
+    this.branchId = branchId;
+    this.code = code;
+  }
+}
+
+/** 跑宿主的一阶段。抛异常 = 不知道做没做 → UNKNOWN（TCC/XA 里照样回滚，cancel 兜得住） */
+async function callPhase1(fn, bid) {
+  try {
+    const v = await fn(bid);
+    return typeof v === 'number' ? v : UNKNOWN;
+  } catch (e) {
+    console.error(`[dtmrs] 分支 ${bid} 的一阶段抛异常，按结果未知处理:`, e);
+    return UNKNOWN;
+  }
+}
+
+/** TCC 和 XA 共用：分支号自动编（01、02……），先登记、登记成功才跑一阶段 */
+class TwoPhase {
+  constructor(tc, gid, registerFn) {
+    this.tc = tc;
+    this.gid = gid;
+    this._reg = registerFn;
+    this._next = 0;
+  }
+
+  /** 只登记下一个分支，返回分支号。一阶段自己去做 —— **必须在这之后** */
+  async register(fwd, bwd) {
+    const bid = String(this._next + 1).padStart(2, '0');
+    this.tc._check(this._reg(this.tc.tc, this.gid, bid, fwd, bwd), '登记分支');
+    // 登记成功才占号：失败了重试还用同一个号
+    this._next++;
+    return bid;
+  }
+
+  async _branch(fwd, bwd, fn) {
+    const bid = await this.register(fwd, bwd);
+    const code = await callPhase1(fn, bid);
+    if (code !== SUCCESS) throw new BranchFailed(bid, code);
+    return bid;
+  }
+
+  async submit() {
+    return this.tc.submit(this.gid);
+  }
+
+  async abort() {
+    return this.tc.abort(this.gid);
+  }
+}
+
+class Tcc extends TwoPhase {
+  /** 先登记、再跑 tryFn(branchId)。没返回 SUCCESS（含抛异常）就抛 BranchFailed */
+  async tryBranch(confirm, cancel, tryFn) {
+    return this._branch(confirm, cancel, tryFn);
+  }
+}
+
+class Xa extends TwoPhase {
+  /** 先登记、再跑 prepareFn(branchId)（业务 SQL + PREPARE）。没 SUCCESS 就抛 BranchFailed */
+  async prepareBranch(commit, rollback, prepareFn) {
+    return this._branch(commit, rollback, prepareFn);
+  }
+}
+
 class Tc {
   /**
    * @param {string} dbUrl 形如 'sqlite:/tmp/app.db'，也支持 postgres:// / mysql://
@@ -119,6 +196,19 @@ class Tc {
       reply: L.func('int dtmrs_reply(void *tc, unsigned long long task_id, int result)'),
       submitSaga: L.func('int dtmrs_submit_saga(void *tc, const char *gid, const char *steps_json)'),
       status: L.func('int dtmrs_status(void *tc, const char *gid, _Out_ char *out, size_t out_len)'),
+      tccBegin: L.func('int dtmrs_tcc_begin(void *tc, const char *gid)'),
+      tccRegister: L.func(
+        'int dtmrs_tcc_register(void *tc, const char *gid, const char *branch_id, const char *confirm, const char *cancel)'
+      ),
+      xaBegin: L.func('int dtmrs_xa_begin(void *tc, const char *gid)'),
+      xaRegister: L.func(
+        'int dtmrs_xa_register(void *tc, const char *gid, const char *branch_id, const char *commit, const char *rollback)'
+      ),
+      msgPrepare: L.func(
+        'int dtmrs_msg_prepare(void *tc, const char *gid, const char *actions_json, const char *query_prepared, int grace_secs)'
+      ),
+      submit: L.func('int dtmrs_submit(void *tc, const char *gid)'),
+      abort: L.func('int dtmrs_abort(void *tc, const char *gid)'),
       close: L.func('void dtmrs_close(void *tc)'),
       lastError: L.func('const char *dtmrs_last_error()'),
     };
@@ -229,6 +319,91 @@ class Tc {
     }
   }
 
+  _check(rc, what) {
+    if (rc !== OK) throw new Error(`${what}失败: ${this.lastError()}`);
+  }
+
+  /** 开一个 TCC 事务（幂等）。多数时候用 tccGlobal 更省心 */
+  async tcc(gid) {
+    this._check(this.f.tccBegin(this.tc, gid), '开 TCC 事务');
+    return new Tcc(this, gid, this.f.tccRegister);
+  }
+
+  /** 开一个 XA 事务（幂等）。一阶段是业务 SQL + PREPARE */
+  async xa(gid) {
+    this._check(this.f.xaBegin(this.tc, gid), '开 XA 事务');
+    return new Xa(this, gid, this.f.xaRegister);
+  }
+
+  /**
+   * TCC 全局事务：body 正常返回 → submit；抛异常（包括 BranchFailed）→ abort，
+   * 然后把异常原样抛出去。超时也是 abort：还没 submit，cancel 会覆盖每个分支
+   */
+  async tccGlobal(gid, body) {
+    return this._global(await this.tcc(gid), body);
+  }
+
+  /** XA 全局事务，语义同 tccGlobal */
+  async xaGlobal(gid, body) {
+    return this._global(await this.xa(gid), body);
+  }
+
+  async _global(t, body) {
+    let r;
+    try {
+      r = await body(t);
+    } catch (e) {
+      await t.abort();
+      throw e;
+    }
+    await t.submit();
+    return r;
+  }
+
+  /**
+   * 二阶段消息的 prepare。之后自己跑本地事务，再 submit / abort / 什么都不做。
+   * queryPrepared 必填：崩在本地事务和 submit 之间时 TC 靠它回查 ——
+   * 回查 handler 返回 SUCCESS=本地已提交、FAILURE=没提交、其它=过会再问。
+   * graceSecs < 0 用默认 10 秒
+   */
+  async msgPrepare(gid, actions, queryPrepared, graceSecs = -1) {
+    this._check(
+      this.f.msgPrepare(this.tc, gid, JSON.stringify(actions), queryPrepared, graceSecs),
+      'msg prepare'
+    );
+  }
+
+  /**
+   * prepare → 跑 localTx() → SUCCESS 就 submit、FAILURE 就 abort、
+   * 其它（含抛异常）什么都不做，交给回查决断。返回 localTx 的结果码。
+   * prepare 失败会直接抛异常，localTx **不会跑**
+   */
+  async msgDoAndSubmit(gid, actions, queryPrepared, localTx, graceSecs = -1) {
+    await this.msgPrepare(gid, actions, queryPrepared, graceSecs);
+    let code;
+    try {
+      const v = await localTx();
+      code = typeof v === 'number' ? v : UNKNOWN;
+    } catch (e) {
+      // 本地事务抛异常 = 不知道提交了没有。不能猜，交给回查
+      console.error(`[dtmrs] ${gid} 的本地事务抛异常，交给回查决断:`, e);
+      return UNKNOWN;
+    }
+    if (code === SUCCESS) await this.submit(gid);
+    else if (code === FAILURE) await this.abort(gid);
+    return code;
+  }
+
+  /** tcc / xa / msg 的二阶段提交（幂等） */
+  async submit(gid) {
+    this._check(this.f.submit(this.tc, gid), '提交');
+  }
+
+  /** 主动中止。tcc / xa / msg 已 submit 的会抛异常 —— 方向已定，不能再回滚 */
+  async abort(gid) {
+    this._check(this.f.abort(this.tc, gid), '中止');
+  }
+
   /** 查状态：prepared | submitted | aborting | succeed | failed */
   async status(gid) {
     const buf = Buffer.alloc(64);
@@ -269,4 +444,4 @@ class Tc {
   }
 }
 
-module.exports = { Tc, Ctx, SUCCESS, FAILURE, ONGOING, UNKNOWN };
+module.exports = { Tc, Ctx, Tcc, Xa, BranchFailed, SUCCESS, FAILURE, ONGOING, UNKNOWN };

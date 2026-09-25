@@ -29,4 +29,5 @@ dtmrs-core = { path = "../dtmrs-core", version = "0.8.0" }
 # 带上 tonic 整条依赖树会让 .so 明显变大，还要求构建机装 protoc
 dtmrs-server = { path = "../dtmrs-server", version = "0.8.0", default-features = false }
 serde_json = { workspace = true }
+anyhow = { workspace = true }
 tokio = { workspace = true }

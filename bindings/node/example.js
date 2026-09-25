@@ -71,6 +71,31 @@ async function main() {
     return dtmrs.UNKNOWN;
   });
 
+  // ---- TCC：try 我们自己跑，TC 只管 confirm / cancel ----
+  const frozen = new Map(); // `${gid}/${branchId}` → 冻结的金额。真实业务里是一张表
+  tc.handler('冻结确认', async (ctx) => {
+    seen.push(`[冻结确认] gid=${ctx.gid} branch=${ctx.branchId}`);
+    frozen.delete(`${ctx.gid}/${ctx.branchId}`);
+    return dtmrs.SUCCESS;
+  });
+  tc.handler('冻结撤销', async (ctx) => {
+    seen.push(`[冻结撤销] gid=${ctx.gid} branch=${ctx.branchId}`);
+    // try 可能根本没跑成（空回滚），删不到也要返回成功
+    frozen.delete(`${ctx.gid}/${ctx.branchId}`);
+    return dtmrs.SUCCESS;
+  });
+
+  // ---- 二阶段消息 ----
+  const orders = new Set();
+  tc.handler('加积分', async (ctx) => {
+    seen.push(`[加积分] gid=${ctx.gid} branch=${ctx.branchId}`);
+    return dtmrs.SUCCESS;
+  });
+  tc.handler('查订单', async (ctx) => {
+    seen.push(`[查订单] gid=${ctx.gid} branch=${ctx.branchId}`);
+    return orders.has(ctx.gid) ? dtmrs.SUCCESS : dtmrs.FAILURE;
+  });
+
   await tc.start();
   console.log('初始余额:', balances());
 
@@ -94,6 +119,50 @@ async function main() {
   await sleep(600);
   console.log(`  状态: ${await tc.status('node-3')}  ← 停在 submitted 等重试，没有转 aborting`);
   seen.splice(0).forEach((s) => console.log('  ' + s));
+
+  const freeze = (gid, amt) => async (bid) => {
+    frozen.set(`${gid}/${bid}`, amt);
+    return dtmrs.SUCCESS;
+  };
+
+  console.log('\n④ TCC：两个 try 都成功 → confirm');
+  await tc.tccGlobal('node-tcc-1', async (t) => {
+    await t.tryBranch('local://冻结确认', 'local://冻结撤销', freeze('node-tcc-1', 10));
+    await t.tryBranch('local://冻结确认', 'local://冻结撤销', freeze('node-tcc-1', 20));
+  });
+  st = await tc.waitFinal('node-tcc-1', 8000);
+  seen.splice(0).forEach((s) => console.log('  ' + s));
+  console.log(`  结果: ${st}`);
+
+  console.log('\n⑤ TCC：第二个 try 失败 → 自动 abort，两个分支都 cancel');
+  try {
+    await tc.tccGlobal('node-tcc-2', async (t) => {
+      await t.tryBranch('local://冻结确认', 'local://冻结撤销', freeze('node-tcc-2', 10));
+      await t.tryBranch('local://冻结确认', 'local://冻结撤销', async () => dtmrs.FAILURE);
+    });
+  } catch (e) {
+    console.log('  ' + e.message);
+  }
+  st = await tc.waitFinal('node-tcc-2', 8000);
+  seen.splice(0).forEach((s) => console.log('  ' + s));
+  console.log(`  结果: ${st}  残留冻结: ${frozen.size}`);
+  if (frozen.size !== 0) throw new Error('cancel 必须清掉所有冻结');
+
+  console.log('\n⑥ 二阶段消息：本地事务成功 → 消息送达');
+  await tc.msgDoAndSubmit('node-msg-1', ['local://加积分'], 'local://查订单', async () => {
+    orders.add('node-msg-1');
+    return dtmrs.SUCCESS;
+  });
+  st = await tc.waitFinal('node-msg-1', 8000);
+  seen.splice(0).forEach((s) => console.log('  ' + s));
+  console.log(`  结果: ${st}`);
+
+  console.log('\n⑦ 二阶段消息：本地事务提交了但「崩」在 submit 之前 → 靠回查继续推');
+  await tc.msgPrepare('node-msg-2', ['local://加积分'], 'local://查订单', 0);
+  orders.add('node-msg-2'); // 本地事务提交了，然后……没调 submit
+  st = await tc.waitFinal('node-msg-2', 8000);
+  seen.splice(0).forEach((s) => console.log('  ' + s));
+  console.log(`  结果: ${st}  ← 回查说已提交，消息照样送达`);
 
   await tc.close();
 }

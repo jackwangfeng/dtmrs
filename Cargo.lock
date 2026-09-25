@@ -480,6 +480,7 @@ dependencies = [
 name = "dtmrs-ffi"
 version = "0.8.0"
 dependencies = [
+ "anyhow",
  "dtmrs-core",
  "dtmrs-server",
  "serde_json",

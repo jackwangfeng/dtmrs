@@ -22,6 +22,19 @@ static int reject(const char *gid, const char *branch_id,
     return DTMRS_FAILURE;
 }
 
+/* 带 payload 的 handler（dtmrs_register_ex） */
+static int ex_handler(const char *gid, const char *branch_id, const char *op,
+                      const char *payload, void *ud) {
+    (void)ud;
+    printf("  [C ex handler] gid=%s branch=%s op=%s payload=%s\n",
+           gid, branch_id, op, *payload ? payload : "(空)");
+    calls++;
+    return DTMRS_SUCCESS;
+}
+
+/* 自己的「一阶段」。真实业务里是冻结库存 / 写本地订单表 */
+static int my_try(const char *bid) { printf("  [try] 分支 %s 冻结资源\n", bid); return 1; }
+
 int main(void) {
     remove("/tmp/dtmrs_c_demo.db");
     DtmrsTc *tc = dtmrs_open("sqlite:/tmp/dtmrs_c_demo.db");
@@ -31,6 +44,11 @@ int main(void) {
     dtmrs_register(tc, "c1", ok_handler, NULL);
     dtmrs_register(tc, "a2", reject, NULL);
     dtmrs_register(tc, "c2", ok_handler, NULL);
+    dtmrs_register_ex(tc, "a3", ex_handler, NULL);
+    dtmrs_register_ex(tc, "confirm", ex_handler, NULL);
+    dtmrs_register_ex(tc, "cancel", ex_handler, NULL);
+    dtmrs_register_ex(tc, "notify", ex_handler, NULL);
+    dtmrs_register_ex(tc, "query", ex_handler, NULL);
     if (dtmrs_start(tc) != DTMRS_OK) {
         fprintf(stderr, "start 失败: %s\n", dtmrs_last_error()); return 1;
     }
@@ -49,7 +67,38 @@ int main(void) {
     dtmrs_wait_final(tc, "c-2", 5000, st, sizeof st);
     printf("  结果: %s\n", st);
 
-    puts("③ 错误处理");
+    puts("③ 每步带自己的 payload");
+    dtmrs_submit_saga(tc, "c-p",
+        "[{\"action\":\"local://a3\",\"compensate\":\"local://c1\",\"payload\":\"{\\\"amount\\\":30}\"}]");
+    dtmrs_wait_final(tc, "c-p", 5000, st, sizeof st);
+    printf("  结果: %s\n", st);
+
+    puts("④ TCC：先 register，再跑 try；全成功才 submit");
+    dtmrs_tcc_begin(tc, "c-tcc");
+    int all_ok = 1;
+    const char *bids[] = {"01", "02"};
+    for (int i = 0; i < 2 && all_ok; i++) {
+        if (dtmrs_tcc_register(tc, "c-tcc", bids[i], "local://confirm", "local://cancel") != DTMRS_OK) {
+            printf("  登记失败，不能跑 try: %s\n", dtmrs_last_error());
+            all_ok = 0;
+            break;
+        }
+        all_ok = my_try(bids[i]);
+    }
+    if (all_ok) dtmrs_submit(tc, "c-tcc"); else dtmrs_abort(tc, "c-tcc");
+    dtmrs_wait_final(tc, "c-tcc", 5000, st, sizeof st);
+    printf("  结果: %s\n", st);
+    if (dtmrs_abort(tc, "c-tcc") != DTMRS_OK)
+        printf("  已 submit（这里已经终结）的 TCC 不能再 abort: %s\n", dtmrs_last_error());
+
+    puts("⑤ 二阶段消息：prepare → 本地事务 → submit");
+    dtmrs_msg_prepare(tc, "c-msg", "[\"local://notify\"]", "local://query", -1);
+    /* ……这里提交本地事务…… */
+    dtmrs_submit(tc, "c-msg");
+    dtmrs_wait_final(tc, "c-msg", 5000, st, sizeof st);
+    printf("  结果: %s\n", st);
+
+    puts("⑥ 错误处理");
     if (dtmrs_submit_saga(tc, "c-3", "{坏 json}") != DTMRS_OK)
         printf("  坏 JSON 被拒: %s\n", dtmrs_last_error());
 
