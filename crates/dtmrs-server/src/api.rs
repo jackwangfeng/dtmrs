@@ -405,6 +405,27 @@ impl Api {
     /// 主动中止，触发逆序补偿
     pub async fn abort(&self, gid: &str) -> Result<()> {
         match self.store.get_global(gid).await {
+            // ⚠ tcc / xa / msg 一旦 submit，方向就定了，**不能再 abort**。
+            //
+            // submit 的含义是「一阶段全成功」（try 全成功 / XA 全 prepare 了 /
+            // msg 的本地事务已提交）。这时候转 aborting：
+            //   · TCC / XA：confirm/commit 做到一半就转 cancel/rollback，
+            //     一半提交一半回滚（CLAUDE.md「绝对不能破坏的语义」第 2 条）；
+            //   · msg：本地已提交，msg_advance 对 Aborting 直接判 Failed，
+            //     剩下的消息一条都不会再发 —— 这正是 msg 要消灭的那种不一致。
+            // 原先这里只判「是不是终态」，submitted 的也照样放行。
+            //
+            // saga / workflow 不受限：它们本来就是「边做边决定」，中途 abort
+            // 就是逆序补偿，补偿所有分支的规则兜得住
+            Ok(Some(g))
+                if g.status == GlobalStatus::Submitted
+                    && matches!(g.trans_type, TransType::Tcc | TransType::Xa | TransType::Msg) =>
+            {
+                Err(ApiError::Conflict(format!(
+                    "{} 事务已经 submit，方向已定，不能再 abort（只能等它推完）",
+                    g.trans_type
+                )))
+            }
             Ok(Some(g)) if !g.status.is_final() => {
                 self.store
                     .set_global_status(gid, GlobalStatus::Aborting, g.trans_type, "调用方主动中止")
