@@ -130,15 +130,15 @@ impl GrpcCaller {
     /// 读不到就**只是不加**，不 panic —— 推进器是常驻的，
     /// 因为一个可选配置起不来比连不上更糟。
     pub fn new(timeout: Duration) -> Self {
-        let extra_ca = std::env::var("DTMRS_GRPC_CA").ok().and_then(|p| {
-            match std::fs::read(&p) {
+        let extra_ca = std::env::var("DTMRS_GRPC_CA")
+            .ok()
+            .and_then(|p| match std::fs::read(&p) {
                 Ok(pem) => check_ca_pem(pem, &p),
                 Err(e) => {
                     warn!(path = %p, error = %e, "DTMRS_GRPC_CA 读不到，忽略该配置");
                     None
                 }
-            }
-        });
+            });
         Self {
             channels: Arc::new(Mutex::new(HashMap::new())),
             timeout,
@@ -288,7 +288,13 @@ mod tests {
         // 端口上没人听 —— 必须是 Unknown（重试），绝不能是 Failure（回滚）
         let c = GrpcCaller::new(Duration::from_millis(300));
         let r = c
-            .call(&target("http://127.0.0.1:1", false), "g1", "saga", "01", "action")
+            .call(
+                &target("http://127.0.0.1:1", false),
+                "g1",
+                "saga",
+                "01",
+                "action",
+            )
             .await;
         assert_eq!(r, BranchResult::Unknown, "连不上必须是未知，不能是失败");
     }
@@ -301,7 +307,13 @@ mod tests {
     async fn tls握手失败也只能是未知() {
         let c = GrpcCaller::new(Duration::from_millis(300));
         let r = c
-            .call(&target("https://127.0.0.1:1", true), "g1", "saga", "01", "action")
+            .call(
+                &target("https://127.0.0.1:1", true),
+                "g1",
+                "saga",
+                "01",
+                "action",
+            )
             .await;
         assert_eq!(r, BranchResult::Unknown, "TLS 失败是部署问题，不是业务拒绝");
     }
@@ -312,7 +324,8 @@ mod tests {
         // 根证书集合没编进来的话这一步就会报错
         let c = GrpcCaller::new(Duration::from_secs(1));
         assert!(
-            c.channel(&target("https://busi.internal:9000", true)).is_ok(),
+            c.channel(&target("https://busi.internal:9000", true))
+                .is_ok(),
             "TLS 配置装不上，多半是 tonic 的 tls feature 没开"
         );
     }

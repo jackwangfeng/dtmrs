@@ -421,7 +421,10 @@ impl Api {
             // 就是逆序补偿，补偿所有分支的规则兜得住
             Ok(Some(g))
                 if g.status == GlobalStatus::Submitted
-                    && matches!(g.trans_type, TransType::Tcc | TransType::Xa | TransType::Msg) =>
+                    && matches!(
+                        g.trans_type,
+                        TransType::Tcc | TransType::Xa | TransType::Msg
+                    ) =>
             {
                 Err(ApiError::Conflict(format!(
                     "{} 事务已经 submit，方向已定，不能再 abort（只能等它推完）",

@@ -118,7 +118,6 @@ pub struct BranchRow {
     pub status: BranchStatus,
 }
 
-
 /// 访问令牌的展示信息。**不含明文** —— 明文只在生成那一刻返回一次
 #[derive(Debug, Clone)]
 pub struct TokenRow {
@@ -347,10 +346,8 @@ impl SqlStore {
     /// 加新列时在这个数组里加一行就行。
     async fn add_missing_columns(&self) -> Result<()> {
         let mid = self.be.text(MID);
-        let adds: [(&str, String); 1] = [(
-            "auth_token",
-            format!("secret {mid} NOT NULL DEFAULT ''"),
-        )];
+        let adds: [(&str, String); 1] =
+            [("auth_token", format!("secret {mid} NOT NULL DEFAULT ''"))];
         for (table, coldef) in adds {
             let sql = format!("ALTER TABLE {table} ADD COLUMN {coldef}");
             if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
@@ -481,12 +478,17 @@ impl SqlStore {
     /// 当前有效的令牌哈希。认证的热路径**不查这个** —— 上层按 TTL 缓存，
     /// 见 `dtmrs_server::auth`
     pub async fn active_token_hashes(&self) -> Result<Vec<String>> {
-        let rows = sqlx::query(&self.be.q(
-            "SELECT token_hash FROM auth_token WHERE revoked=0",
-        ))
+        let rows = sqlx::query(
+            &self
+                .be
+                .q("SELECT token_hash FROM auth_token WHERE revoked=0"),
+        )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.iter().map(|r| r.get::<String, _>("token_hash")).collect())
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<String, _>("token_hash"))
+            .collect())
     }
 
     /// 记一次使用。**尽力而为**：失败只吞掉不影响请求 ——
@@ -817,9 +819,11 @@ impl SqlStore {
             // 但这里要区分的不是「插没插进去」而是「里面躺的是不是同一个 URL」，
             // 那个数字回答不了。回读还顺带解决了并发：两个请求同时登记同一个号时，
             // 输的那个在自己事务里读到的是赢家已提交的行，照样能发现冲突。
-            let stored: Option<String> = sqlx::query_scalar(&self.be.q(
-                "SELECT url FROM trans_branch_op WHERE gid=? AND branch_id=? AND op=?",
-            ))
+            let stored: Option<String> = sqlx::query_scalar(
+                &self
+                    .be
+                    .q("SELECT url FROM trans_branch_op WHERE gid=? AND branch_id=? AND op=?"),
+            )
             .bind(gid)
             .bind(branch_id)
             .bind(op.as_str())
@@ -828,10 +832,7 @@ impl SqlStore {
             if let Some(existing) = stored {
                 if existing != *url {
                     // 不 commit，前面几个 op 一并回滚 —— 半登记的分支比没登记更难查
-                    return Ok(RegisterOutcome::Conflict {
-                        op: *op,
-                        existing,
-                    });
+                    return Ok(RegisterOutcome::Conflict { op: *op, existing });
                 }
             }
         }
@@ -1177,7 +1178,11 @@ mod tests {
             let rows = s.list_branches("dup1").await.unwrap();
             assert_eq!(rows.len(), 4, "{name}: 两个分支各两个 op");
             for r in &rows {
-                let 期望 = if r.branch_id == "01" { "kucun" } else { "dingdan" };
+                let 期望 = if r.branch_id == "01" {
+                    "kucun"
+                } else {
+                    "dingdan"
+                };
                 assert!(
                     r.url.contains(期望),
                     "{name}: 分支 {} 的地址串味了 —— {}",

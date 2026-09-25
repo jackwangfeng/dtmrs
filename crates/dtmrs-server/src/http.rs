@@ -121,7 +121,6 @@ fn http_result(r: Result<(), ApiError>) -> (StatusCode, Json<Reply>) {
     }
 }
 
-
 /// 不带认证的 router（本地/内网用）。要保护请用 [`router_with_auth`]
 pub fn router(app: App) -> Router {
     routes(app)

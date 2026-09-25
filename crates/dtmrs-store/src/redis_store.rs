@@ -32,7 +32,7 @@
 //!
 //! 多个 TC 实例抢同一笔事务时，Redis 侧不需要行锁也不会重复推进。
 
-use crate::{TokenRow, BranchRow, GlobalRow, SubmitOutcome, MID};
+use crate::{BranchRow, GlobalRow, SubmitOutcome, TokenRow, MID};
 use dtmrs_core::dialect::check_len;
 use dtmrs_core::{Backend, BranchOp, BranchStatus, GlobalStatus, TransType};
 use redis::aio::MultiplexedConnection;
@@ -735,9 +735,8 @@ impl RedisStore {
             if set == 0 {
                 // 已经有了 —— 得看清楚里面躺的是不是同一个 URL。
                 // 一致就是客户端重试（幂等，放行）；不一致就是两个分支编了同一个号
-                let raw: Option<String> = c
-                    .hget(self.bkey(gid), Self::bfield(branch_id, *op))
-                    .await?;
+                let raw: Option<String> =
+                    c.hget(self.bkey(gid), Self::bfield(branch_id, *op)).await?;
                 let existing = raw
                     .as_deref()
                     .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())

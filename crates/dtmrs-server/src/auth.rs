@@ -241,11 +241,7 @@ fn is_https(req_headers: &axum::http::HeaderMap) -> bool {
 ///
 /// 浏览器来的（Accept 含 text/html）跳转到登录页；
 /// 接口调用返回 401，不做跳转 —— 让 curl / SDK 拿到明确的状态码。
-pub async fn guard(
-    State(auth): State<Arc<Auth>>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn guard(State(auth): State<Arc<Auth>>, req: Request<Body>, next: Next) -> Response {
     let path = req.uri().path();
     if path == "/health" || path == "/login" || path == "/logout" {
         return next.run(req).await;
@@ -303,10 +299,10 @@ pub async fn login_submit(
         // 不区分「用户名不存在」和「密码错误」—— 那等于告诉对方用户名猜对了
         return (
             StatusCode::UNAUTHORIZED,
-            Html(include_str!("login.html").replace(
-                "<!--ERR-->",
-                r#"<p class="err">用户名或密码不对</p>"#,
-            )),
+            Html(
+                include_str!("login.html")
+                    .replace("<!--ERR-->", r#"<p class="err">用户名或密码不对</p>"#),
+            ),
         )
             .into_response();
     }
@@ -503,7 +499,9 @@ fn token_key() -> Option<LessSafeKey> {
     let mut h = Sha256::new();
     h.update(raw.as_bytes());
     let key = h.finalize();
-    UnboundKey::new(&AES_256_GCM, &key).ok().map(LessSafeKey::new)
+    UnboundKey::new(&AES_256_GCM, &key)
+        .ok()
+        .map(LessSafeKey::new)
 }
 
 fn hex(b: &[u8]) -> String {

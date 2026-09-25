@@ -399,7 +399,11 @@ async fn redis_重号登记要拒绝而同号重试要幂等() {
     let rows = s.list_branches(gid).await.unwrap();
     assert_eq!(rows.len(), 4, "两个分支各两个 op");
     for r in &rows {
-        let 期望 = if r.branch_id == "01" { "库存" } else { "订单" };
+        let 期望 = if r.branch_id == "01" {
+            "库存"
+        } else {
+            "订单"
+        };
         assert!(
             r.url.contains(期望),
             "分支 {} 的地址串味了：{}",

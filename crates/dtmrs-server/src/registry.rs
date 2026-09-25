@@ -74,10 +74,7 @@ pub fn parse_target(s: &str) -> Target {
     //   strip_prefix("grpc://") 试探 —— 那个不匹配（因为第 5 个字符是 s），
     //   所以现在顺序其实无所谓，但写死这个顺序是防止以后有人改成
     //   starts_with("grpc") 那种前缀判断，那时静默降级成明文就发生了
-    for (prefix, scheme, tls) in [
-        ("grpcs://", "https", true),
-        ("grpc://", "http", false),
-    ] {
+    for (prefix, scheme, tls) in [("grpcs://", "https", true), ("grpc://", "http", false)] {
         if let Some(rest) = s.strip_prefix(prefix) {
             // 认不出来就落到 Http 分支去**明确失败**，不猜。
             // 静默用错协议比报错难查得多
@@ -215,8 +212,8 @@ mod tests {
     fn grpcs绝不能静默降级成明文() {
         for s in [
             "grpcs://a:1/p.S/M",
-            "grpcs://a:1/bad",       // 畸形，会落回 Http
-            "grpcs://",              // 畸形
+            "grpcs://a:1/bad", // 畸形，会落回 Http
+            "grpcs://",        // 畸形
         ] {
             if let Target::Grpc(t) = parse_target(s) {
                 assert!(t.tls, "{s} 认成了 grpc 却没开 TLS —— 这是静默降级成明文");

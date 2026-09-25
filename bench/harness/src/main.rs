@@ -727,7 +727,8 @@ mod tests {
         // DTM 的协议要求 payloads 跟 steps 等长，少了会被拒
         let c = client_calls("saga", "g7", 3, "dtm", "");
         assert_eq!(shape(&c), vec![("tc", "/api/dtmsvr/submit".into())]);
-        let v: serde_json::Value = serde_json::from_str(&body_of(&c, "/api/dtmsvr/submit")).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&body_of(&c, "/api/dtmsvr/submit")).unwrap();
         assert_eq!(v["payloads"].as_array().unwrap().len(), 3);
         assert_eq!(v["steps"].as_array().unwrap().len(), 3);
     }

@@ -29,9 +29,7 @@ async fn store() -> Store {
 async fn spawn_http(api: Api) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router(App::new(api))).await
-    });
+    tokio::spawn(async move { axum::serve(listener, router(App::new(api))).await });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     format!("http://{addr}")
 }
@@ -65,15 +63,30 @@ async fn 所有路由都挂上了() {
     let cli = reqwest::Client::new();
 
     // 这些是 GET
-    for (path, 期望非空) in [("/health", true), ("/api/dtmsvr/newGid", true), ("/console", true)] {
+    for (path, 期望非空) in [
+        ("/health", true),
+        ("/api/dtmsvr/newGid", true),
+        ("/console", true),
+    ] {
         let r = cli.get(format!("{base}{path}")).send().await.unwrap();
-        assert!(r.status().is_success(), "{path} 应该 200，实际 {}", r.status());
+        assert!(
+            r.status().is_success(),
+            "{path} 应该 200，实际 {}",
+            r.status()
+        );
         if 期望非空 {
             assert!(!r.text().await.unwrap().is_empty(), "{path} 不该返回空");
         }
     }
     // 管理台是内嵌 HTML，不该是空壳
-    let html = cli.get(format!("{base}/")).send().await.unwrap().text().await.unwrap();
+    let html = cli
+        .get(format!("{base}/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(html.contains("<"), "管理台应该返回 HTML");
 }
 
@@ -132,7 +145,10 @@ async fn 重复提交同一个gid必须幂等成功() {
     let b = r#"{"gid":"h-dup","steps":[{"action":"http://x/a","compensate":"http://x/c"}]}"#;
     for i in 1..=3 {
         let (code, body) = post(&base, "/api/dtmsvr/submit", b).await;
-        assert!(accepted(code, &body), "第 {i} 次提交应该成功，得到 {code} {body}");
+        assert!(
+            accepted(code, &body),
+            "第 {i} 次提交应该成功，得到 {code} {body}"
+        );
     }
 }
 
@@ -140,10 +156,10 @@ async fn 重复提交同一个gid必须幂等成功() {
 async fn 报文不合法要被拒而不是panic() {
     let base = spawn_http(Api::new(store().await)).await;
     for (path, body) in [
-        ("/api/dtmsvr/submit", "{}"),                       // 缺 gid
-        ("/api/dtmsvr/submit", "不是json"),                 // 根本不是 JSON
-        ("/api/dtmsvr/registerBranch", r#"{"gid":"x"}"#),   // 缺 branch_id
-        ("/api/dtmsvr/abort", r#"{"gid":"不存在"}"#),        // gid 不存在
+        ("/api/dtmsvr/submit", "{}"),                     // 缺 gid
+        ("/api/dtmsvr/submit", "不是json"),               // 根本不是 JSON
+        ("/api/dtmsvr/registerBranch", r#"{"gid":"x"}"#), // 缺 branch_id
+        ("/api/dtmsvr/abort", r#"{"gid":"不存在"}"#),     // gid 不存在
     ] {
         let (code, _) = post(&base, path, body).await;
         assert!(
@@ -259,7 +275,10 @@ mod 等价 {
             })
             .await
             .is_ok();
-        assert_eq!(http_ok, grpc_ok, "空步骤提交：HTTP {http_ok} / gRPC {grpc_ok}");
+        assert_eq!(
+            http_ok, grpc_ok,
+            "空步骤提交：HTTP {http_ok} / gRPC {grpc_ok}"
+        );
 
         // gid 为空：两边都该拒
         let (c, b) = post(&http_base, "/api/dtmsvr/submit", r#"{"gid":""}"#).await;
@@ -341,7 +360,11 @@ mod 认证 {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(l, dtmrs_server::http::router_with_auth(App::new(api), a, st)).await
+            axum::serve(
+                l,
+                dtmrs_server::http::router_with_auth(App::new(api), a, st),
+            )
+            .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         format!("http://{addr}")

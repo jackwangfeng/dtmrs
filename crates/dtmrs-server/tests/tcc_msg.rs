@@ -561,7 +561,9 @@ async fn 补零不对的分支号也必须拒绝() {
         assert!(
             登记分支号(bad).await.is_err(),
             "branch_id {bad:?} 必须被拒绝：driver 反查时用的是 {:?}，对不上",
-            dtmrs_server::driver::branch_id(bad.trim_start_matches('0').parse::<usize>().unwrap_or(1) - 1)
+            dtmrs_server::driver::branch_id(
+                bad.trim_start_matches('0').parse::<usize>().unwrap_or(1) - 1
+            )
         );
     }
 }
@@ -669,9 +671,12 @@ async fn 真的没有分支时仍然按空事务落终态() {
 // 实测过：两次登记 "01"，库里只留下第一个的 URL。
 // ===================================================================
 
-async fn 登记(api: &dtmrs_server::api::Api, gid: &str, bid: &str, base: &str)
-    -> Result<(), dtmrs_server::api::ApiError>
-{
+async fn 登记(
+    api: &dtmrs_server::api::Api,
+    gid: &str,
+    bid: &str,
+    base: &str,
+) -> Result<(), dtmrs_server::api::ApiError> {
     use dtmrs_server::api::RegisterBranch;
     api.register_branch(&RegisterBranch {
         gid: gid.into(),
@@ -694,10 +699,10 @@ async fn 两个分支用同一个分支号必须拒绝() {
     s.create_global(&tcc_rows(gid), &[]).await.unwrap();
 
     登记(&api, gid, "01", "http://库存").await.unwrap();
-    let e = 登记(&api, gid, "01", "http://订单")
-        .await
-        .expect_err("重号必须拒绝：放行的话订单服务的 URL 根本没存进去，\
-                     客户端却会以为登记成功并去冻结资源");
+    let e = 登记(&api, gid, "01", "http://订单").await.expect_err(
+        "重号必须拒绝：放行的话订单服务的 URL 根本没存进去，\
+                     客户端却会以为登记成功并去冻结资源",
+    );
     assert!(
         matches!(e, dtmrs_server::api::ApiError::Conflict(_)),
         "应该是 Conflict，实际 {e:?}"
@@ -739,12 +744,20 @@ async fn 不同分支号各自登记不受影响() {
     let gid = "multi-bid";
     s.create_global(&tcc_rows(gid), &[]).await.unwrap();
 
-    for (bid, base) in [("01", "http://库存"), ("02", "http://订单"), ("03", "http://账户")] {
+    for (bid, base) in [
+        ("01", "http://库存"),
+        ("02", "http://订单"),
+        ("03", "http://账户"),
+    ] {
         登记(&api, gid, bid, base)
             .await
             .unwrap_or_else(|e| panic!("{bid} 应该能登记，却报了 {e:?}"));
     }
-    assert_eq!(s.list_branches(gid).await.unwrap().len(), 9, "3 个分支 × 3 个 op");
+    assert_eq!(
+        s.list_branches(gid).await.unwrap().len(),
+        9,
+        "3 个分支 × 3 个 op"
+    );
 }
 
 #[tokio::test]
@@ -765,8 +778,14 @@ async fn 已submit的tcc_xa_msg不能被abort() {
         g.status = GlobalStatus::Submitted;
         s.create_global(&g, &[]).await.unwrap();
 
-        let e = api.abort(&gid).await.expect_err(&format!("{tt} 已 submit，必须拒绝 abort"));
-        assert!(matches!(e, ApiError::Conflict(_)), "{tt} 应该是 Conflict，实际 {e:?}");
+        let e = api
+            .abort(&gid)
+            .await
+            .expect_err(&format!("{tt} 已 submit，必须拒绝 abort"));
+        assert!(
+            matches!(e, ApiError::Conflict(_)),
+            "{tt} 应该是 Conflict，实际 {e:?}"
+        );
         assert_eq!(
             s.get_global(&gid).await.unwrap().unwrap().status,
             GlobalStatus::Submitted,

@@ -326,9 +326,10 @@ async fn 本地分支能拿到这一步自己的payload_补偿也拿得到() {
         move |ctx: dtmrs_server::registry::BranchCtx| {
             let seen = seen.clone();
             async move {
-                seen.lock()
-                    .unwrap()
-                    .push((format!("{}-{}", ctx.branch_id, ctx.op.as_str()), ctx.payload));
+                seen.lock().unwrap().push((
+                    format!("{}-{}", ctx.branch_id, ctx.op.as_str()),
+                    ctx.payload,
+                ));
                 r
             }
         }

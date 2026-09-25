@@ -559,7 +559,13 @@ impl MsgBuilder<'_> {
         self.tc.check_local(&t)?;
         self.tc
             .api
-            .prepare(&self.gid, "msg", &self.actions, &self.query_prepared, self.grace_secs)
+            .prepare(
+                &self.gid,
+                "msg",
+                &self.actions,
+                &self.query_prepared,
+                self.grace_secs,
+            )
             .await?;
         Ok(())
     }

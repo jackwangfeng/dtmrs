@@ -501,7 +501,9 @@ pub extern "C" fn dtmrs_start(tc: *mut DtmrsTc) -> c_int {
             match tokio::task::spawn_blocking(move || run_host_workflow(wp, ctx, rt)).await {
                 Ok(r) => r,
                 // 宿主函数 panic 了。不知道跑到哪了 —— **重放，不回滚**
-                Err(e) => Err(WorkflowError::Retry(format!("宿主 workflow 函数异常终止: {e}"))),
+                Err(e) => Err(WorkflowError::Retry(format!(
+                    "宿主 workflow 函数异常终止: {e}"
+                ))),
             }
         });
     }
@@ -557,7 +559,10 @@ fn call_host(hp: HandlerPtr, ctx: &BranchCtx) -> BranchResult {
             // payload 里带 NUL 就传不过去。**不能退化成空串**：宿主拿到空数据
             // 可能照样执行（扣 0 元），按未知处理只重试，让人去看日志
             let Ok(p) = CString::new(ctx.payload.as_str()) else {
-                eprintln!("[dtmrs] 分支 {} 的 payload 含 NUL，C 回调传不了，按结果未知处理", ctx.branch_id);
+                eprintln!(
+                    "[dtmrs] 分支 {} 的 payload 含 NUL，C 回调传不了，按结果未知处理",
+                    ctx.branch_id
+                );
                 return BranchResult::Unknown;
             };
             f(gid.as_ptr(), bid.as_ptr(), op.as_ptr(), p.as_ptr(), hp.ud)
@@ -675,7 +680,9 @@ fn run(h: &DtmrsTc, fut: impl std::future::Future<Output = anyhow::Result<()>>) 
 #[no_mangle]
 pub extern "C" fn dtmrs_tcc_begin(tc: *mut DtmrsTc, gid: *const c_char) -> c_int {
     clear_err();
-    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
     let Some(gid) = (unsafe { cstr(gid, "gid") }) else {
         return DTMRS_ERR;
     };
@@ -697,7 +704,9 @@ pub extern "C" fn dtmrs_tcc_register(
     cancel: *const c_char,
 ) -> c_int {
     clear_err();
-    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
     let (Some(gid), Some(bid), Some(c), Some(x)) = (unsafe {
         (
             cstr(gid, "gid"),
@@ -716,7 +725,9 @@ pub extern "C" fn dtmrs_tcc_register(
 #[no_mangle]
 pub extern "C" fn dtmrs_xa_begin(tc: *mut DtmrsTc, gid: *const c_char) -> c_int {
     clear_err();
-    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
     let Some(gid) = (unsafe { cstr(gid, "gid") }) else {
         return DTMRS_ERR;
     };
@@ -735,7 +746,9 @@ pub extern "C" fn dtmrs_xa_register(
     rollback: *const c_char,
 ) -> c_int {
     clear_err();
-    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
     let (Some(gid), Some(bid), Some(c), Some(r)) = (unsafe {
         (
             cstr(gid, "gid"),
@@ -773,7 +786,9 @@ pub extern "C" fn dtmrs_msg_prepare(
     grace_secs: c_int,
 ) -> c_int {
     clear_err();
-    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
     let (Some(gid), Some(js), Some(q)) = (unsafe {
         (
             cstr(gid, "gid"),
@@ -805,7 +820,9 @@ pub extern "C" fn dtmrs_msg_prepare(
 #[no_mangle]
 pub extern "C" fn dtmrs_submit(tc: *mut DtmrsTc, gid: *const c_char) -> c_int {
     clear_err();
-    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
     let Some(gid) = (unsafe { cstr(gid, "gid") }) else {
         return DTMRS_ERR;
     };
@@ -820,7 +837,9 @@ pub extern "C" fn dtmrs_submit(tc: *mut DtmrsTc, gid: *const c_char) -> c_int {
 #[no_mangle]
 pub extern "C" fn dtmrs_abort(tc: *mut DtmrsTc, gid: *const c_char) -> c_int {
     clear_err();
-    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
     let Some(gid) = (unsafe { cstr(gid, "gid") }) else {
         return DTMRS_ERR;
     };
@@ -864,9 +883,13 @@ fn run_host_workflow(
     ctx: WorkflowCtx,
     rt: tokio::runtime::Handle,
 ) -> WorkflowResult<()> {
-    let (Ok(gid), Ok(input)) = (CString::new(ctx.gid.as_str()), CString::new(ctx.input.as_str()))
-    else {
-        return Err(WorkflowError::Retry("gid / input 含 NUL，C 回调传不了".into()));
+    let (Ok(gid), Ok(input)) = (
+        CString::new(ctx.gid.as_str()),
+        CString::new(ctx.input.as_str()),
+    ) else {
+        return Err(WorkflowError::Retry(
+            "gid / input 含 NUL，C 回调传不了".into(),
+        ));
     };
     let mut wf = DtmrsWf { ctx, rt, err: None };
     let code = (wp.f)(&mut wf, gid.as_ptr(), input.as_ptr(), wp.ud);
@@ -925,7 +948,9 @@ pub extern "C" fn dtmrs_submit_workflow(
     input: *const c_char,
 ) -> c_int {
     clear_err();
-    let Some(h) = started(tc) else { return DTMRS_ERR };
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
     let (Some(gid), Some(name), Some(input)) =
         (unsafe { (cstr(gid, "gid"), cstr(name, "name"), cstr(input, "input")) })
     else {
@@ -983,8 +1008,10 @@ pub extern "C" fn dtmrs_wf_branch(
 
     // run_with 不把分支号交给函数体，按同样的规则先算出来（下一个序号）
     let bid = dtmrs_server::driver::branch_id(wf.ctx.branch_count());
-    let (Ok(gid_c), Ok(bid_c)) = (CString::new(wf.ctx.gid.as_str()), CString::new(bid.as_str()))
-    else {
+    let (Ok(gid_c), Ok(bid_c)) = (
+        CString::new(wf.ctx.gid.as_str()),
+        CString::new(bid.as_str()),
+    ) else {
         set_err("gid 含 NUL");
         return DTMRS_ERR;
     };
@@ -1016,7 +1043,10 @@ pub extern "C" fn dtmrs_wf_branch(
             if write_out(&data, out, out_len) != DTMRS_OK {
                 // 分支本身已经成功并记下了，只是宿主接不住结果。**重放，不回滚**：
                 // 宿主改大缓冲区后重放会命中记忆化，不会重做
-                let e = WorkflowError::Retry(format!("分支 {bid} 的结果写不进 out: {}", last_err_string()));
+                let e = WorkflowError::Retry(format!(
+                    "分支 {bid} 的结果写不进 out: {}",
+                    last_err_string()
+                ));
                 set_err(e.to_string());
                 wf.err = Some(e);
                 return DTMRS_ERR;
@@ -1427,8 +1457,10 @@ mod tests {
             DTMRS_OK
         );
         assert_eq!(dtmrs_start(tc), DTMRS_OK);
-        let steps = cs(r#"[{"action":"local://a","compensate":"local://c","payload":"{\"amount\":30}"},
-                           {"action":"local://a","compensate":"local://c"}]"#);
+        let steps = cs(
+            r#"[{"action":"local://a","compensate":"local://c","payload":"{\"amount\":30}"},
+                           {"action":"local://a","compensate":"local://c"}]"#,
+        );
         assert_eq!(
             dtmrs_submit_saga(tc, cs("ffi-payload").as_ptr(), steps.as_ptr()),
             DTMRS_OK
@@ -1453,7 +1485,8 @@ mod tests {
         assert_eq!(dtmrs_register_pull(tc, cs("act").as_ptr()), DTMRS_OK);
         assert_eq!(dtmrs_register_pull(tc, cs("undo").as_ptr()), DTMRS_OK);
         assert_eq!(dtmrs_start(tc), DTMRS_OK);
-        let steps = cs(r#"[{"action":"local://act","compensate":"local://undo","payload":"订单-7"}]"#);
+        let steps =
+            cs(r#"[{"action":"local://act","compensate":"local://undo","payload":"订单-7"}]"#);
         assert_eq!(
             dtmrs_submit_saga(tc, cs("pull-payload").as_ptr(), steps.as_ptr()),
             DTMRS_OK
@@ -1477,12 +1510,20 @@ mod tests {
     /// 等终态，返回状态字符串。等不到返回 last_error，让断言信息有用
     fn wait(tc: *mut DtmrsTc, gid: &str) -> String {
         let mut buf = [0u8; 64];
-        if dtmrs_wait_final(tc, cs(gid).as_ptr(), 8000, buf.as_mut_ptr() as *mut c_char, 64)
-            != DTMRS_OK
+        if dtmrs_wait_final(
+            tc,
+            cs(gid).as_ptr(),
+            8000,
+            buf.as_mut_ptr() as *mut c_char,
+            64,
+        ) != DTMRS_OK
         {
-            return format!("ERR: {}", unsafe { CStr::from_ptr(dtmrs_last_error()) }
-                .to_str()
-                .unwrap());
+            return format!(
+                "ERR: {}",
+                unsafe { CStr::from_ptr(dtmrs_last_error()) }
+                    .to_str()
+                    .unwrap()
+            );
         }
         unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
             .to_str()
@@ -1518,15 +1559,25 @@ mod tests {
     /// Box 不是多余的：user_data 存的是 Rec 的地址，Vec 扩容会把裸 Rec 搬走，
     /// 回调拿到的就是野指针
     #[allow(clippy::vec_box)]
-    fn tc_with(name: &str, hs: &[(&'static str, c_int)]) -> (*mut DtmrsTc, Log, Vec<Box<Rec>>, std::path::PathBuf) {
+    fn tc_with(
+        name: &str,
+        hs: &[(&'static str, c_int)],
+    ) -> (*mut DtmrsTc, Log, Vec<Box<Rec>>, std::path::PathBuf) {
         let (url, path) = db(name);
         let tc = dtmrs_open(url.as_ptr());
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut keep = Vec::new();
         for (n, ret) in hs {
-            let r = Box::new(Rec { tag: n, ret: *ret, log: log.clone() });
+            let r = Box::new(Rec {
+                tag: n,
+                ret: *ret,
+                log: log.clone(),
+            });
             let ud = &*r as *const Rec as *mut c_void;
-            assert_eq!(dtmrs_register_ex(tc, cs(n).as_ptr(), Some(rec_handler), ud), DTMRS_OK);
+            assert_eq!(
+                dtmrs_register_ex(tc, cs(n).as_ptr(), Some(rec_handler), ud),
+                DTMRS_OK
+            );
             keep.push(r);
         }
         assert_eq!(dtmrs_start(tc), DTMRS_OK);
@@ -1534,20 +1585,33 @@ mod tests {
     }
 
     fn last_err() -> String {
-        unsafe { CStr::from_ptr(dtmrs_last_error()) }.to_str().unwrap().to_string()
+        unsafe { CStr::from_ptr(dtmrs_last_error()) }
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     #[test]
     fn c接口跑通tcc() {
-        let (tc, log, _k, path) = tc_with("tcc", &[("confirm", DTMRS_SUCCESS), ("cancel", DTMRS_SUCCESS)]);
+        let (tc, log, _k, path) = tc_with(
+            "tcc",
+            &[("confirm", DTMRS_SUCCESS), ("cancel", DTMRS_SUCCESS)],
+        );
         let gid = cs("ffi-tcc");
         assert_eq!(dtmrs_tcc_begin(tc, gid.as_ptr()), DTMRS_OK);
         assert_eq!(dtmrs_tcc_begin(tc, gid.as_ptr()), DTMRS_OK, "begin 要幂等");
         for bid in ["01", "02"] {
             assert_eq!(
-                dtmrs_tcc_register(tc, gid.as_ptr(), cs(bid).as_ptr(),
-                    cs("local://confirm").as_ptr(), cs("local://cancel").as_ptr()),
-                DTMRS_OK, "{}", last_err()
+                dtmrs_tcc_register(
+                    tc,
+                    gid.as_ptr(),
+                    cs(bid).as_ptr(),
+                    cs("local://confirm").as_ptr(),
+                    cs("local://cancel").as_ptr()
+                ),
+                DTMRS_OK,
+                "{}",
+                last_err()
             );
             // （宿主在这里跑 try）
         }
@@ -1560,12 +1624,20 @@ mod tests {
 
     #[test]
     fn c接口tcc_abort后逆序cancel每个分支() {
-        let (tc, log, _k, path) = tc_with("tcc_rb", &[("confirm", DTMRS_SUCCESS), ("cancel", DTMRS_SUCCESS)]);
+        let (tc, log, _k, path) = tc_with(
+            "tcc_rb",
+            &[("confirm", DTMRS_SUCCESS), ("cancel", DTMRS_SUCCESS)],
+        );
         let gid = cs("ffi-tcc-rb");
         dtmrs_tcc_begin(tc, gid.as_ptr());
         for bid in ["01", "02"] {
-            dtmrs_tcc_register(tc, gid.as_ptr(), cs(bid).as_ptr(),
-                cs("local://confirm").as_ptr(), cs("local://cancel").as_ptr());
+            dtmrs_tcc_register(
+                tc,
+                gid.as_ptr(),
+                cs(bid).as_ptr(),
+                cs("local://confirm").as_ptr(),
+                cs("local://cancel").as_ptr(),
+            );
         }
         // 第 2 个 try 失败了
         assert_eq!(dtmrs_abort(tc, gid.as_ptr()), DTMRS_OK);
@@ -1577,18 +1649,33 @@ mod tests {
 
     #[test]
     fn c接口tcc_submit之后不能abort_confirm失败也绝不cancel() {
-        let (tc, log, _k, path) = tc_with("tcc_cf", &[("confirm", DTMRS_FAILURE), ("cancel", DTMRS_SUCCESS)]);
+        let (tc, log, _k, path) = tc_with(
+            "tcc_cf",
+            &[("confirm", DTMRS_FAILURE), ("cancel", DTMRS_SUCCESS)],
+        );
         let gid = cs("ffi-tcc-cf");
         dtmrs_tcc_begin(tc, gid.as_ptr());
-        dtmrs_tcc_register(tc, gid.as_ptr(), cs("01").as_ptr(),
-            cs("local://confirm").as_ptr(), cs("local://cancel").as_ptr());
+        dtmrs_tcc_register(
+            tc,
+            gid.as_ptr(),
+            cs("01").as_ptr(),
+            cs("local://confirm").as_ptr(),
+            cs("local://cancel").as_ptr(),
+        );
         assert_eq!(dtmrs_submit(tc, gid.as_ptr()), DTMRS_OK);
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(dtmrs_abort(tc, gid.as_ptr()), DTMRS_ERR, "已 submit 必须拒绝 abort");
+        assert_eq!(
+            dtmrs_abort(tc, gid.as_ptr()),
+            DTMRS_ERR,
+            "已 submit 必须拒绝 abort"
+        );
         assert!(last_err().contains("submit"), "{}", last_err());
         std::thread::sleep(Duration::from_millis(200));
         let l = log.lock().unwrap().clone();
-        assert!(l.iter().all(|s| s.starts_with("confirm@")), "confirm 失败绝不能转 cancel: {l:?}");
+        assert!(
+            l.iter().all(|s| s.starts_with("confirm@")),
+            "confirm 失败绝不能转 cancel: {l:?}"
+        );
         assert!(!l.is_empty());
         dtmrs_close(tc);
         let _ = std::fs::remove_file(path);
@@ -1596,28 +1683,63 @@ mod tests {
 
     #[test]
     fn c接口tcc的登记错误都要报出来() {
-        let (tc, _log, _k, path) = tc_with("tcc_err", &[("confirm", DTMRS_SUCCESS), ("cancel", DTMRS_SUCCESS)]);
+        let (tc, _log, _k, path) = tc_with(
+            "tcc_err",
+            &[("confirm", DTMRS_SUCCESS), ("cancel", DTMRS_SUCCESS)],
+        );
         let reg = |gid: &str, bid: &str, c: &str| {
-            dtmrs_tcc_register(tc, cs(gid).as_ptr(), cs(bid).as_ptr(), cs(c).as_ptr(), cs("local://cancel").as_ptr())
+            dtmrs_tcc_register(
+                tc,
+                cs(gid).as_ptr(),
+                cs(bid).as_ptr(),
+                cs(c).as_ptr(),
+                cs("local://cancel").as_ptr(),
+            )
         };
         // 没 begin
         assert_eq!(reg("ffi-nobegin", "01", "local://confirm"), DTMRS_ERR);
         dtmrs_tcc_begin(tc, cs("ffi-tcc-err").as_ptr());
         // 分支号格式不对（会让推进器把事务当成空事务直接判成功）
-        assert_eq!(reg("ffi-tcc-err", "inventory", "local://confirm"), DTMRS_ERR);
+        assert_eq!(
+            reg("ffi-tcc-err", "inventory", "local://confirm"),
+            DTMRS_ERR
+        );
         // 漏注册的 handler
         assert_eq!(reg("ffi-tcc-err", "01", "local://没注册"), DTMRS_ERR);
         assert!(last_err().contains("没注册"), "{}", last_err());
         // 撞号：同号不同地址
         assert_eq!(reg("ffi-tcc-err", "01", "local://confirm"), DTMRS_OK);
-        assert_eq!(reg("ffi-tcc-err", "01", "local://confirm"), DTMRS_OK, "原样重试要幂等");
-        assert_eq!(reg("ffi-tcc-err", "01", "local://cancel"), DTMRS_ERR, "撞号必须报错");
+        assert_eq!(
+            reg("ffi-tcc-err", "01", "local://confirm"),
+            DTMRS_OK,
+            "原样重试要幂等"
+        );
+        assert_eq!(
+            reg("ffi-tcc-err", "01", "local://cancel"),
+            DTMRS_ERR,
+            "撞号必须报错"
+        );
         // 空指针
-        assert_eq!(dtmrs_tcc_begin(std::ptr::null_mut(), cs("x").as_ptr()), DTMRS_ERR);
+        assert_eq!(
+            dtmrs_tcc_begin(std::ptr::null_mut(), cs("x").as_ptr()),
+            DTMRS_ERR
+        );
         assert_eq!(dtmrs_tcc_begin(tc, std::ptr::null()), DTMRS_ERR);
-        assert_eq!(dtmrs_tcc_register(tc, cs("x").as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null()), DTMRS_ERR);
+        assert_eq!(
+            dtmrs_tcc_register(
+                tc,
+                cs("x").as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null()
+            ),
+            DTMRS_ERR
+        );
         assert_eq!(dtmrs_submit(tc, std::ptr::null()), DTMRS_ERR);
-        assert_eq!(dtmrs_abort(std::ptr::null_mut(), cs("x").as_ptr()), DTMRS_ERR);
+        assert_eq!(
+            dtmrs_abort(std::ptr::null_mut(), cs("x").as_ptr()),
+            DTMRS_ERR
+        );
         dtmrs_close(tc);
         let _ = std::fs::remove_file(path);
     }
@@ -1636,22 +1758,41 @@ mod tests {
 
     #[test]
     fn c接口跑通xa_commit和rollback() {
-        let (tc, log, _k, path) = tc_with("xa", &[("commit", DTMRS_SUCCESS), ("rollback", DTMRS_SUCCESS)]);
+        let (tc, log, _k, path) = tc_with(
+            "xa",
+            &[("commit", DTMRS_SUCCESS), ("rollback", DTMRS_SUCCESS)],
+        );
         for (gid, ok, want, calls) in [
             ("ffi-xa-ok", true, "succeed", vec!["commit@01", "commit@02"]),
-            ("ffi-xa-rb", false, "failed", vec!["rollback@02", "rollback@01"]),
+            (
+                "ffi-xa-rb",
+                false,
+                "failed",
+                vec!["rollback@02", "rollback@01"],
+            ),
         ] {
             log.lock().unwrap().clear();
             let g = cs(gid);
             assert_eq!(dtmrs_xa_begin(tc, g.as_ptr()), DTMRS_OK);
             for bid in ["01", "02"] {
                 assert_eq!(
-                    dtmrs_xa_register(tc, g.as_ptr(), cs(bid).as_ptr(),
-                        cs("local://commit").as_ptr(), cs("local://rollback").as_ptr()),
-                    DTMRS_OK, "{}", last_err()
+                    dtmrs_xa_register(
+                        tc,
+                        g.as_ptr(),
+                        cs(bid).as_ptr(),
+                        cs("local://commit").as_ptr(),
+                        cs("local://rollback").as_ptr()
+                    ),
+                    DTMRS_OK,
+                    "{}",
+                    last_err()
                 );
             }
-            let r = if ok { dtmrs_submit(tc, g.as_ptr()) } else { dtmrs_abort(tc, g.as_ptr()) };
+            let r = if ok {
+                dtmrs_submit(tc, g.as_ptr())
+            } else {
+                dtmrs_abort(tc, g.as_ptr())
+            };
             assert_eq!(r, DTMRS_OK);
             assert_eq!(wait(tc, gid), want);
             assert_eq!(*log.lock().unwrap(), calls, "{gid}");
@@ -1659,8 +1800,13 @@ mod tests {
         // XA 分支不能拿 tcc 的接口登记（缺 commit/rollback 会留下永久持锁的 prepared）
         dtmrs_xa_begin(tc, cs("ffi-xa-wrong").as_ptr());
         assert_eq!(
-            dtmrs_tcc_register(tc, cs("ffi-xa-wrong").as_ptr(), cs("01").as_ptr(),
-                cs("local://commit").as_ptr(), cs("local://rollback").as_ptr()),
+            dtmrs_tcc_register(
+                tc,
+                cs("ffi-xa-wrong").as_ptr(),
+                cs("01").as_ptr(),
+                cs("local://commit").as_ptr(),
+                cs("local://rollback").as_ptr()
+            ),
             DTMRS_ERR
         );
         dtmrs_close(tc);
@@ -1672,7 +1818,18 @@ mod tests {
         let (tc, log, _k, path) = tc_with("msg", &[("act", DTMRS_SUCCESS), ("q", DTMRS_SUCCESS)]);
         let g = cs("ffi-msg");
         let actions = cs(r#"["local://act","local://act"]"#);
-        assert_eq!(dtmrs_msg_prepare(tc, g.as_ptr(), actions.as_ptr(), cs("local://q").as_ptr(), -1), DTMRS_OK, "{}", last_err());
+        assert_eq!(
+            dtmrs_msg_prepare(
+                tc,
+                g.as_ptr(),
+                actions.as_ptr(),
+                cs("local://q").as_ptr(),
+                -1
+            ),
+            DTMRS_OK,
+            "{}",
+            last_err()
+        );
         // （宿主在这里提交本地事务）
         assert_eq!(dtmrs_submit(tc, g.as_ptr()), DTMRS_OK);
         assert_eq!(wait(tc, "ffi-msg"), "succeed");
@@ -1686,7 +1843,16 @@ mod tests {
         // 宿主崩在本地事务和 submit 之间 —— 这里就是 prepare 完什么都不调
         let (tc, log, _k, path) = tc_with("msg_q", &[("act", DTMRS_SUCCESS), ("q", DTMRS_SUCCESS)]);
         let g = cs("ffi-msg-q");
-        assert_eq!(dtmrs_msg_prepare(tc, g.as_ptr(), cs(r#"["local://act"]"#).as_ptr(), cs("local://q").as_ptr(), 0), DTMRS_OK);
+        assert_eq!(
+            dtmrs_msg_prepare(
+                tc,
+                g.as_ptr(),
+                cs(r#"["local://act"]"#).as_ptr(),
+                cs("local://q").as_ptr(),
+                0
+            ),
+            DTMRS_OK
+        );
         assert_eq!(wait(tc, "ffi-msg-q"), "succeed");
         assert_eq!(*log.lock().unwrap(), ["q@00", "act@01"], "先回查、再送达");
         dtmrs_close(tc);
@@ -1695,11 +1861,24 @@ mod tests {
 
     #[test]
     fn c接口msg的参数错误都要报出来() {
-        let (tc, _log, _k, path) = tc_with("msg_err", &[("act", DTMRS_SUCCESS), ("q", DTMRS_SUCCESS)]);
-        let p = |a: &str, q: &str| dtmrs_msg_prepare(tc, cs("ffi-msg-err").as_ptr(), cs(a).as_ptr(), cs(q).as_ptr(), -1);
+        let (tc, _log, _k, path) =
+            tc_with("msg_err", &[("act", DTMRS_SUCCESS), ("q", DTMRS_SUCCESS)]);
+        let p = |a: &str, q: &str| {
+            dtmrs_msg_prepare(
+                tc,
+                cs("ffi-msg-err").as_ptr(),
+                cs(a).as_ptr(),
+                cs(q).as_ptr(),
+                -1,
+            )
+        };
         assert_eq!(p(r#"{"a":1}"#, "local://q"), DTMRS_ERR, "不是数组");
         assert_eq!(p("[]", "local://q"), DTMRS_ERR, "没有消息");
-        assert_eq!(p(r#"["local://act"]"#, ""), DTMRS_ERR, "没有回查地址就没法决断");
+        assert_eq!(
+            p(r#"["local://act"]"#, ""),
+            DTMRS_ERR,
+            "没有回查地址就没法决断"
+        );
         assert_eq!(p(r#"["local://没注册"]"#, "local://q"), DTMRS_ERR);
         assert_eq!(p(r#"["local://act"]"#, "local://q"), DTMRS_OK);
         dtmrs_close(tc);
@@ -1724,7 +1903,13 @@ mod tests {
         unsafe { &*(ud as *const Wf) }
     }
 
-    extern "C" fn body_ok(_g: *const c_char, b: *const c_char, out: *mut c_char, len: usize, ud: *mut c_void) -> c_int {
+    extern "C" fn body_ok(
+        _g: *const c_char,
+        b: *const c_char,
+        out: *mut c_char,
+        len: usize,
+        ud: *mut c_void,
+    ) -> c_int {
         let w = wf_of(ud);
         let b = unsafe { CStr::from_ptr(b) }.to_str().unwrap();
         let i: usize = b.parse::<usize>().unwrap() - 1;
@@ -1733,13 +1918,25 @@ mod tests {
         DTMRS_SUCCESS
     }
 
-    extern "C" fn body_fail(_g: *const c_char, _b: *const c_char, _o: *mut c_char, _l: usize, ud: *mut c_void) -> c_int {
+    extern "C" fn body_fail(
+        _g: *const c_char,
+        _b: *const c_char,
+        _o: *mut c_char,
+        _l: usize,
+        ud: *mut c_void,
+    ) -> c_int {
         wf_of(ud).body[1].fetch_add(1, Ordering::SeqCst);
         DTMRS_FAILURE
     }
 
     /// 第一次结果未知，之后成功
-    extern "C" fn body_flaky(g: *const c_char, b: *const c_char, o: *mut c_char, l: usize, ud: *mut c_void) -> c_int {
+    extern "C" fn body_flaky(
+        g: *const c_char,
+        b: *const c_char,
+        o: *mut c_char,
+        l: usize,
+        ud: *mut c_void,
+    ) -> c_int {
         let w = wf_of(ud);
         if w.body[1].load(Ordering::SeqCst) == 0 {
             w.body[1].fetch_add(1, Ordering::SeqCst);
@@ -1748,25 +1945,48 @@ mod tests {
         body_ok(g, b, o, l, ud)
     }
 
-    fn wf_branch(wf: *mut DtmrsWf, name: &str, f: WfBranchFn, ud: *mut c_void) -> Result<String, String> {
+    fn wf_branch(
+        wf: *mut DtmrsWf,
+        name: &str,
+        f: WfBranchFn,
+        ud: *mut c_void,
+    ) -> Result<String, String> {
         let mut out = [0u8; 256];
-        let r = dtmrs_wf_branch(wf, cs(name).as_ptr(), cs("local://undo").as_ptr(), Some(f), ud,
-            out.as_mut_ptr() as *mut c_char, out.len());
+        let r = dtmrs_wf_branch(
+            wf,
+            cs(name).as_ptr(),
+            cs("local://undo").as_ptr(),
+            Some(f),
+            ud,
+            out.as_mut_ptr() as *mut c_char,
+            out.len(),
+        );
         if r == DTMRS_OK {
-            Ok(unsafe { CStr::from_ptr(out.as_ptr() as *const c_char) }.to_str().unwrap().to_string())
+            Ok(unsafe { CStr::from_ptr(out.as_ptr() as *const c_char) }
+                .to_str()
+                .unwrap()
+                .to_string())
         } else {
             Err(last_err())
         }
     }
 
-    extern "C" fn host_workflow(wf: *mut DtmrsWf, _gid: *const c_char, input: *const c_char, ud: *mut c_void) -> c_int {
+    extern "C" fn host_workflow(
+        wf: *mut DtmrsWf,
+        _gid: *const c_char,
+        input: *const c_char,
+        ud: *mut c_void,
+    ) -> c_int {
         let w = wf_of(ud);
         let run = w.runs.fetch_add(1, Ordering::SeqCst);
         let seen = |s: String| w.seen.lock().unwrap().push(s);
         match w.mode {
             // 正常：两步，第一步的结果拿得到
             0 => {
-                seen(format!("input={}", unsafe { CStr::from_ptr(input) }.to_str().unwrap()));
+                seen(format!(
+                    "input={}",
+                    unsafe { CStr::from_ptr(input) }.to_str().unwrap()
+                ));
                 let a = wf_branch(wf, "建订单", body_ok, ud).unwrap();
                 seen(format!("out={a}"));
                 wf_branch(wf, "扣款", body_ok, ud).unwrap();
@@ -1813,31 +2033,73 @@ mod tests {
 
     /// 开 TC、注册 undo 补偿和一个 workflow，提交一笔。Box 的理由同 `tc_with`
     #[allow(clippy::vec_box)]
-    fn wf_run(name: &str, mode: u8) -> (*mut DtmrsTc, Box<Wf>, Log, Vec<Box<Rec>>, std::path::PathBuf) {
+    fn wf_run(
+        name: &str,
+        mode: u8,
+    ) -> (
+        *mut DtmrsTc,
+        Box<Wf>,
+        Log,
+        Vec<Box<Rec>>,
+        std::path::PathBuf,
+    ) {
         let (url, path) = db(name);
         let tc = dtmrs_open(url.as_ptr());
         let log: Log = Arc::new(Mutex::new(Vec::new()));
-        let undo = Box::new(Rec { tag: "undo", ret: DTMRS_SUCCESS, log: log.clone() });
-        dtmrs_register_ex(tc, cs("undo").as_ptr(), Some(rec_handler), &*undo as *const Rec as *mut c_void);
-        let w = Box::new(Wf { mode, ..Default::default() });
+        let undo = Box::new(Rec {
+            tag: "undo",
+            ret: DTMRS_SUCCESS,
+            log: log.clone(),
+        });
+        dtmrs_register_ex(
+            tc,
+            cs("undo").as_ptr(),
+            Some(rec_handler),
+            &*undo as *const Rec as *mut c_void,
+        );
+        let w = Box::new(Wf {
+            mode,
+            ..Default::default()
+        });
         assert_eq!(
-            dtmrs_register_workflow(tc, cs("下单").as_ptr(), Some(host_workflow), &*w as *const Wf as *mut c_void),
+            dtmrs_register_workflow(
+                tc,
+                cs("下单").as_ptr(),
+                Some(host_workflow),
+                &*w as *const Wf as *mut c_void
+            ),
             DTMRS_OK
         );
         assert_eq!(dtmrs_start(tc), DTMRS_OK);
         assert_eq!(
-            dtmrs_submit_workflow(tc, cs(name).as_ptr(), cs("下单").as_ptr(), cs("订单-7").as_ptr()),
-            DTMRS_OK, "{}", last_err()
+            dtmrs_submit_workflow(
+                tc,
+                cs(name).as_ptr(),
+                cs("下单").as_ptr(),
+                cs("订单-7").as_ptr()
+            ),
+            DTMRS_OK,
+            "{}",
+            last_err()
         );
         (tc, w, log, vec![undo], path)
     }
 
     fn wait_ms(tc: *mut DtmrsTc, gid: &str, ms: c_int) -> String {
         let mut buf = [0u8; 64];
-        dtmrs_wait_final(tc, cs(gid).as_ptr(), ms, buf.as_mut_ptr() as *mut c_char, 64);
+        dtmrs_wait_final(
+            tc,
+            cs(gid).as_ptr(),
+            ms,
+            buf.as_mut_ptr() as *mut c_char,
+            64,
+        );
         let mut st = [0u8; 64];
         dtmrs_status(tc, cs(gid).as_ptr(), st.as_mut_ptr() as *mut c_char, 64);
-        unsafe { CStr::from_ptr(st.as_ptr() as *const c_char) }.to_str().unwrap().to_string()
+        unsafe { CStr::from_ptr(st.as_ptr() as *const c_char) }
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     #[test]
@@ -1855,13 +2117,25 @@ mod tests {
     #[test]
     fn c接口workflow分支失败则逆序补偿_宿主不理会错误也开不了新分支() {
         let (tc, w, log, _k, path) = wf_run("wf-rb", 1);
-        assert_eq!(wait_ms(tc, "wf-rb", 8000), "failed", "宿主返回 SUCCESS 不算数");
+        assert_eq!(
+            wait_ms(tc, "wf-rb", 8000),
+            "failed",
+            "宿主返回 SUCCESS 不算数"
+        );
         // 失败的那步也补：它的补偿在动作之前就登记了，动作可能做了一半
         assert_eq!(*log.lock().unwrap(), ["undo@02", "undo@01"]);
         assert_eq!(w.body[2].load(Ordering::SeqCst), 0, "第三步绝不能执行");
         let seen = w.seen.lock().unwrap().clone();
-        assert!(seen.iter().any(|s| s.starts_with("err=") && s.contains("FAILURE")), "{seen:?}");
-        assert!(seen.iter().any(|s| s.starts_with("err3=") && s.contains("停下")), "{seen:?}");
+        assert!(
+            seen.iter()
+                .any(|s| s.starts_with("err=") && s.contains("FAILURE")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|s| s.starts_with("err3=") && s.contains("停下")),
+            "{seen:?}"
+        );
         dtmrs_close(tc);
         let _ = std::fs::remove_file(path);
     }
@@ -1872,7 +2146,11 @@ mod tests {
         let (tc, w, log, _k, path) = wf_run("wf-replay", 2);
         assert_eq!(wait_ms(tc, "wf-replay", 20000), "succeed");
         assert_eq!(w.runs.load(Ordering::SeqCst), 2, "函数被从头跑了两次");
-        assert_eq!(w.body[0].load(Ordering::SeqCst), 1, "第一步重放时命中记忆化，不重做");
+        assert_eq!(
+            w.body[0].load(Ordering::SeqCst),
+            1,
+            "第一步重放时命中记忆化，不重做"
+        );
         assert_eq!(w.body[1].load(Ordering::SeqCst), 2);
         assert!(log.lock().unwrap().is_empty(), "结果未知绝不能触发补偿");
         dtmrs_close(tc);
@@ -1888,11 +2166,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(wait_ms(tc, "wf-diverge", 0), "submitted", "分岔了不能判成功（宿主返回 SUCCESS 也不行）");
+        assert_eq!(
+            wait_ms(tc, "wf-diverge", 0),
+            "submitted",
+            "分岔了不能判成功（宿主返回 SUCCESS 也不行）"
+        );
         assert!(log.lock().unwrap().is_empty(), "分岔了也不能回滚");
         let seen = w.seen.lock().unwrap().clone();
         assert!(seen.iter().any(|s| s.contains("走岔")), "{seen:?}");
-        assert_eq!(w.body[0].load(Ordering::SeqCst), 1, "B 不能在 A 的位置上执行");
+        assert_eq!(
+            w.body[0].load(Ordering::SeqCst),
+            1,
+            "B 不能在 A 的位置上执行"
+        );
         dtmrs_close(tc);
         let _ = std::fs::remove_file(path);
     }
@@ -1912,18 +2198,41 @@ mod tests {
     fn c接口workflow的错误路径() {
         let (url, path) = db("wf_err");
         let tc = dtmrs_open(url.as_ptr());
-        assert_eq!(dtmrs_register_workflow(tc, cs("w").as_ptr(), None, std::ptr::null_mut()), DTMRS_ERR);
-        assert_eq!(dtmrs_submit_workflow(tc, cs("g").as_ptr(), cs("w").as_ptr(), cs("").as_ptr()), DTMRS_ERR, "没 start");
+        assert_eq!(
+            dtmrs_register_workflow(tc, cs("w").as_ptr(), None, std::ptr::null_mut()),
+            DTMRS_ERR
+        );
+        assert_eq!(
+            dtmrs_submit_workflow(tc, cs("g").as_ptr(), cs("w").as_ptr(), cs("").as_ptr()),
+            DTMRS_ERR,
+            "没 start"
+        );
         assert_eq!(dtmrs_start(tc), DTMRS_OK);
         assert_eq!(
-            dtmrs_register_workflow(tc, cs("w").as_ptr(), Some(host_workflow), std::ptr::null_mut()),
-            DTMRS_ERR, "start 之后不能再注册"
+            dtmrs_register_workflow(
+                tc,
+                cs("w").as_ptr(),
+                Some(host_workflow),
+                std::ptr::null_mut()
+            ),
+            DTMRS_ERR,
+            "start 之后不能再注册"
         );
-        assert_eq!(dtmrs_submit_workflow(tc, cs("g").as_ptr(), cs("没注册").as_ptr(), cs("").as_ptr()), DTMRS_ERR);
+        assert_eq!(
+            dtmrs_submit_workflow(tc, cs("g").as_ptr(), cs("没注册").as_ptr(), cs("").as_ptr()),
+            DTMRS_ERR
+        );
         assert!(last_err().contains("没注册"), "{}", last_err());
         assert_eq!(
-            dtmrs_wf_branch(std::ptr::null_mut(), cs("a").as_ptr(), std::ptr::null(), Some(body_ok),
-                std::ptr::null_mut(), std::ptr::null_mut(), 0),
+            dtmrs_wf_branch(
+                std::ptr::null_mut(),
+                cs("a").as_ptr(),
+                std::ptr::null(),
+                Some(body_ok),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0
+            ),
             DTMRS_ERR
         );
         dtmrs_close(tc);
