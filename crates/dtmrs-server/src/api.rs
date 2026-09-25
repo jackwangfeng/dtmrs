@@ -45,6 +45,8 @@ impl std::fmt::Display for ApiError {
     }
 }
 
+impl std::error::Error for ApiError {}
+
 pub type Result<T> = std::result::Result<T, ApiError>;
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
