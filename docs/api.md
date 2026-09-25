@@ -191,6 +191,10 @@ gRPC：`Tc.RegisterBranch(RegisterBranchRequest) → Empty`
 
 已终结的事务返回 200 + `FAILURE` 体（gRPC 是 `FAILED_PRECONDITION`）。
 
+**已 submit 的 tcc / xa / msg 同样拒绝**（同样的返回）：submit 意味着一阶段全成功、
+方向已定，这时 abort 会造成一半 confirm 一半 cancel（msg 则是本地已提交、消息被作废）。
+TCC / XA 要回滚，必须在 submit **之前** abort。saga 不受此限。
+
 gRPC：`Tc.Abort(AbortRequest) → Empty`
 
 ---
