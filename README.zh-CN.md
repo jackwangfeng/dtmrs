@@ -155,11 +155,11 @@ MySQL 慢是它自己的默认配置导致的（每次提交两次 fsync），�
 
 ```toml
 # 跑协调器（或者把它嵌进自己进程）
-dtmrs = "0.10"
+dtmrs = "0.11"
 
 # 业务服务（RM）：只需要屏障做幂等。
 # 别把整个协调器（axum、tonic 那一堆）拖进去
-dtmrs = { version = "0.10", default-features = false, features = ["barrier"] }
+dtmrs = { version = "0.11", default-features = false, features = ["barrier"] }
 ```
 
 编 gRPC 需要 **protoc**；关掉 `grpc` feature 就不需要。
