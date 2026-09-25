@@ -34,14 +34,14 @@ default = ["redis"]
 redis = ["dtmrs-server/redis"]
 
 [dependencies]
-dtmrs-core = { path = "../dtmrs-core", version = "0.9.0" }
+dtmrs-core = { path = "../dtmrs-core", version = "0.10.0" }
 # 关掉 grpc：这里要的是尽量小的 .so，而嵌入式宿主基本用 local:// 分支。
 # 带上 tonic 整条依赖树会让 .so 明显变大，还要求构建机装 protoc
-dtmrs-server = { path = "../dtmrs-server", version = "0.9.0", default-features = false }
+dtmrs-server = { path = "../dtmrs-server", version = "0.10.0", default-features = false }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 # 只有 Redis 那条测试用：开头结尾清自己的 key 前缀
-dtmrs-store = { path = "../dtmrs-store", version = "0.9.0" }
+dtmrs-store = { path = "../dtmrs-store", version = "0.10.0" }
