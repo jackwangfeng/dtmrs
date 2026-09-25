@@ -4,6 +4,8 @@
 //! - TCC：**confirm 失败绝不能触发 cancel**（try 已成功、方向已定）
 //! - msg：**进程崩在 prepare 和 submit 之间，靠回查决断**（取代 MQ 事务消息）
 
+mod common;
+
 use dtmrs_core::{BranchOp, GlobalStatus, TransType};
 use dtmrs_server::driver::Driver;
 use dtmrs_server::{msg_rows, tcc_rows};
@@ -767,31 +769,35 @@ async fn 已submit的tcc_xa_msg不能被abort() {
     // 一半 confirm 一半 cancel（CLAUDE.md 第 2 条），msg 则是本地已提交、
     // 下游消息却被整单作废（msg_advance 对 Aborting 直接判 Failed）。
     //
-    // 原先 Api::abort 只看「是不是终态」，submitted 的也照样转 aborting
+    // 原先 Api::abort 只看「是不是终态」，submitted 的也照样转 aborting。
+    // 判断只走 get_global，按理跟后端无关 —— 但「按理」不算数，两种后端都跑
     use dtmrs_server::api::{Api, ApiError};
-    let s = store().await;
-    let api = Api::new(s.clone());
-    for tt in [TransType::Tcc, TransType::Xa, TransType::Msg] {
-        let gid = format!("abort-submitted-{tt}");
-        let mut g = tcc_rows(&gid);
-        g.trans_type = tt;
-        g.status = GlobalStatus::Submitted;
-        s.create_global(&g, &[]).await.unwrap();
+    common::for_each_backend("abort_submitted", |be| async move {
+        let s = Store::open(&be.url).await.unwrap();
+        let api = Api::new(s.clone());
+        for tt in [TransType::Tcc, TransType::Xa, TransType::Msg] {
+            let gid = format!("abort-submitted-{tt}");
+            let mut g = tcc_rows(&gid);
+            g.trans_type = tt;
+            g.status = GlobalStatus::Submitted;
+            s.create_global(&g, &[]).await.unwrap();
 
-        let e = api
-            .abort(&gid)
-            .await
-            .expect_err(&format!("{tt} 已 submit，必须拒绝 abort"));
-        assert!(
-            matches!(e, ApiError::Conflict(_)),
-            "{tt} 应该是 Conflict，实际 {e:?}"
-        );
-        assert_eq!(
-            s.get_global(&gid).await.unwrap().unwrap().status,
-            GlobalStatus::Submitted,
-            "{tt} 的状态不能被改动"
-        );
-    }
+            let e = api
+                .abort(&gid)
+                .await
+                .expect_err(&format!("{tt} 已 submit，必须拒绝 abort"));
+            assert!(
+                matches!(e, ApiError::Conflict(_)),
+                "{tt} 应该是 Conflict，实际 {e:?}"
+            );
+            assert_eq!(
+                s.get_global(&gid).await.unwrap().unwrap().status,
+                GlobalStatus::Submitted,
+                "{tt} 的状态不能被改动"
+            );
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -799,19 +805,22 @@ async fn prepared的tcc_xa_msg可以abort() {
     // 守卫不能误伤：一阶段还没做完时 abort 是 TCC/XA 回滚的**唯一入口**，
     // msg 在 prepare 之后本地事务失败也要靠它作废
     use dtmrs_server::api::Api;
-    let s = store().await;
-    let api = Api::new(s.clone());
-    for tt in [TransType::Tcc, TransType::Xa, TransType::Msg] {
-        let gid = format!("abort-prepared-{tt}");
-        let mut g = tcc_rows(&gid);
-        g.trans_type = tt;
-        s.create_global(&g, &[]).await.unwrap();
-        api.abort(&gid)
-            .await
-            .unwrap_or_else(|e| panic!("{tt} prepared 时应该能 abort，却报了 {e:?}"));
-        assert_eq!(
-            s.get_global(&gid).await.unwrap().unwrap().status,
-            GlobalStatus::Aborting
-        );
-    }
+    common::for_each_backend("abort_prepared", |be| async move {
+        let s = Store::open(&be.url).await.unwrap();
+        let api = Api::new(s.clone());
+        for tt in [TransType::Tcc, TransType::Xa, TransType::Msg] {
+            let gid = format!("abort-prepared-{tt}");
+            let mut g = tcc_rows(&gid);
+            g.trans_type = tt;
+            s.create_global(&g, &[]).await.unwrap();
+            api.abort(&gid)
+                .await
+                .unwrap_or_else(|e| panic!("{tt} prepared 时应该能 abort，却报了 {e:?}"));
+            assert_eq!(
+                s.get_global(&gid).await.unwrap().unwrap().status,
+                GlobalStatus::Aborting
+            );
+        }
+    })
+    .await;
 }

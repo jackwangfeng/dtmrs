@@ -4,6 +4,8 @@
 //! TC 在你的进程里，但事务状态在 DB 里，进程死了事务不丢。
 //! 这是嵌入式方案能不能当真的分水岭。
 
+mod common;
+
 use dtmrs_core::{BranchResult, GlobalStatus};
 use dtmrs_server::embedded::Embedded;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -319,56 +321,59 @@ async fn 本地分支与远端http可以混用() {
 #[tokio::test]
 async fn 本地分支能拿到这一步自己的payload_补偿也拿得到() {
     // 扣款那步要金额、发货那步要地址。原先 BranchCtx 里根本没有 payload，
-    // step_with 写进去的数据只有 http 分支收得到，local:// 分支一律拿不到
-    let (db, path) = tmp_db("payload");
-    let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
-    let rec = |seen: Arc<std::sync::Mutex<Vec<(String, String)>>>, r: BranchResult| {
-        move |ctx: dtmrs_server::registry::BranchCtx| {
-            let seen = seen.clone();
-            async move {
-                seen.lock().unwrap().push((
-                    format!("{}-{}", ctx.branch_id, ctx.op.as_str()),
-                    ctx.payload,
-                ));
-                r
+    // step_with 写进去的数据只有 http 分支收得到，local:// 分支一律拿不到。
+    // 两种后端各跑一遍：payload 在 Redis 上是另一套序列化路径
+    common::for_each_backend("payload", |be| async move {
+        let db = be.url;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let rec = |seen: Arc<std::sync::Mutex<Vec<(String, String)>>>, r: BranchResult| {
+            move |ctx: dtmrs_server::registry::BranchCtx| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push((
+                        format!("{}-{}", ctx.branch_id, ctx.op.as_str()),
+                        ctx.payload,
+                    ));
+                    r
+                }
             }
-        }
-    };
-    let tc = Embedded::builder(&db)
-        .handler("a", rec(seen.clone(), BranchResult::Success))
-        .handler("c", rec(seen.clone(), BranchResult::Success))
-        // 第二步明确失败，逼出两步的补偿
-        .handler("a_fail", rec(seen.clone(), BranchResult::Failure))
-        .tick(Duration::from_millis(10))
-        .start()
-        .await
-        .unwrap();
+        };
+        let tc = Embedded::builder(&db)
+            .handler("a", rec(seen.clone(), BranchResult::Success))
+            .handler("c", rec(seen.clone(), BranchResult::Success))
+            // 第二步明确失败，逼出两步的补偿
+            .handler("a_fail", rec(seen.clone(), BranchResult::Failure))
+            .tick(Duration::from_millis(10))
+            .start()
+            .await
+            .unwrap();
 
-    tc.saga("emb-payload")
-        .step_with("local://a", "local://c", r#"{"amount":30}"#)
-        .step_with("local://a_fail", "local://c", r#"{"addr":"x"}"#)
-        .submit()
-        .await
-        .unwrap();
-    let s = tc
-        .wait_final("emb-payload", Duration::from_secs(10))
-        .await
-        .unwrap();
-    assert_eq!(s, GlobalStatus::Failed);
+        tc.saga("emb-payload")
+            .step_with("local://a", "local://c", r#"{"amount":30}"#)
+            .step_with("local://a_fail", "local://c", r#"{"addr":"x"}"#)
+            .submit()
+            .await
+            .unwrap();
+        let s = tc
+            .wait_final("emb-payload", Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(s, GlobalStatus::Failed);
 
-    let got = seen.lock().unwrap().clone();
-    let want = [
-        ("01-action", r#"{"amount":30}"#),
-        ("02-action", r#"{"addr":"x"}"#),
-        // 逆序补偿，每步的补偿拿到的是**它自己那步**的数据
-        ("02-compensate", r#"{"addr":"x"}"#),
-        ("01-compensate", r#"{"amount":30}"#),
-    ];
-    assert_eq!(
-        got,
-        want.iter()
-            .map(|(a, b)| (a.to_string(), b.to_string()))
-            .collect::<Vec<_>>()
-    );
-    let _ = std::fs::remove_file(path);
+        let got = seen.lock().unwrap().clone();
+        let want = [
+            ("01-action", r#"{"amount":30}"#),
+            ("02-action", r#"{"addr":"x"}"#),
+            // 逆序补偿，每步的补偿拿到的是**它自己那步**的数据
+            ("02-compensate", r#"{"addr":"x"}"#),
+            ("01-compensate", r#"{"amount":30}"#),
+        ];
+        assert_eq!(
+            got,
+            want.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect::<Vec<_>>()
+        );
+    })
+    .await;
 }
