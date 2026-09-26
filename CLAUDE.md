@@ -16,7 +16,7 @@ Apache-2.0。只实现 DTM 的协议，不抄它的代码。
 
 ```bash
 cargo build --release                 # 二进制在 target/release/dtmrs
-cargo test --workspace                # 250 个测试（真库那部分会被跳过，见下）
+cargo test --workspace                # 251 个测试（真库那部分会被跳过，见下）
 cargo run --example embedded -p dtmrs-server   # 嵌入式模式的可运行示例
 cargo run --example workflow -p dtmrs-server   # workflow 模式（重放/断点续跑）
 
@@ -196,6 +196,9 @@ crates/
   → `dtmrs_submit` / `dtmrs_abort`），分支号由宿主给 —— 库里没法安全地替它编号
   （并发 try 时同地址撞号查不出来）。绑定层各自维护计数器。判断全走 `api.rs`，
   `embedded.rs` 只加 `local://` 漏注册的自查，别在 FFI / embedded 里另写规则。
+- **`dtmrs_close` 必须先在运行时上 `Embedded::shutdown()` 再析构运行时**。光 drop 的话
+  sqlx-sqlite 的每连接线程没人等，close 返回后库文件还在被关、被 checkpoint，
+  宿主立刻删目录会撞 ENOTEMPTY。`close返回时sqlite连接必须已经关完` 钉着。
 - **FFI 的 workflow 是回调里再调回来**：宿主函数跑在 `spawn_blocking` 线程上，
   `dtmrs_wf_branch` 在那条线程上 `block_on`。`DtmrsWf.err` 是**粘性**的：
   任何分支出过错，之后的 `dtmrs_wf_branch` 一律不执行，宿主函数的返回值也不算数 ——

@@ -223,7 +223,9 @@ int dtmrs_status(DtmrsTc *tc, const char *gid, char *out, size_t out_len);
 int dtmrs_wait_final(DtmrsTc *tc, const char *gid, int timeout_ms,
                      char *out, size_t out_len);
 
-/* 关闭释放。未终结事务留在库里，下次 open+start 继续。传 NULL 安全。 */
+/* 关闭释放。未终结事务留在库里，下次 open+start 继续。传 NULL 安全。
+ * 返回时存储连接已经全部关完（sqlite 的 -wal / -shm 已收尾），
+ * 可以立刻删除 / 挪动库文件或重新打开同一个库。 */
 void dtmrs_close(DtmrsTc *tc);
 
 /* 最近一次错误。返回的指针在下次调用本库任何函数后失效。 */

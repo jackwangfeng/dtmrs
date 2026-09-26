@@ -1140,8 +1140,14 @@ pub extern "C" fn dtmrs_close(tc: *mut DtmrsTc) {
     if tc.is_null() {
         return;
     }
-    // Embedded 的 Drop 会停掉推进器；Runtime 的 Drop 等待任务收尾
-    drop(unsafe { Box::from_raw(tc) });
+    let mut h = unsafe { Box::from_raw(tc) };
+    // 必须在运行时还活着的时候把存储关干净，再析构运行时。
+    // 光 drop 的话：Runtime 的 Drop 只等 tokio 任务，等不到 sqlx-sqlite 的连接线程，
+    // close 返回时库文件还在被关 / 被 checkpoint，宿主立刻删目录会撞 ENOTEMPTY。
+    if let Some(e) = h.tc.take() {
+        h.rt.block_on(e.shutdown());
+    }
+    drop(h);
 }
 
 #[cfg(test)]
@@ -1230,6 +1236,40 @@ mod tests {
         assert_eq!(r, 0, "没任务应该返回 0");
         assert!(t0.elapsed() < Duration::from_millis(200), "不该阻塞");
         dtmrs_close(tc);
+    }
+
+    #[test]
+    fn close返回时sqlite连接必须已经关完() {
+        // 问题单 2026-09-26：close 只 drop 句柄，运行时先析构、连接池后丢且从没 close 过；
+        // sqlx-sqlite 每条连接一个 OS 线程，drop 不等它 sqlite3_close。
+        // 宿主「close 完立刻删目录」会撞上 -wal / -shm 被删了又重建，ENOTEMPTY。
+        // 关干净的判据：WAL 模式下最后一条连接关闭会 checkpoint 并删掉 -wal / -shm，
+        // 所以 close 一返回，目录里只能剩主库文件。
+        // （不数 sqlx-sqlite 线程 —— 同进程并行的其它测试也在开 sqlite。）
+        for i in 0..20 {
+            let dir = std::env::temp_dir().join(format!("dtmrs_close_{}_{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = format!("sqlite:{}/dtm.db", dir.display());
+            let tc = dtmrs_open(cs(&db).as_ptr());
+            assert!(!tc.is_null());
+            assert_eq!(dtmrs_start(tc), DTMRS_OK);
+            // 让推进器转几圈，池子里有连接在用
+            std::thread::sleep(Duration::from_millis(30));
+            dtmrs_close(tc);
+
+            let mut left: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            left.sort();
+            assert_eq!(
+                left,
+                vec!["dtm.db".to_string()],
+                "第 {i} 轮 close 返回后还有没关完的连接"
+            );
+            std::fs::remove_dir_all(&dir).expect("close 返回后立刻删目录必须成功");
+        }
     }
 
     #[test]

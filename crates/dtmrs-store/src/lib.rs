@@ -1789,6 +1789,23 @@ impl Store {
         }
     }
 
+    /// 关掉底层连接，**等到连接真的关完才返回**。
+    ///
+    /// 光 drop 不够：sqlx-sqlite 每条连接占一个专属 OS 线程，drop 只关命令通道，
+    /// `sqlite3_close` 在那条线程上稍后才执行，没人等它。WAL 模式下最后一条连接
+    /// 关闭时还要 checkpoint、删 `-wal` / `-shm`。宿主「关完立刻删目录」
+    /// 就会跟这些文件的删除 / 重建撞车（ENOTEMPTY）。`Pool::close` 会等每条连接
+    /// 的 worker 回话，而 worker 是先 `sqlite3_close` 再回话的。
+    ///
+    /// 所有 clone 共用同一个池，关一次全关。Redis 连接是多路复用的，drop 即可，这里什么也不做。
+    pub async fn close(&self) {
+        match &self.inner {
+            Inner::Sql(s) => s.pool().close().await,
+            #[cfg(feature = "redis")]
+            Inner::Redis(_) => {}
+        }
+    }
+
     /// SQL 方言。Redis 后端没有方言可言，返回 `None`
     pub fn backend(&self) -> Option<Backend> {
         match &self.inner {

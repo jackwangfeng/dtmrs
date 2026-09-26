@@ -319,6 +319,23 @@ impl Embedded {
     pub fn store(&self) -> &Store {
         &self.store
     }
+
+    /// 正经关闭：停推进器、等它退干净，再把存储连接关完才返回。
+    ///
+    /// 跟 drop 的区别：drop 只 abort 推进器，连接池丢掉就不管了 —— sqlite 的连接
+    /// 线程要过几百毫秒才真正关库，调用方没有任何东西可等。要在关闭后删 / 挪库文件、
+    /// 或重新打开同一个库的，必须走这个（见 [`Store::close`]）。
+    ///
+    /// 未终结的事务照样留在库里，下次 start 接着推，跟 drop 一样。
+    pub async fn shutdown(mut self) {
+        if let Some(t) = self.task.take() {
+            t.abort();
+            // abort 后等它真的停下：run_forever 的 JoinSet 随之析构、abort 掉各 worker，
+            // 它们手上借出的连接才会还回池子
+            let _ = t.await;
+        }
+        self.store.close().await;
+    }
 }
 
 impl Drop for Embedded {
