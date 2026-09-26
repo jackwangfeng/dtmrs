@@ -118,13 +118,15 @@ impl EmbeddedBuilder {
             .with_registry(registry.clone())
             .with_workflows(workflows.clone());
         // 常驻推进器。重启后未终结的事务会被它自动捞起继续推 —— 崩溃恢复就靠这个
-        let task = tokio::spawn(driver.clone().run_forever(self.tick));
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(driver.clone().run_until(self.tick, stop_rx));
         Ok(Embedded {
             api: Api::new(store.clone()),
             store,
             registry,
             workflows,
             task: Some(task),
+            stop,
         })
     }
 }
@@ -136,7 +138,13 @@ pub struct Embedded {
     registry: Arc<Registry>,
     workflows: Arc<WorkflowRegistry>,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// 叫推进器体面退出的开关，见 [`Embedded::shutdown`]
+    stop: tokio::sync::watch::Sender<bool>,
 }
+
+/// shutdown 时等推进器把手上这一轮推完的上限。到点就 abort ——
+/// 分支卡死（宿主 handler 不返回、拉取式没人回话）不能让 close 永远挂着。
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 impl Embedded {
     pub fn builder(db: &str) -> EmbeddedBuilder {
@@ -326,15 +334,25 @@ impl Embedded {
     /// 线程要过几百毫秒才真正关库，调用方没有任何东西可等。要在关闭后删 / 挪库文件、
     /// 或重新打开同一个库的，必须走这个（见 [`Store::close`]）。
     ///
+    /// 推进器是**叫停**而不是 abort 的：abort 可能砍在建连中途，那条连接
+    /// 不在池子里，`Store::close` 等不到它（理由见 [`Driver::run_until`]）。
+    /// 正在推的事务最多等 [`SHUTDOWN_GRACE`]，超时才 abort —— 那种情况下
+    /// 不保证返回时连接已经关完。
+    ///
     /// 未终结的事务照样留在库里，下次 start 接着推，跟 drop 一样。
     pub async fn shutdown(mut self) {
-        if let Some(t) = self.task.take() {
-            t.abort();
-            // abort 后等它真的停下：run_forever 的 JoinSet 随之析构、abort 掉各 worker，
-            // 它们手上借出的连接才会还回池子
-            let _ = t.await;
+        if let Some(mut t) = self.task.take() {
+            let _ = self.stop.send(true);
+            if tokio::time::timeout(SHUTDOWN_GRACE, &mut t).await.is_err() {
+                tracing::warn!("推进器 {SHUTDOWN_GRACE:?} 内没停下（分支卡住？），强制 abort");
+                t.abort();
+                let _ = t.await;
+            }
         }
         self.store.close().await;
+        if let Some(n) = self.store.pool().map(|p| p.size()).filter(|n| *n > 0) {
+            tracing::warn!(left = n, "连接池关闭后仍有连接没关完");
+        }
     }
 }
 

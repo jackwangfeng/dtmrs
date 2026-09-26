@@ -139,29 +139,56 @@ impl Driver {
     ///
     /// `JoinSet` 被 drop 时会把里面所有任务一并 abort，正好是我们要的语义。
     pub async fn run_forever(self, tick: Duration) {
+        // 发送端留在这个栈帧里：它活着 changed() 就永远不返回
+        let (_never, stop) = tokio::sync::watch::channel(false);
+        self.run_until(tick, stop).await
+    }
+
+    /// 同 [`run_forever`](Self::run_forever)，但 `stop` 变成 true 时**体面地**停：
+    /// 每个 worker 在安全点（一轮开头、空闲睡眠中）自己退出，全部退完才返回。
+    ///
+    /// # 为什么光 abort 不够
+    ///
+    /// abort 会在任意 await 点砍掉 future，包括**连接正在建立**的时候。
+    /// sqlx-sqlite 的连接跑在专属 OS 线程上，建好后发现接收端没了，就自己
+    /// 异步 `sqlite3_close` —— 这条连接从没进过池子，`Pool::close` 等不到它。
+    /// 结果是「关闭」返回后库文件（WAL 的 -wal / -shm）还在被动。
+    /// start 后立刻 close 时 16 个 worker 全在建连，几乎必撞（keel 实测）。
+    ///
+    /// 正在推进的事务会把这一轮推完；推多久由分支决定，调用方自己兜超时
+    /// （[`Embedded::shutdown`](crate::embedded::Embedded::shutdown) 超时后退回 abort）。
+    pub async fn run_until(self, tick: Duration, stop: tokio::sync::watch::Receiver<bool>) {
         let mut set = tokio::task::JoinSet::new();
         for _ in 0..self.workers.max(1) {
             let d = self.clone();
-            set.spawn(async move { d.worker_loop(tick).await });
+            let stop = stop.clone();
+            set.spawn(async move { d.worker_loop(tick, stop).await });
         }
         // 任一 worker 意外退出就整体结束 —— 静默少几个 worker 比直接挂更难查
         set.join_next().await;
+        if *stop.borrow() {
+            // 是叫停的：等其余 worker 也退干净，别让 JoinSet 的 drop 去 abort 它们
+            while set.join_next().await.is_some() {}
+        }
     }
 
     /// 单个 worker：抢一个到期事务推一下，没活就睡
-    async fn worker_loop(&self, tick: Duration) {
-        loop {
+    async fn worker_loop(&self, tick: Duration, mut stop: tokio::sync::watch::Receiver<bool>) {
+        while !*stop.borrow() {
             match self.store.lock_one_due(&self.owner, self.lease).await {
                 Ok(Some(g)) => {
                     if let Err(e) = self.process(&g).await {
                         warn!(gid = %g.gid, error = %e, "推进出错，等下轮重试");
                     }
+                    continue;
                 }
-                Ok(None) => tokio::time::sleep(tick).await,
-                Err(e) => {
-                    warn!(error = %e, "取待办失败");
-                    tokio::time::sleep(tick).await;
-                }
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "取待办失败"),
+            }
+            // 睡的时候也要能被叫醒退出，否则 close 平白多等一个 tick
+            tokio::select! {
+                _ = tokio::time::sleep(tick) => {}
+                _ = stop.changed() => {}
             }
         }
     }

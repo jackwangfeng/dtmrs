@@ -1797,10 +1797,36 @@ impl Store {
     /// 就会跟这些文件的删除 / 重建撞车（ENOTEMPTY）。`Pool::close` 会等每条连接
     /// 的 worker 回话，而 worker 是先 `sqlite3_close` 再回话的。
     ///
+    /// ⚠ **`Pool::close` 调一次不够**（sqlx 0.8.6，读源码 + 实测）：
+    ///
+    /// 1. 借出的连接归还时是 `spawn` 一个任务去关的，而 `close` 的等待循环第 k 轮
+    ///    只要 k 个空闲 permit —— 池子没用满时立刻满足，它会在那些任务还在关连接时就返回。
+    /// 2. 更糟的竞态：归还任务先看了 `is_closed()`（还没关），在它 await 的空当里
+    ///    `close` 清空了空闲队列并返回，随后这条连接被**推回空闲队列**，从此没人关它，
+    ///    连接线程和 -wal / -shm 一直留着（多进程压测下约千分之二）。
+    ///
+    /// 所以循环「close → 看 `size()` 是否归零」：`close` 可重入，每次都会把新落进
+    /// 空闲队列的连接关掉；`size()` 在连接真正关完（sqlite3_close 之后）才减。
+    ///
+    /// 在建立中途被 abort 的连接从没进过池子，这里等不到 —— 调用方得先让用池子的
+    /// 任务**体面地**停下来，别 abort（见 `Driver::run_until`）。
+    ///
     /// 所有 clone 共用同一个池，关一次全关。Redis 连接是多路复用的，drop 即可，这里什么也不做。
     pub async fn close(&self) {
         match &self.inner {
-            Inner::Sql(s) => s.pool().close().await,
+            Inner::Sql(s) => {
+                let pool = s.pool();
+                // 有上限：万一 sqlx 行为变了导致 size 永不归零，也别让关闭永远挂着。
+                // 超时不报错（这层没日志），调用方可以自己看 `pool().size()`
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    pool.close().await;
+                    if pool.size() == 0 || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
             #[cfg(feature = "redis")]
             Inner::Redis(_) => {}
         }

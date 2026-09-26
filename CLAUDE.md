@@ -198,7 +198,10 @@ crates/
   `embedded.rs` 只加 `local://` 漏注册的自查，别在 FFI / embedded 里另写规则。
 - **`dtmrs_close` 必须先在运行时上 `Embedded::shutdown()` 再析构运行时**。光 drop 的话
   sqlx-sqlite 的每连接线程没人等，close 返回后库文件还在被关、被 checkpoint，
-  宿主立刻删目录会撞 ENOTEMPTY。`close返回时sqlite连接必须已经关完` 钉着。
+  宿主立刻删目录会撞 ENOTEMPTY。`close返回时sqlite连接必须已经关完` 钉着（含 start 后 0ms 就 close）。
+  两个坑别退回去：推进器要**叫停**（`Driver::run_until`）不能 abort —— abort 砍在建连中途
+  的连接不在池里谁也等不到；`Store::close` 要**循环 close 直到 `size()` 归零** ——
+  sqlx 0.8.6 的 `Pool::close` 调一次会漏掉归还途中的连接（理由在它的文档注释里）。
 - **FFI 的 workflow 是回调里再调回来**：宿主函数跑在 `spawn_blocking` 线程上，
   `dtmrs_wf_branch` 在那条线程上 `block_on`。`DtmrsWf.err` 是**粘性**的：
   任何分支出过错，之后的 `dtmrs_wf_branch` 一律不执行，宿主函数的返回值也不算数 ——

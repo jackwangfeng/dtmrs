@@ -1243,32 +1243,59 @@ mod tests {
         // 问题单 2026-09-26：close 只 drop 句柄，运行时先析构、连接池后丢且从没 close 过；
         // sqlx-sqlite 每条连接一个 OS 线程，drop 不等它 sqlite3_close。
         // 宿主「close 完立刻删目录」会撞上 -wal / -shm 被删了又重建，ENOTEMPTY。
-        // 关干净的判据：WAL 模式下最后一条连接关闭会 checkpoint 并删掉 -wal / -shm，
-        // 所以 close 一返回，目录里只能剩主库文件。
+        //
+        // 判据：close 返回时目录里只剩主库（WAL 模式下最后一条连接关闭会 checkpoint
+        // 并删掉 -wal / -shm），而且**之后不再变** —— 有没被等到的连接线程的话，
+        // 它稍后关库时会删 / 建这两个文件。
+        //
+        // ⚠ 0ms 那档是关键：start 后立刻 close 时 16 个 worker 正在并发建连，
+        // abort 掉 connect 中途的 future，sqlx-sqlite 的线程会自己异步关库，
+        // Pool::close 根本不知道有这条连接（keel 复核 0cda1a4 时发现的，
+        // 只测「sleep 30ms 再 close」测不出来）。
         // （不数 sqlx-sqlite 线程 —— 同进程并行的其它测试也在开 sqlite。）
-        for i in 0..20 {
-            let dir = std::env::temp_dir().join(format!("dtmrs_close_{}_{i}", std::process::id()));
+        fn ls(dir: &std::path::Path) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+        let rounds: Vec<(u64, usize)> = [0u64, 1, 5, 30]
+            .iter()
+            .flat_map(|&ms| (0..15).map(move |i| (ms, i)))
+            .collect();
+        let mut dirs = Vec::new();
+        for (ms, i) in rounds {
+            let dir =
+                std::env::temp_dir().join(format!("dtmrs_close_{}_{ms}_{i}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let db = format!("sqlite:{}/dtm.db", dir.display());
             let tc = dtmrs_open(cs(&db).as_ptr());
             assert!(!tc.is_null());
             assert_eq!(dtmrs_start(tc), DTMRS_OK);
-            // 让推进器转几圈，池子里有连接在用
-            std::thread::sleep(Duration::from_millis(30));
+            if ms > 0 {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
             dtmrs_close(tc);
-
-            let mut left: Vec<String> = std::fs::read_dir(&dir)
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .collect();
-            left.sort();
+            let at_close = ls(&dir);
             assert_eq!(
-                left,
+                at_close,
                 vec!["dtm.db".to_string()],
-                "第 {i} 轮 close 返回后还有没关完的连接"
+                "start 后 {ms}ms close（第 {i} 轮）：close 返回时还有没关完的连接"
             );
-            std::fs::remove_dir_all(&dir).expect("close 返回后立刻删目录必须成功");
+            dirs.push((ms, i, dir));
+        }
+        // 统一等一次，再核对每个目录都没被「迟到的关库」动过
+        std::thread::sleep(Duration::from_millis(300));
+        for (ms, i, dir) in dirs {
+            assert_eq!(
+                ls(&dir),
+                vec!["dtm.db".to_string()],
+                "start 后 {ms}ms close（第 {i} 轮）：close 返回后目录内容还在变"
+            );
+            std::fs::remove_dir_all(&dir).expect("close 返回后删目录必须成功");
         }
     }
 
