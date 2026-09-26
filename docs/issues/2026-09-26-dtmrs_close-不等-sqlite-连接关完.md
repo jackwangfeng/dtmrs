@@ -1,5 +1,11 @@
 # dtmrs_close 返回时 sqlite 连接还没关完：先析构运行时、后丢连接池
 
+> **状态：已关闭（2026-09-26），修复发布于 v0.11.1。**
+> 0cda1a4 只修了一半（start 后立刻 close 仍有约 1/3 复现），5b270d0 补上另外两个洞：
+> 推进器改成叫停而不是 abort、`Store::close` 循环 close 直到 `size()` 归零。
+> keel 在 dc9862b 升级到 v0.11.1，绕法换成直接断言「Close 后目录里只剩 dtm.db」：
+> 600 次 0 失败，换回 v0.11.0 则 600 次全红。
+
 - 报告方：keel（通过 FFI 嵌入 dtmrs，Go 侧 `internal/dtm`）
 - 版本：dtmrs v0.11.0（c6dc313），sqlx / sqlx-sqlite 0.8.6
 - 严重程度：中。不丢数据，但 `dtmrs_close` 返回后宿主**无法确认存储已经释放**，
