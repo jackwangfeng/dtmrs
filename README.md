@@ -4,6 +4,9 @@
 
 [![CI](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml/badge.svg)](https://github.com/jackwangfeng/dtmrs/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/dtmrs.svg?logo=rust)](https://crates.io/crates/dtmrs) [![docs.rs](https://img.shields.io/docsrs/dtmrs?logo=rust)](https://docs.rs/dtmrs) [![Stars](https://img.shields.io/github/stars/jackwangfeng/dtmrs?style=flat&logo=github)](https://github.com/jackwangfeng/dtmrs/stargazers) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+> **Rust 分布式事务管理器**（分布式事务框架，DTM 协议兼容的 Rust 实现）：SAGA / TCC / 二阶段消息 / XA / workflow，
+> 可嵌入进程内当库用。中文文档见 [README.zh-CN.md](README.zh-CN.md)。
+
 A distributed transaction manager in Rust — SAGA, TCC, two-phase messaging, XA and
 workflow, over sqlite / Postgres / MySQL / Redis, with equivalent HTTP and gRPC APIs.
 Protocol-compatible with [DTM](https://github.com/dtm-labs/dtm), plus one thing DTM

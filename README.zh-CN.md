@@ -1,4 +1,4 @@
-# dtmrs
+# dtmrs —— Rust 分布式事务管理器
 
 [English](README.md) | **简体中文**
 
