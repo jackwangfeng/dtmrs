@@ -409,6 +409,7 @@ async fn grpc的错误映射到正确的状态码() {
             actions: vec!["http://x/a".into()],
             query_prepared: String::new(),
             grace_secs: 0,
+            ..Default::default()
         })
         .await
         .unwrap_err();

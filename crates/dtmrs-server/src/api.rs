@@ -17,10 +17,13 @@
 //! abort），换成 4xx 会打破现有客户端。
 
 use crate::driver;
-use crate::{msg_rows, saga_rows, tcc_rows};
-use dtmrs_core::{BranchOp, GlobalStatus, SagaStep, TransType};
-use dtmrs_store::{Store, SubmitOutcome};
+use crate::{msg_rows_expanded, saga_rows, tcc_rows};
+use dtmrs_core::{expand_msg_steps, BranchOp, GlobalStatus, SagaStep, TransType, MSG_TOPIC_PREFIX};
+use dtmrs_store::{Store, SubmitOutcome, TopicSub};
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
@@ -84,12 +87,29 @@ pub struct RegisterBranch {
     pub rollback: String,
 }
 
+/// msg prepare 的可选项（DTM 协议之外的扩展，都有默认值）
+#[derive(Debug, Clone, Default)]
+pub struct PrepareOpts {
+    /// 每个 action 对应的请求体。空表示都不带（分支收到 `{}`）；
+    /// 非空时必须跟 actions 一样长。`topic://` 的那一步，所有订阅者收到同一份
+    pub payloads: Vec<String>,
+    /// 主题没有订阅者时放行（展开成 0 个分支）而不是报 `topic not found`。
+    /// 给「晚到或漏一次可以接受、但不能挡住业务」的通知类消息用 ——
+    /// 发送方往往是在业务本地事务里 prepare 的，报错会把业务本身也带失败
+    pub allow_empty_topic: bool,
+}
+
 #[derive(Clone)]
 pub struct Api {
     pub store: Store,
     /// 提交后**直接开推**用的推进器。`None` 就是老行为：写完就返回，
     /// 等推进器自己抢到再推。见 [`Api::with_inline_driver`]
     inline: Option<crate::driver::Driver>,
+    /// 代码里静态登记的订阅（嵌入式启动时给的）：主题 → 地址。
+    /// 跟存储里的订阅取并集，静态的排前面
+    static_topics: Arc<BTreeMap<String, Vec<String>>>,
+    /// 因为 `allow_empty_topic` 被放行成「没人收」的主题次数（按主题计，不按消息）
+    empty_topic: Arc<AtomicU64>,
 }
 
 impl Api {
@@ -97,7 +117,28 @@ impl Api {
         Self {
             store,
             inline: None,
+            static_topics: Arc::new(BTreeMap::new()),
+            empty_topic: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 代码里静态登记的订阅。重复的地址去掉
+    pub fn with_static_topics(mut self, subs: Vec<(String, String)>) -> Self {
+        let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (t, u) in subs {
+            let v = m.entry(t).or_default();
+            if !v.contains(&u) {
+                v.push(u);
+            }
+        }
+        self.static_topics = Arc::new(m);
+        self
+    }
+
+    /// `allow_empty_topic` 放行了多少次「主题没有订阅者」。
+    /// 不该一直涨：涨了说明订阅方没登记上，消息在靠对账兜底
+    pub fn empty_topic_count(&self) -> u64 {
+        self.empty_topic.load(Ordering::Relaxed)
     }
 
     /// 开启「提交后直接开推」。
@@ -257,6 +298,130 @@ impl Api {
         }
     }
 
+    // ---------------- 主题订阅（对齐 DTM 的 subscribe / unsubscribe / topic） ----------------
+    //
+    // 错误文案照抄 DTM（`dtmsvr/topics.go`），客户端可能按文案判断。
+    // 状态码跟 DTM 不同：DTM 一律 500，这里参数错 400、找不到 404 ——
+    // 都是非 2xx，按「失败」处理的客户端行为不变。
+
+    /// 一个主题当前的全部订阅地址：静态的在前，存储里的在后，去重
+    pub async fn topic_urls(&self, topic: &str) -> Result<Vec<String>> {
+        let mut urls = self.static_topics.get(topic).cloned().unwrap_or_default();
+        for s in self
+            .store
+            .list_subscriptions(Some(topic))
+            .await
+            .map_err(internal)?
+        {
+            if !urls.contains(&s.url) {
+                urls.push(s.url);
+            }
+        }
+        Ok(urls)
+    }
+
+    pub async fn subscribe(&self, topic: &str, url: &str, remark: &str) -> Result<()> {
+        if topic.is_empty() {
+            return Err(ApiError::BadRequest("empty topic".into()));
+        }
+        if url.is_empty() {
+            return Err(ApiError::BadRequest("empty url".into()));
+        }
+        if url.starts_with(MSG_TOPIC_PREFIX) {
+            // 订阅者必须是能调的地址；主题套主题会在展开时变成一个打不通的分支
+            return Err(ApiError::BadRequest("订阅地址不能是 topic://".into()));
+        }
+        if self.is_static(topic, url) {
+            return Err(ApiError::BadRequest("this url exists".into()));
+        }
+        if self
+            .store
+            .subscribe(topic, url, remark)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest("this url exists".into()))
+        }
+    }
+
+    pub async fn unsubscribe(&self, topic: &str, url: &str) -> Result<()> {
+        if topic.is_empty() {
+            return Err(ApiError::BadRequest("empty topic".into()));
+        }
+        if url.is_empty() {
+            return Err(ApiError::BadRequest("empty url".into()));
+        }
+        if self.is_static(topic, url) {
+            return Err(ApiError::BadRequest(
+                "这是代码里静态登记的订阅，只能改代码去掉".into(),
+            ));
+        }
+        if self.store.unsubscribe(topic, url).await.map_err(internal)? {
+            return Ok(());
+        }
+        let exists = !self
+            .store
+            .list_subscriptions(Some(topic))
+            .await
+            .map_err(internal)?
+            .is_empty();
+        Err(ApiError::NotFound(if exists {
+            // 末尾空格是 DTM 原文
+            "no such an url ".into()
+        } else {
+            "no such a topic".into()
+        }))
+    }
+
+    /// 删整个主题（只删存储里的订阅；静态登记的在代码里，删不掉也不该删）
+    pub async fn delete_topic(&self, topic: &str) -> Result<()> {
+        if topic.is_empty() {
+            return Err(ApiError::BadRequest("empty topic".into()));
+        }
+        match self.store.delete_topic(topic).await.map_err(internal)? {
+            0 => Err(ApiError::NotFound("storage: NotFound".into())),
+            _ => Ok(()),
+        }
+    }
+
+    /// 列订阅（`topic` 为空列全部）。静态登记的也列出来，备注是 `(static)`、
+    /// 登记时间是 0 —— 排查「消息发给了谁」时要看全
+    pub async fn list_topic_subs(&self, topic: Option<&str>) -> Result<Vec<TopicSub>> {
+        let mut out: Vec<TopicSub> = Vec::new();
+        for (t, urls) in self.static_topics.iter() {
+            if topic.is_some_and(|x| x != t) {
+                continue;
+            }
+            out.extend(urls.iter().map(|u| TopicSub {
+                topic: t.clone(),
+                url: u.clone(),
+                remark: "(static)".into(),
+                create_time: 0,
+            }));
+        }
+        for s in self
+            .store
+            .list_subscriptions(topic)
+            .await
+            .map_err(internal)?
+        {
+            if !self.is_static(&s.topic, &s.url) {
+                out.push(s);
+            }
+        }
+        // 稳定排序：同一主题内保持「静态在前、再按登记先后」
+        out.sort_by(|a, b| a.topic.cmp(&b.topic));
+        Ok(out)
+    }
+
+    fn is_static(&self, topic: &str, url: &str) -> bool {
+        self.static_topics
+            .get(topic)
+            .is_some_and(|v| v.iter().any(|u| u == url))
+    }
+
     /// 第一阶段。msg 建 prepared 事务 + 正向分支；tcc / xa 只建空事务。
     pub async fn prepare(
         &self,
@@ -265,6 +430,30 @@ impl Api {
         actions: &[String],
         query_prepared: &str,
         grace_secs: Option<i64>,
+    ) -> Result<()> {
+        self.prepare_with(
+            gid,
+            trans_type,
+            actions,
+            query_prepared,
+            grace_secs,
+            &PrepareOpts::default(),
+        )
+        .await
+    }
+
+    /// 同 [`prepare`](Self::prepare)，多了 msg 的 payload 和「主题允许为空」。
+    ///
+    /// `topic://名字` 的 action **在这里展开**成订阅者（同 DTM：订阅关系在
+    /// prepare 那一刻定格，之后的订阅 / 退订不影响这条消息，也不补发历史消息）。
+    pub async fn prepare_with(
+        &self,
+        gid: &str,
+        trans_type: &str,
+        actions: &[String],
+        query_prepared: &str,
+        grace_secs: Option<i64>,
+        opts: &PrepareOpts,
     ) -> Result<()> {
         if gid.is_empty() {
             return Err(ApiError::BadRequest("gid 不能为空".into()));
@@ -281,7 +470,32 @@ impl Api {
                         "msg 必须提供 query_prepared，否则崩溃后无法决断".into(),
                     ));
                 }
-                let (g, br) = msg_rows(gid, actions, query_prepared, grace_secs.unwrap_or(10));
+                // 先把涉及的主题都查好，展开本身是 core 里的纯函数
+                let mut subs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for a in actions {
+                    if let Some(t) = a.strip_prefix(MSG_TOPIC_PREFIX) {
+                        if !t.is_empty() && !subs.contains_key(t) {
+                            subs.insert(t.to_string(), self.topic_urls(t).await?);
+                        }
+                    }
+                }
+                let exp = expand_msg_steps(
+                    actions,
+                    &opts.payloads,
+                    |t| subs.get(t).cloned().unwrap_or_default(),
+                    opts.allow_empty_topic,
+                )
+                .map_err(ApiError::BadRequest)?;
+                for t in &exp.empty_topics {
+                    self.empty_topic.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        gid,
+                        topic = %t,
+                        "主题没有订阅者，按 allow_empty_topic 放行：这一步没有人会收到消息"
+                    );
+                }
+                let (g, br) =
+                    msg_rows_expanded(gid, &exp.branches, query_prepared, grace_secs.unwrap_or(10));
                 self.store.create_global(&g, &br).await.map_err(internal)?;
                 Ok(())
             }

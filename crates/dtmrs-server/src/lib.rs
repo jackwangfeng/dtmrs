@@ -16,7 +16,7 @@ pub mod http;
 pub mod registry;
 pub mod workflow;
 
-use dtmrs_core::{BranchOp, BranchStatus, GlobalStatus, SagaStep, TransType};
+use dtmrs_core::{BranchOp, BranchStatus, GlobalStatus, MsgBranch, SagaStep, TransType};
 use dtmrs_store::{BranchRow, GlobalRow};
 
 /// 各模式共用的全局事务骨架
@@ -102,6 +102,34 @@ pub fn msg_rows(
         })
         .collect();
     (g, branches)
+}
+
+/// 二阶段消息，主题已经展开过（见 [`dtmrs_core::expand_msg_steps`]）。
+///
+/// 全局事务的 payload 存展开后的 [`MsgBranch`] 列表，推进器按它调分支 ——
+/// **不再按下标算分支号**，扇出的分支号是 `01-01` 这种。
+pub fn msg_rows_expanded(
+    gid: &str,
+    branches: &[MsgBranch],
+    query_prepared: &str,
+    grace_secs: i64,
+) -> (GlobalRow, Vec<BranchRow>) {
+    let payload = serde_json::to_string(branches).unwrap_or_else(|_| "[]".into());
+    let mut g = global(gid, TransType::Msg, GlobalStatus::Prepared, payload);
+    g.query_prepared = query_prepared.to_string();
+    g.next_cron_time = dtmrs_store::now() + grace_secs.max(0);
+    let rows = branches
+        .iter()
+        .map(|b| BranchRow {
+            gid: gid.to_string(),
+            branch_id: b.branch_id.clone(),
+            op: BranchOp::Action,
+            url: b.action.clone(),
+            payload: b.payload.clone(),
+            status: BranchStatus::Prepared,
+        })
+        .collect();
+    (g, rows)
 }
 
 /// TCC：`prepare` 只建全局事务，**分支是客户端在 try 阶段动态登记的**

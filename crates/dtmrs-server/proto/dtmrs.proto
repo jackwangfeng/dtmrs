@@ -28,6 +28,20 @@ service Tc {
 
   // 查一笔事务的当前状态和各分支明细
   rpc Query(QueryRequest) returns (TransView);
+
+  // 二阶段消息的主题订阅（同 DTM 的 Subscribe / Unsubscribe / DeleteTopic）。
+  // 发送方把 action 写成 topic://名字，prepare 时展开成当时的全部订阅者。
+  // 查询订阅走 HTTP 的 /api/dtmsvr/queryKV?cat=topics（DTM 的 gRPC 也没有查询）
+  rpc Subscribe(TopicRequest) returns (Empty);
+  rpc Unsubscribe(TopicRequest) returns (Empty);
+  rpc DeleteTopic(TopicRequest) returns (Empty);
+}
+
+message TopicRequest {
+  string topic = 1;
+  // 订阅者地址：http(s):// / grpc:// / local://（嵌入式）
+  string url = 2;
+  string remark = 3;
 }
 
 message Empty {}
@@ -65,6 +79,10 @@ message PrepareRequest {
   string query_prepared = 4;
   // msg 用：回查前的宽限秒数，0 表示用默认值 10
   int64 grace_secs = 5;
+  // msg 用：每个 action 的请求体（同 DTM 的 payloads）。不给表示都不带
+  repeated string payloads = 6;
+  // msg 用：topic:// 没有订阅者时放行（展开成 0 个分支）而不是报 topic not found
+  bool allow_empty_topic = 7;
 }
 
 message AbortRequest {

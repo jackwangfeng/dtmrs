@@ -46,7 +46,7 @@
 //!
 //! 多个 TC 实例抢同一笔事务时，Redis 侧不需要行锁也不会重复推进。
 
-use crate::{BranchRow, GlobalRow, SubmitOutcome, TokenRow, MID};
+use crate::{BranchRow, GlobalRow, SubmitOutcome, TokenRow, TopicSub, MID, SUB_URL_LEN, TOPIC_LEN};
 use dtmrs_core::dialect::check_len;
 use dtmrs_core::{Backend, BranchOp, BranchStatus, GlobalStatus, TransType};
 use redis::aio::MultiplexedConnection;
@@ -196,6 +196,14 @@ impl RedisStore {
     /// 令牌索引（set），用来列举 —— Redis 上不能像 SQL 那样 SELECT *
     fn tidx(&self) -> String {
         format!("{}tokens", self.prefix)
+    }
+    /// 一个主题的订阅者（hash：url → `create_time\x1fremark`）
+    fn topic_key(&self, topic: &str) -> String {
+        format!("{}topic:{}", self.prefix, topic)
+    }
+    /// 有订阅者的主题名（set），用来列举
+    fn topics_idx(&self) -> String {
+        format!("{}topics", self.prefix)
     }
 
     /// 分支在 hash 里的字段名。用 `\x1f`（单元分隔符）拼，
@@ -1049,6 +1057,101 @@ impl RedisStore {
             .filter(|t| t.revoked == 0)
             .map(|t| t.token_hash)
             .collect())
+    }
+
+    // ---------------- 主题订阅 ----------------
+    //
+    // 语义跟 SQL 后端逐条一致（见 `Store::subscribe` 一组的注释）。
+    // 订阅 / 退订都是两个 key（主题 hash + 主题索引 set）一起改，走 Lua 保证原子：
+    // 否则退订最后一个订阅者和新订阅并发时，索引里可能丢掉一个还有订阅者的主题。
+    // **这些 key 都不设 TTL** —— 订阅是配置，过期消失等于消息悄悄没人收。
+
+    pub async fn subscribe(&self, topic: &str, url: &str, remark: &str) -> Result<bool> {
+        check_len("topic", topic, TOPIC_LEN).map_err(|e| err(&e.to_string()))?;
+        check_len("url", url, SUB_URL_LEN).map_err(|e| err(&e.to_string()))?;
+        check_len("remark", remark, MID).map_err(|e| err(&e.to_string()))?;
+        let script = redis::Script::new(
+            r"
+            local added = redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2])
+            redis.call('SADD', KEYS[2], ARGV[3])
+            return added",
+        );
+        let mut c = self.conn.clone();
+        let added: i64 = script
+            .key(self.topic_key(topic))
+            .key(self.topics_idx())
+            .arg(url)
+            .arg(format!("{}\x1f{}", crate::now(), remark))
+            .arg(topic)
+            .invoke_async(&mut c)
+            .await?;
+        Ok(added == 1)
+    }
+
+    pub async fn unsubscribe(&self, topic: &str, url: &str) -> Result<bool> {
+        let script = redis::Script::new(
+            r"
+            local n = redis.call('HDEL', KEYS[1], ARGV[1])
+            if redis.call('HLEN', KEYS[1]) == 0 then redis.call('SREM', KEYS[2], ARGV[2]) end
+            return n",
+        );
+        let mut c = self.conn.clone();
+        let n: i64 = script
+            .key(self.topic_key(topic))
+            .key(self.topics_idx())
+            .arg(url)
+            .arg(topic)
+            .invoke_async(&mut c)
+            .await?;
+        Ok(n == 1)
+    }
+
+    pub async fn delete_topic(&self, topic: &str) -> Result<u64> {
+        let script = redis::Script::new(
+            r"
+            local n = redis.call('HLEN', KEYS[1])
+            redis.call('DEL', KEYS[1])
+            redis.call('SREM', KEYS[2], ARGV[1])
+            return n",
+        );
+        let mut c = self.conn.clone();
+        let n: i64 = script
+            .key(self.topic_key(topic))
+            .key(self.topics_idx())
+            .arg(topic)
+            .invoke_async(&mut c)
+            .await?;
+        Ok(n as u64)
+    }
+
+    pub async fn list_subscriptions(&self, topic: Option<&str>) -> Result<Vec<TopicSub>> {
+        let mut c = self.conn.clone();
+        let mut topics: Vec<String> = match topic {
+            Some(t) => vec![t.to_string()],
+            None => c.smembers(self.topics_idx()).await?,
+        };
+        topics.sort();
+        let mut out = Vec::new();
+        for t in topics {
+            let h: std::collections::HashMap<String, String> =
+                c.hgetall(self.topic_key(&t)).await?;
+            let mut subs: Vec<TopicSub> = h
+                .into_iter()
+                .map(|(url, v)| {
+                    let (ct, remark) = v.split_once('\x1f').unwrap_or(("0", ""));
+                    TopicSub {
+                        topic: t.clone(),
+                        url,
+                        remark: remark.to_string(),
+                        create_time: ct.parse().unwrap_or(0),
+                    }
+                })
+                .collect();
+            // 跟 SQL 的 ORDER BY create_time, url 一致
+            subs.sort_by(|a, b| (a.create_time, &a.url).cmp(&(b.create_time, &b.url)));
+            out.extend(subs);
+        }
+        Ok(out)
     }
 
     pub async fn touch_token(&self, hash: &str, ip: &str) -> Result<()> {

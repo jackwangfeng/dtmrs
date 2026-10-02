@@ -326,6 +326,12 @@ pub enum Advance {
     /// 单独一个变体而不是复用 `Call`：workflow 的正向走向是**用户函数**决定的，
     /// 不是状态机决定的。混进 `Call` 会让人以为这里也能算出「下一个分支是谁」。
     RunWorkflow,
+    /// 同时调这一组分支，**各自记成败、互不等待**（只有按主题扇出的 msg 会出现）。
+    ///
+    /// 单独一个变体而不是连发几个 `Call`：`Call` 的语义是「调完这个才知道下一步」，
+    /// 而一个主题的订阅者之间没有先后 —— 一个订阅者挂了不能挡住别的。
+    /// 组内全成功才轮到下一组（不同 step 之间仍然保序）。
+    CallEach { indices: Vec<usize>, op: BranchOp },
 }
 
 /// SAGA 推进决策。**不碰 I/O，所以可以穷举测试。**
@@ -723,6 +729,315 @@ pub fn msg_advance(status: GlobalStatus, actions: &[BranchStatus]) -> Advance {
         // 回查得到 FAILURE：整单作废，没有补偿可做
         GlobalStatus::Aborting => Advance::Finish(GlobalStatus::Failed),
         s => Advance::Finish(s),
+    }
+}
+
+/// 按主题投递时 action 的前缀，跟 DTM 的 `MsgTopicPrefix` 一致：`topic://库存跨零`
+pub const MSG_TOPIC_PREFIX: &str = "topic://";
+
+/// 二阶段消息展开后的一个分支（落在全局事务的 payload 里）。
+///
+/// # 跟老格式兼容
+///
+/// 0.11 及以前 msg 的 payload 是 `Vec<SagaStep>`（`action` / `compensate` / `payload`），
+/// 一步就是一个分支。新加的两个字段都带 `serde(default)`：老数据解出来
+/// `branch_id` 为空、`step` 为 `None`，[`MsgBranch::fill_defaults`] 按下标补上，
+/// 推进行为跟升级前完全一样。`compensate` 留着只为了老数据能解 —— msg 没有补偿。
+///
+/// ⚠ 反过来不兼容：0.11 的 TC 读到扇出过的 payload 会按下标算分支号（"02"），
+/// 对不上真实的 "01-02"。**所有 TC 实例要一起升级**。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgBranch {
+    /// 展开后的具体地址（`http://` / `grpc://` / `local://`），不会再是 `topic://`
+    pub action: String,
+    #[serde(default)]
+    pub compensate: String,
+    /// 发给分支的请求体。同一个主题的订阅者收到的是同一份
+    #[serde(default)]
+    pub payload: String,
+    /// 分支号。普通 step 和只有一个订阅者的主题是 `01`，扇出的是 `01-01`、`01-02`
+    /// （跟 DTM 的 `GenBranches` 一致）
+    #[serde(default)]
+    pub branch_id: String,
+    /// 属于第几个 step（从 0 起）。同一个 step 的分支并发投递，step 之间保序
+    #[serde(default)]
+    pub step: Option<usize>,
+}
+
+impl MsgBranch {
+    /// 给老格式的数据补上分支号和 step（一步一个分支，按下标）
+    pub fn fill_defaults(list: &mut [MsgBranch]) {
+        for (i, b) in list.iter_mut().enumerate() {
+            if b.branch_id.is_empty() {
+                b.branch_id = format!("{:02}", i + 1);
+            }
+            if b.step.is_none() {
+                b.step = Some(i);
+            }
+        }
+    }
+}
+
+/// 主题展开的结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MsgExpansion {
+    pub branches: Vec<MsgBranch>,
+    /// 没有订阅者、被放行成 0 个分支的主题（只有 `allow_empty_topic` 时才会非空）。
+    /// 调用方据此打 WARN、记计数
+    pub empty_topics: Vec<String>,
+}
+
+/// 把 msg 的 step 列表展开成具体分支。**纯函数**，订阅关系由 `subscribers` 提供。
+///
+/// - 普通地址原样一个分支，分支号 `{step:02}`
+/// - `topic://名字` 换成它的全部订阅者，同享这一步的 payload；
+///   一个订阅者时分支号仍是 `{step:02}`，多个时是 `{step:02}-{序号:02}`（同 DTM）
+/// - 主题没有订阅者：默认报错 `topic not found`（DTM 的原文）——
+///   二阶段消息存在的意义就是保证送达，悄悄丢掉比报错糟得多。
+///   `allow_empty_topic` 时放行成 0 个分支，记进 `empty_topics`
+///
+/// `payloads` 为空表示每步都不带数据；非空时必须跟 `actions` 一样长。
+pub fn expand_msg_steps(
+    actions: &[String],
+    payloads: &[String],
+    subscribers: impl Fn(&str) -> Vec<String>,
+    allow_empty_topic: bool,
+) -> Result<MsgExpansion, String> {
+    if !payloads.is_empty() && payloads.len() != actions.len() {
+        return Err(format!(
+            "payloads 有 {} 个，跟 {} 个 action 对不上",
+            payloads.len(),
+            actions.len()
+        ));
+    }
+    let mut out = MsgExpansion {
+        branches: Vec::new(),
+        empty_topics: Vec::new(),
+    };
+    for (i, action) in actions.iter().enumerate() {
+        let payload = payloads.get(i).cloned().unwrap_or_default();
+        let urls = match action.strip_prefix(MSG_TOPIC_PREFIX) {
+            None => vec![action.clone()],
+            Some("") => return Err("empty topic".into()),
+            Some(topic) => {
+                let urls = subscribers(topic);
+                if urls.is_empty() {
+                    if !allow_empty_topic {
+                        return Err("topic not found".into());
+                    }
+                    out.empty_topics.push(topic.to_string());
+                }
+                urls
+            }
+        };
+        let n = urls.len();
+        for (j, url) in urls.into_iter().enumerate() {
+            let branch_id = if n == 1 {
+                format!("{:02}", i + 1)
+            } else {
+                format!("{:02}-{:02}", i + 1, j + 1)
+            };
+            out.branches.push(MsgBranch {
+                action: url,
+                compensate: String::new(),
+                payload: payload.clone(),
+                branch_id,
+                step: Some(i),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// 按主题扇出的二阶段消息推进决策。
+///
+/// `steps[k]` / `states[k]` 是第 k 个分支所属的 step 和当前状态（按 step 升序）。
+/// `Submitted` 时找第一个还有分支没成功的 step，把**这个 step 里所有没成功的**
+/// 一起交出去（[`Advance::CallEach`]）：同一个主题的订阅者互不阻塞，
+/// 成功了的不会重发；step 之间仍然保序。
+///
+/// 其余语义跟 [`msg_advance`] 一样：没有补偿，失败只能重试。
+pub fn msg_fanout_advance(
+    status: GlobalStatus,
+    steps: &[usize],
+    states: &[BranchStatus],
+) -> Advance {
+    debug_assert_eq!(steps.len(), states.len());
+    match status {
+        GlobalStatus::Prepared => Advance::Wait,
+        GlobalStatus::Submitted => {
+            let Some(first) = states.iter().position(|s| *s != BranchStatus::Succeed) else {
+                return Advance::Finish(GlobalStatus::Succeed);
+            };
+            let step = steps[first];
+            let indices = (0..states.len())
+                .filter(|&k| steps[k] == step && states[k] != BranchStatus::Succeed)
+                .collect();
+            Advance::CallEach {
+                indices,
+                op: BranchOp::Action,
+            }
+        }
+        GlobalStatus::Aborting => Advance::Finish(GlobalStatus::Failed),
+        s => Advance::Finish(s),
+    }
+}
+
+#[cfg(test)]
+mod topic_tests {
+    use super::*;
+    use BranchStatus::{Prepared, Succeed};
+
+    fn subs(topic: &str) -> Vec<String> {
+        match topic {
+            "一个" => vec!["http://a/x".into()],
+            "三个" => vec![
+                "http://a/x".into(),
+                "local://b".into(),
+                "grpc://c/svc/M".into(),
+            ],
+            _ => vec![],
+        }
+    }
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+    fn ids(e: &MsgExpansion) -> Vec<&str> {
+        e.branches.iter().map(|b| b.branch_id.as_str()).collect()
+    }
+
+    #[test]
+    fn 普通地址原样一个分支_分支号跟以前一样() {
+        let e = expand_msg_steps(&s(&["http://x/a", "local://b"]), &[], subs, false).unwrap();
+        assert_eq!(ids(&e), ["01", "02"]);
+        assert_eq!(e.branches[1].action, "local://b");
+        assert_eq!(e.branches[1].step, Some(1));
+        assert!(e.empty_topics.is_empty());
+    }
+
+    #[test]
+    fn 主题展开成全部订阅者_共享这一步的payload() {
+        let e = expand_msg_steps(
+            &s(&["topic://三个", "http://x/after"]),
+            &s(&[r#"{"store_id":3}"#, "p2"]),
+            subs,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ids(&e), ["01-01", "01-02", "01-03", "02"]);
+        assert!(e.branches[..3]
+            .iter()
+            .all(|b| b.payload == r#"{"store_id":3}"#));
+        assert!(e.branches[..3].iter().all(|b| b.step == Some(0)));
+        assert_eq!(e.branches[1].action, "local://b");
+        assert_eq!(e.branches[3].payload, "p2");
+    }
+
+    #[test]
+    fn 只有一个订阅者时分支号不带序号_同dtm() {
+        let e = expand_msg_steps(&s(&["topic://一个"]), &[], subs, false).unwrap();
+        assert_eq!(ids(&e), ["01"]);
+    }
+
+    #[test]
+    fn 主题没有订阅者默认报错_不能悄悄丢消息() {
+        let e = expand_msg_steps(&s(&["topic://没人"]), &[], subs, false);
+        assert_eq!(e.unwrap_err(), "topic not found");
+    }
+
+    #[test]
+    fn 允许为空时没订阅者的主题展开成0个分支并记下来() {
+        let e = expand_msg_steps(&s(&["topic://没人", "http://x/a"]), &[], subs, true).unwrap();
+        // 分支号仍按 step 编：第二步是 02，不会因为第一步空了就挪成 01
+        assert_eq!(ids(&e), ["02"]);
+        assert_eq!(e.empty_topics, ["没人"]);
+    }
+
+    #[test]
+    fn 空主题名和payload个数对不上都要拒绝() {
+        assert!(expand_msg_steps(&s(&["topic://"]), &[], subs, true).is_err());
+        assert!(expand_msg_steps(&s(&["http://a", "http://b"]), &s(&["p"]), subs, false).is_err());
+    }
+
+    #[test]
+    fn 老格式payload补出来的分支号和step跟以前一致() {
+        let mut v: Vec<MsgBranch> = serde_json::from_str(
+            r#"[{"action":"http://a","compensate":""},{"action":"http://b","compensate":"","payload":"p"}]"#,
+        )
+        .unwrap();
+        MsgBranch::fill_defaults(&mut v);
+        assert_eq!(v[0].branch_id, "01");
+        assert_eq!(v[1].branch_id, "02");
+        assert_eq!(v[1].step, Some(1));
+        assert_eq!(v[1].payload, "p");
+    }
+
+    #[test]
+    fn 扇出时一组里没成功的一起交出去_成功的不重发() {
+        assert_eq!(
+            msg_fanout_advance(
+                GlobalStatus::Submitted,
+                &[0, 0, 0, 1],
+                &[Prepared, Succeed, Prepared, Prepared]
+            ),
+            Advance::CallEach {
+                indices: vec![0, 2],
+                op: BranchOp::Action
+            }
+        );
+    }
+
+    #[test]
+    fn step之间保序_前一组没全成功不碰下一组() {
+        let a = msg_fanout_advance(
+            GlobalStatus::Submitted,
+            &[0, 0, 1],
+            &[Succeed, Prepared, Prepared],
+        );
+        assert_eq!(
+            a,
+            Advance::CallEach {
+                indices: vec![1],
+                op: BranchOp::Action
+            }
+        );
+        let b = msg_fanout_advance(
+            GlobalStatus::Submitted,
+            &[0, 0, 1],
+            &[Succeed, Succeed, Prepared],
+        );
+        assert_eq!(
+            b,
+            Advance::CallEach {
+                indices: vec![2],
+                op: BranchOp::Action
+            }
+        );
+    }
+
+    #[test]
+    fn 扇出的其它状态跟msg_advance一致() {
+        assert_eq!(
+            msg_fanout_advance(GlobalStatus::Submitted, &[0, 0], &[Succeed, Succeed]),
+            Advance::Finish(GlobalStatus::Succeed)
+        );
+        // 允许为空、所有主题都没订阅者：0 个分支，提交后直接完成
+        assert_eq!(
+            msg_fanout_advance(GlobalStatus::Submitted, &[], &[]),
+            Advance::Finish(GlobalStatus::Succeed)
+        );
+        for st in [
+            GlobalStatus::Prepared,
+            GlobalStatus::Aborting,
+            GlobalStatus::Succeed,
+            GlobalStatus::Failed,
+        ] {
+            assert_eq!(
+                msg_fanout_advance(st, &[0], &[Prepared]),
+                msg_advance(st, &[Prepared]),
+                "{st:?}"
+            );
+        }
     }
 }
 

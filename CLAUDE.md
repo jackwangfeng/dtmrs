@@ -16,7 +16,7 @@ Apache-2.0。只实现 DTM 的协议，不抄它的代码。
 
 ```bash
 cargo build --release                 # 二进制在 target/release/dtmrs
-cargo test --workspace                # 251 个测试（真库那部分会被跳过，见下）
+cargo test --workspace                # 278 个测试（真库那部分会被跳过，见下）
 cargo run --example embedded -p dtmrs-server   # 嵌入式模式的可运行示例
 cargo run --example workflow -p dtmrs-server   # workflow 模式（重放/断点续跑）
 
@@ -217,6 +217,14 @@ crates/
   Redis 上只对 `dtmrs_core::status_contested` 的状态真比较（要走 Lua，落终态原本是 MULTI）。
   **改 `Api` 里 abort / submit 的放行规则时必须同步改 `status_contested`**，
   `外部能改的状态必须跟api的放行规则一致` 会逐格核对。
+- **msg 按主题投递（`topic://`）在 prepare 时展开**（`dtmrs_core::expand_msg_steps`，纯函数），
+  全局事务的 payload 存展开后的 `MsgBranch` 列表（带分支号和所属 step），推进器按它调，
+  **不再按下标算分支号**（扇出是 `01-01`）。老数据靠 `serde(default)` + `fill_defaults` 兼容。
+  同一 step 的分支由 `msg_fanout_advance` 一起交出（`Advance::CallEach`），driver 并发调、
+  各自落成功 —— 一个订阅者挂了不能挡别的，`订阅者挂住时别的订阅者不用等它` /
+  `一个订阅者一直失败不能挡住别的_成功的不重发` 钉着（改回串行两条都会红，验过）。
+  订阅表 `topic_sub` 主键 (topic, url)：url 上限 512 不是随手定的 —— MySQL utf8mb4 索引
+  上限 3072 字节，`4×(128+512)` 刚好放得下。
 - **workflow 模式靠重放**：函数会被从头跑多次，已成功的分支走记忆化。改
   `workflow.rs` 时记住两条不变量：补偿必须**先于**正向动作登记（否则动作超时
   或崩溃会漏掉补偿）；分岔检测发现名字对不上时**既不能成功也不能回滚**，

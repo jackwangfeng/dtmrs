@@ -71,9 +71,24 @@ pub struct EmbeddedBuilder {
     registry: Registry,
     workflows: WorkflowRegistry,
     tick: Duration,
+    /// 代码里静态登记的主题订阅：(主题, 地址)
+    topics: Vec<(String, String)>,
 }
 
 impl EmbeddedBuilder {
+    /// 静态登记一个主题订阅：发到 `topic://主题` 的消息会投给 `url`。
+    ///
+    /// 适合单体部署（发布方和订阅方在同一个进程，`url` 多半是 `local://`）。
+    /// 拆分部署时别用这个 —— 那等于在发布方的代码里写死下游地址，
+    /// 让订阅方自己通过 [`Embedded::serve_topic_api`] 登记上来。
+    ///
+    /// 跟存储里的订阅（[`Embedded::subscribe`]、HTTP 的 subscribe）取并集。
+    /// `local://` 的订阅者在 [`start`](Self::start) 时检查是否注册了 handler。
+    pub fn subscribe(mut self, topic: &str, url: &str) -> Self {
+        self.topics.push((topic.to_string(), url.to_string()));
+        self
+    }
+
     /// 注册一个进程内分支。名字对应 `local://名字`。
     pub fn handler<F, Fut>(mut self, name: &str, f: F) -> Self
     where
@@ -111,6 +126,17 @@ impl EmbeddedBuilder {
     }
 
     pub async fn start(self) -> anyhow::Result<Embedded> {
+        for (t, u) in &self.topics {
+            if t.is_empty() || u.is_empty() || u.starts_with(dtmrs_core::MSG_TOPIC_PREFIX) {
+                anyhow::bail!("静态订阅写错了：主题 {t:?} → 地址 {u:?}");
+            }
+        }
+        // 静态订阅的 local:// 没注册的话，消息会永远投不出去（按结果未知一直重试）。
+        // 启动时就报，比上线后才发现消息没人收好查得多
+        let urls: Vec<String> = self.topics.iter().map(|(_, u)| u.clone()).collect();
+        if let Err(missing) = self.registry.check_all(&urls) {
+            anyhow::bail!("静态订阅的本地分支没注册: {}", missing.join(", "));
+        }
         let store = Store::open(&self.db).await?;
         let registry = Arc::new(self.registry);
         let workflows = Arc::new(self.workflows);
@@ -121,7 +147,8 @@ impl EmbeddedBuilder {
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(driver.clone().run_until(self.tick, stop_rx));
         Ok(Embedded {
-            api: Api::new(store.clone()),
+            api: Api::new(store.clone()).with_static_topics(self.topics),
+            servers: std::sync::Mutex::new(Vec::new()),
             store,
             registry,
             workflows,
@@ -138,6 +165,8 @@ pub struct Embedded {
     registry: Arc<Registry>,
     workflows: Arc<WorkflowRegistry>,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// [`Embedded::serve_topic_api`] 起的 HTTP 服务，shutdown 时一起停、等它们退完
+    servers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// 叫推进器体面退出的开关，见 [`Embedded::shutdown`]
     stop: tokio::sync::watch::Sender<bool>,
 }
@@ -154,6 +183,7 @@ impl Embedded {
             registry: Registry::new(),
             workflows: WorkflowRegistry::new(),
             tick: Duration::from_millis(200),
+            topics: Vec::new(),
         }
     }
 
@@ -221,8 +251,10 @@ impl Embedded {
             tc: self,
             gid: gid.to_string(),
             actions: Vec::new(),
+            payloads: Vec::new(),
             query_prepared: String::new(),
             grace_secs: None,
+            allow_empty_topic: false,
         }
     }
 
@@ -328,6 +360,74 @@ impl Embedded {
         &self.store
     }
 
+    // ---------------- 主题订阅 ----------------
+
+    /// 把 `url` 订阅到主题（存进存储，重启后还在）。重复订阅报 `this url exists`。
+    /// 判断全在 [`Api`]，这里只多一条 `local://` 没注册的自查
+    pub async fn subscribe(&self, topic: &str, url: &str, remark: &str) -> anyhow::Result<()> {
+        self.check_local(&[url])?;
+        self.api.subscribe(topic, url, remark).await?;
+        Ok(())
+    }
+
+    pub async fn unsubscribe(&self, topic: &str, url: &str) -> anyhow::Result<()> {
+        self.api.unsubscribe(topic, url).await?;
+        Ok(())
+    }
+
+    /// 列订阅（`None` 列全部），静态登记的备注是 `(static)`
+    pub async fn subscriptions(
+        &self,
+        topic: Option<&str>,
+    ) -> anyhow::Result<Vec<dtmrs_store::TopicSub>> {
+        Ok(self.api.list_topic_subs(topic).await?)
+    }
+
+    /// `allow_empty_topic` 放行了多少次「主题没有订阅者」（进程内累计）。
+    /// 一直在涨说明订阅方没登记上，消息在靠对账兜底
+    pub fn empty_topic_count(&self) -> u64 {
+        self.api.empty_topic_count()
+    }
+
+    /// 在 `addr` 上开放**主题订阅接口**，让订阅方自己登记上来。
+    ///
+    /// 拆分部署时用：发布方进程里嵌着协调器，订阅方启动时调这里的
+    /// `GET /api/dtmsvr/subscribe?topic=..&url=..`（失败了自己重试），
+    /// 发布方的代码和配置里都不出现下游地址。
+    ///
+    /// - 只开放 subscribe / unsubscribe / `DELETE /api/dtmsvr/topic/{名字}` /
+    ///   queryKV / scanKV，外加不鉴权的 `/health`。prepare / submit 那些不开放
+    /// - 每个请求必须带 `Authorization: Bearer <token>`，`token` 不能为空
+    /// - 返回实际监听的地址（`addr` 端口给 0 时用来拿真实端口）
+    /// - 跟着 [`shutdown`](Self::shutdown) 一起停，停干净才返回
+    pub async fn serve_topic_api(
+        &self,
+        addr: &str,
+        token: &str,
+    ) -> anyhow::Result<std::net::SocketAddr> {
+        if token.is_empty() {
+            anyhow::bail!("订阅接口必须设共享密钥：不鉴权等于谁都能把消息改发到任意地址");
+        }
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let local = listener.local_addr()?;
+        let router =
+            crate::http::topic_router(crate::http::App::new(self.api.clone()), token.to_string());
+        let mut stop = self.stop.subscribe();
+        let h = tokio::spawn(async move {
+            let r = axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = stop.wait_for(|v| *v).await;
+                })
+                .await;
+            if let Err(e) = r {
+                tracing::warn!(error = %e, "订阅接口退出");
+            }
+        });
+        self.servers.lock().unwrap().push(h);
+        tracing::info!(%local, "主题订阅接口已开放");
+        Ok(local)
+    }
+
     /// 正经关闭：停推进器、等它退干净，再把存储连接关完才返回。
     ///
     /// 跟 drop 的区别：drop 只 abort 推进器，连接池丢掉就不管了 —— sqlite 的连接
@@ -341,8 +441,18 @@ impl Embedded {
     ///
     /// 未终结的事务照样留在库里，下次 start 接着推，跟 drop 一样。
     pub async fn shutdown(mut self) {
+        // send_replace 而不是 send：没有接收端时 send 不会更新值
+        self.stop.send_replace(true);
+        // 先停对外的订阅接口：它也在用存储，不停的话池子关不干净
+        let servers: Vec<_> = std::mem::take(&mut *self.servers.lock().unwrap());
+        for mut h in servers {
+            if tokio::time::timeout(SHUTDOWN_GRACE, &mut h).await.is_err() {
+                tracing::warn!("订阅接口 {SHUTDOWN_GRACE:?} 内没停下，强制 abort");
+                h.abort();
+                let _ = h.await;
+            }
+        }
         if let Some(mut t) = self.task.take() {
-            let _ = self.stop.send(true);
             if tokio::time::timeout(SHUTDOWN_GRACE, &mut t).await.is_err() {
                 tracing::warn!("推进器 {SHUTDOWN_GRACE:?} 内没停下（分支卡住？），强制 abort");
                 t.abort();
@@ -361,6 +471,11 @@ impl Drop for Embedded {
         // 模拟进程退出：停掉推进器。未终结的事务留在库里，下次 start 会接着推
         if let Some(t) = self.task.take() {
             t.abort();
+        }
+        if let Ok(mut v) = self.servers.lock() {
+            for h in v.drain(..) {
+                h.abort();
+            }
         }
     }
 }
@@ -562,15 +677,42 @@ pub struct MsgBuilder<'a> {
     tc: &'a Embedded,
     gid: String,
     actions: Vec<String>,
+    payloads: Vec<String>,
     query_prepared: String,
     grace_secs: Option<i64>,
+    allow_empty_topic: bool,
 }
 
 impl MsgBuilder<'_> {
-    /// 加一条要送达的消息（正向分支）。msg 没有补偿：送不到就一直重试。
-    pub fn action(mut self, target: &str) -> Self {
+    /// 加一条带请求体的消息
+    pub fn action_with(mut self, target: &str, payload: &str) -> Self {
         self.actions.push(target.to_string());
+        self.payloads.push(payload.to_string());
         self
+    }
+
+    /// 发到主题：prepare 时展开成当时的全部订阅者，各自收到同一份 `payload`。
+    /// 等价于 `action_with("topic://主题", payload)`（同 DTM 的 `AddTopic`）。
+    ///
+    /// 主题没有订阅者时 prepare 报 `topic not found`，除非
+    /// [`allow_empty_topic`](Self::allow_empty_topic)。
+    pub fn topic(self, topic: &str, payload: &str) -> Self {
+        self.action_with(&format!("{}{topic}", dtmrs_core::MSG_TOPIC_PREFIX), payload)
+    }
+
+    /// 主题没有订阅者时 prepare 照常成功（这一步没人收），而不是报错。
+    ///
+    /// 给「晚到或漏一次可以接受、但不能挡住业务」的通知类消息用：发送方
+    /// 多半是在业务本地事务里 prepare 的，报错会把业务本身带失败。
+    /// 放行时打 WARN、[`Embedded::empty_topic_count`] 加一。**要配对账兜底**
+    pub fn allow_empty_topic(mut self) -> Self {
+        self.allow_empty_topic = true;
+        self
+    }
+
+    /// 加一条要送达的消息（正向分支）。msg 没有补偿：送不到就一直重试。
+    pub fn action(self, target: &str) -> Self {
+        self.action_with(target, "")
     }
 
     /// 回查地址。见类型文档。
@@ -592,14 +734,24 @@ impl MsgBuilder<'_> {
         let mut t: Vec<&str> = self.actions.iter().map(String::as_str).collect();
         t.push(&self.query_prepared);
         self.tc.check_local(&t)?;
+        // 全都没带 payload 时按「不带」传，跟 HTTP 不给 payloads 字段一致
+        let payloads = if self.payloads.iter().all(String::is_empty) {
+            Vec::new()
+        } else {
+            self.payloads
+        };
         self.tc
             .api
-            .prepare(
+            .prepare_with(
                 &self.gid,
                 "msg",
                 &self.actions,
                 &self.query_prepared,
                 self.grace_secs,
+                &crate::api::PrepareOpts {
+                    payloads,
+                    allow_empty_topic: self.allow_empty_topic,
+                },
             )
             .await?;
         Ok(())

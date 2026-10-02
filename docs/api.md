@@ -114,6 +114,8 @@ gRPC：`Tc.Submit(SubmitRequest) → Empty`
 | `actions` | msg 必填 | `[]` | 正向分支列表（msg 没有补偿） |
 | `query_prepared` | **msg 必填** | | 回查地址，见下 |
 | `grace_secs` | 否 | `10` | 回查前的宽限秒数 |
+| `payloads` | 否 | `[]` | msg 每个 action 的请求体，跟 `actions` 等长（字段名同 DTM）。不给则分支收到 `{}` |
+| `allow_empty_topic` | 否 | `false` | `topic://` 没有订阅者时放行而不是报错，见[按主题投递](#按主题投递topic) |
 
 > ⚠ **msg 不给 `query_prepared` 会被直接拒绝。** 客户端崩在 prepare 和 submit 之间时，没有回查地址就没人能决断这单——猜「已提交」会重复执行，猜「没提交」会丢单。
 
@@ -126,6 +128,72 @@ gRPC：`Tc.Submit(SubmitRequest) → Empty`
 | `ONGOING`（425）/ 超时 | **不能当成「没提交」** → 退避重试 |
 
 gRPC：`Tc.Prepare(PrepareRequest) → Empty`
+
+### 按主题投递（topic）
+
+`actions` 里写 `topic://名字`，就不用在发送方写死下游地址：订阅方自己登记到主题上，
+发送方只认主题名。协议、接口、错误文案都对齐 DTM（`msg.AddTopic` 就是拼这个前缀）。
+
+```json
+{
+  "gid": "stock-7-a1b2c3",
+  "trans_type": "msg",
+  "actions": ["topic://stock.zero_crossing"],
+  "payloads": ["{\"store_id\":3,\"sku_ids\":[11,12]}"],
+  "query_prepared": "http://inventory/query",
+  "allow_empty_topic": true
+}
+```
+
+**语义（每条都有测试钉着，见 `crates/dtmrs-server/tests/topic.rs`）：**
+
+| 情形 | 行为 |
+|---|---|
+| 展开时机 | **prepare 那一刻**展开成当时的全部订阅者，各自一个分支、收到同一份 payload。之后的订阅 / 退订不影响这条消息 |
+| 分支号 | 多个订阅者是 `01-01`、`01-02`……，只有一个时是 `01`（同 DTM）。订阅方的屏障按 gid + branch_id 去重，互不冲突 |
+| 一个订阅者一直失败 | **不挡别的**：同一主题的订阅者每轮并发投递、各自记成败，成功的不重发，失败的单独退避重试 |
+| 订阅者返回 `FAILURE` | 一直重试（msg 没有补偿）。⚠ 跟 DTM 不同：DTM 会把这个分支标成 failed 就算完成 |
+| 多个 action | action 之间仍然保序：前一个 action 的订阅者全部送达，才轮到下一个 |
+| 订阅变更生效 | 下一次 prepare 立刻生效（不缓存；DTM 要等 `ConfigUpdateInterval`，默认 3 秒） |
+| **后来才订阅的** | **不补发**历史消息（同 DTM）。订阅生效之前发出的消息它收不到 —— 需要的话配一个对账兜底 |
+| 进程崩溃 | 分支在 prepare 时就落库了，重启后照常推，已送达的不重发 |
+| **主题没有订阅者** | 默认 prepare 失败：`topic not found`（同 DTM）—— 二阶段消息的意义就是保证送达，悄悄丢掉比报错糟。`allow_empty_topic: true` 时照常受理、这一步展开成 0 个分支、提交后直接完成，打一条 WARN 并计数（嵌入式 `Embedded::empty_topic_count()` / C 的 `dtmrs_empty_topic_count`） |
+
+> 什么时候开 `allow_empty_topic`：发送方是在**业务本地事务里** prepare 的，而这条消息只是
+> 通知（晚到、漏一次都能靠对账补）。不开的话订阅方没登记就会让 prepare 失败，
+> 业务本身跟着失败 —— 一个下游没到位，把上游堵死了。
+
+#### 订阅管理
+
+都走 **query string**（同 DTM），成功返回 `{"dtm_result":"SUCCESS"}`。
+
+| 接口 | 参数 | 失败时的 message（同 DTM 原文） |
+|---|---|---|
+| `GET /api/dtmsvr/subscribe` | `topic`、`url`、`remark`（可选） | `empty topic` / `empty url` / `this url exists` |
+| `GET /api/dtmsvr/unsubscribe` | `topic`、`url` | `no such a topic` / `no such an url `（末尾空格是原文） |
+| `DELETE /api/dtmsvr/topic/{名字}` | | `storage: NotFound` |
+| `GET /api/dtmsvr/queryKV` | `cat=topics`，`key`（可选，某个主题） | |
+| `GET /api/dtmsvr/scanKV` | `cat=topics`，`position`（上一页最后的主题名）、`limit`（默认 100） | |
+
+`queryKV` / `scanKV` 返回 DTM 的 KV 形状：`{"kv":[{"id","cat":"topics","k":主题,"v":"[{\"url\":..,\"remark\":..}]","version","create_time","update_time"}]}`，
+**`v` 是 JSON 字符串**（DTM 原样如此）；`scanKV` 另带 `next_position`，为空表示到底。
+
+跟 DTM 的状态码不同：DTM 一律 500，这里参数错 400、找不到 404 —— 都是非 2xx，
+按「失败」处理的客户端不受影响。
+
+gRPC：`Tc.Subscribe` / `Tc.Unsubscribe` / `Tc.DeleteTopic`（`TopicRequest{topic, url, remark}`），
+查询走 HTTP（DTM 的 gRPC 也没有查询）。
+
+#### 嵌入式：让订阅方自己登记
+
+发布方进程里嵌着协调器时，用 `Embedded::serve_topic_api(地址, 共享密钥)`
+（C 是 `dtmrs_serve_topic_api`）在内网端口上开放**只有上面这几个订阅接口**的 HTTP 服务，
+每个请求要带 `Authorization: Bearer <密钥>`。订阅方启动时调 subscribe 把自己登记上去
+（拿到 `this url exists` 说明已经在了，按成功处理）。这样发布方的代码和配置里都不出现下游地址。
+
+单体部署（发布方和订阅方在同一个进程）用 `EmbeddedBuilder::subscribe(主题, "local://函数")`
+（C 是 start 之前调 `dtmrs_topic_static`）静态登记就够了。静态订阅跟存储里的取并集、排在前面，
+不能通过接口退订。
 
 ---
 

@@ -9,7 +9,7 @@
 //! 只有一半受测试保护。搬过来之后 `router()` 可导出，两边就能用同一组
 //! 用例做等价性测试（见 tests/http.rs 的「HTTP 与 gRPC 等价」那几个）。
 
-use crate::api::{Api, ApiError, RegisterBranch, TransView};
+use crate::api::{Api, ApiError, PrepareOpts, RegisterBranch, TransView};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -54,6 +54,50 @@ struct PrepareReq {
     /// msg 用：回查前的宽限秒数，默认 10
     #[serde(default)]
     grace_secs: Option<i64>,
+    /// msg 用：每个 action 的请求体（字段名同 DTM）。空表示都不带
+    #[serde(default)]
+    payloads: Vec<String>,
+    /// msg 用：`topic://` 没有订阅者时放行而不是报错（dtmrs 扩展）
+    #[serde(default)]
+    allow_empty_topic: bool,
+}
+
+/// subscribe / unsubscribe 的参数。**走 query string**，跟 DTM 一样（GET 请求）
+#[derive(Deserialize)]
+struct TopicReq {
+    #[serde(default)]
+    topic: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    remark: String,
+}
+
+/// queryKV / scanKV 的参数（DTM 的通用 KV 接口，这里只有 `cat=topics` 一类）
+#[derive(Deserialize)]
+struct KvReq {
+    #[serde(default)]
+    cat: String,
+    #[serde(default)]
+    key: String,
+    /// scanKV 的游标：上一页最后一个主题名
+    #[serde(default)]
+    position: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// DTM 的 KV 条目。`v` 是 JSON **字符串**（`[{"url":..,"remark":..}]`），不是对象 ——
+/// DTM 原样存原样吐，客户端是再解一次的
+#[derive(Serialize)]
+struct KvItem {
+    id: usize,
+    cat: &'static str,
+    k: String,
+    v: String,
+    version: i64,
+    create_time: i64,
+    update_time: i64,
 }
 
 /// 分支登记。TCC 用 confirm/cancel，XA 用 commit/rollback。
@@ -158,6 +202,57 @@ pub fn router_with_auth(
         .layer(middleware::from_fn_with_state(auth, crate::auth::guard))
 }
 
+/// 主题订阅的那几个接口（DTM 的路径和方法）。完整 router 和
+/// [`topic_router`] 共用这一份，免得两处漂移
+fn topic_routes() -> Router<App> {
+    Router::new()
+        .route("/api/dtmsvr/subscribe", get(subscribe))
+        .route("/api/dtmsvr/unsubscribe", get(unsubscribe))
+        .route(
+            "/api/dtmsvr/topic/{topic}",
+            axum::routing::delete(delete_topic),
+        )
+        .route("/api/dtmsvr/queryKV", get(query_kv))
+        .route("/api/dtmsvr/scanKV", get(scan_kv))
+}
+
+/// **只有**主题订阅接口的 router，带共享密钥认证。
+///
+/// 给嵌入式用：发布方进程里嵌着协调器，订阅方要在启动时自己登记上来 ——
+/// 订阅关系由订阅方维护，发布方的代码和配置里都不出现下游地址。
+/// 只开放订阅相关的接口：prepare / submit / abort 这些不该被别的服务随手调。
+///
+/// 请求必须带 `Authorization: Bearer <token>`（定长比较）。`/health` 不需要。
+/// `token` 为空会 panic —— 不带认证的订阅入口等于谁都能把消息改发到任意地址，
+/// 调用方（[`crate::embedded::Embedded::serve_topic_api`]）会先挡掉空值。
+pub fn topic_router(app: App, token: String) -> Router {
+    assert!(!token.is_empty(), "topic_router 必须带共享密钥");
+    let token = std::sync::Arc::new(token);
+    topic_routes()
+        .with_state(app)
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let token = token.clone();
+                async move {
+                    use axum::response::IntoResponse;
+                    let ok = req
+                        .headers()
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(crate::auth::Auth::bearer)
+                        .is_some_and(|p| crate::auth::ct_eq(p, &token));
+                    if ok {
+                        next.run(req).await
+                    } else {
+                        (StatusCode::UNAUTHORIZED, Reply::err("unauthorized")).into_response()
+                    }
+                }
+            },
+        ))
+        // 健康检查在认证层外面
+        .route("/health", get(|| async { "ok" }))
+}
+
 fn routes(app: App) -> Router {
     Router::new()
         .route("/api/dtmsvr/newGid", get(new_gid))
@@ -168,6 +263,7 @@ fn routes(app: App) -> Router {
         .route("/api/dtmsvr/retry", post(retry))
         .route("/api/dtmsvr/query", get(query))
         .route("/api/dtmsvr/all", get(all))
+        .merge(topic_routes())
         .route("/health", get(|| async { "ok" }))
         // 管理台。单文件内嵌，没有构建步骤也没有外部依赖 ——
         // 内网和离线环境都能直接用
@@ -187,15 +283,125 @@ async fn submit(State(app): State<App>, Json(req): Json<SubmitReq>) -> (StatusCo
 async fn prepare(State(app): State<App>, Json(req): Json<PrepareReq>) -> (StatusCode, Json<Reply>) {
     http_result(
         app.api
-            .prepare(
+            .prepare_with(
                 &req.gid,
                 &req.trans_type,
                 &req.actions,
                 &req.query_prepared,
                 req.grace_secs,
+                &PrepareOpts {
+                    payloads: req.payloads,
+                    allow_empty_topic: req.allow_empty_topic,
+                },
             )
             .await,
     )
+}
+
+async fn subscribe(State(app): State<App>, Query(q): Query<TopicReq>) -> (StatusCode, Json<Reply>) {
+    http_result(app.api.subscribe(&q.topic, &q.url, &q.remark).await)
+}
+
+async fn unsubscribe(
+    State(app): State<App>,
+    Query(q): Query<TopicReq>,
+) -> (StatusCode, Json<Reply>) {
+    http_result(app.api.unsubscribe(&q.topic, &q.url).await)
+}
+
+async fn delete_topic(
+    State(app): State<App>,
+    axum::extract::Path(topic): axum::extract::Path<String>,
+) -> (StatusCode, Json<Reply>) {
+    http_result(app.api.delete_topic(&topic).await)
+}
+
+/// 把订阅按主题聚成 DTM 的 KV 条目
+async fn topic_kvs(app: &App, key: &str) -> Result<Vec<KvItem>, ApiError> {
+    if !key.is_empty() && key.len() > dtmrs_store::TOPIC_LEN {
+        return Ok(Vec::new());
+    }
+    let subs = app
+        .api
+        .list_topic_subs((!key.is_empty()).then_some(key))
+        .await?;
+    let mut out: Vec<KvItem> = Vec::new();
+    for s in subs {
+        let entry = serde_json::json!({"url": s.url, "remark": s.remark});
+        match out.last_mut() {
+            Some(last) if last.k == s.topic => {
+                let mut v: Vec<serde_json::Value> =
+                    serde_json::from_str(&last.v).unwrap_or_default();
+                v.push(entry);
+                last.v = serde_json::Value::from(v).to_string();
+                last.create_time = last.create_time.min(s.create_time);
+                last.update_time = last.update_time.max(s.create_time);
+            }
+            _ => out.push(KvItem {
+                id: out.len() + 1,
+                cat: "topics",
+                k: s.topic,
+                v: serde_json::Value::from(vec![entry]).to_string(),
+                version: 1,
+                create_time: s.create_time,
+                update_time: s.create_time,
+            }),
+        }
+    }
+    Ok(out)
+}
+
+fn kv_cat_ok(cat: &str) -> Result<(), ApiError> {
+    if cat == "topics" {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "不支持的 cat：{cat}（只有 topics）"
+        )))
+    }
+}
+
+async fn query_kv(State(app): State<App>, Query(q): Query<KvReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let r = async {
+        kv_cat_ok(&q.cat)?;
+        topic_kvs(&app, &q.key).await
+    }
+    .await;
+    match r {
+        Ok(kv) => Json(serde_json::json!({ "kv": kv })).into_response(),
+        Err(e) => http_err(e).into_response(),
+    }
+}
+
+/// 按主题名翻页。`next_position` 为空表示到底了（同 DTM）
+async fn scan_kv(State(app): State<App>, Query(q): Query<KvReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let r = async {
+        kv_cat_ok(&q.cat)?;
+        topic_kvs(&app, "").await
+    }
+    .await;
+    match r {
+        Ok(all) => {
+            let limit = q.limit.unwrap_or(100).max(1);
+            let page: Vec<KvItem> = all
+                .into_iter()
+                .filter(|kv| q.position.is_empty() || kv.k > q.position)
+                .take(limit + 1)
+                .collect();
+            let more = page.len() > limit;
+            let mut page = page;
+            page.truncate(limit);
+            let next = if more {
+                page.last().map(|kv| kv.k.clone()).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            Json(serde_json::json!({ "kv": page, "next_position": next })).into_response()
+        }
+        Err(e) => http_err(e).into_response(),
+    }
 }
 
 async fn register_branch(

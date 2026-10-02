@@ -42,6 +42,16 @@ const COOKIE: &str = "dtmrs_session";
 /// 多实例部署时每个实例各自刷新，所以延迟是各自独立的、不会叠加。
 const TOKEN_CACHE_TTL: Duration = Duration::from_secs(10);
 
+/// 定长时间比较两个令牌：耗时不随「前面匹配了几个字节」变化，没法逐字节试出来
+pub fn ct_eq(presented: &str, expected: &str) -> bool {
+    let (a, b) = (presented.as_bytes(), expected.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(1));
+    }
+    diff == 0
+}
+
 pub struct Auth {
     /// 管理台登录用。为空表示不提供登录页（只用 token 认证）
     user: String,
@@ -141,15 +151,7 @@ impl Auth {
 
     /// 校验业务端的 Bearer token。定长时间比较，理由同 `matches`
     pub fn token_ok(&self, presented: &str) -> bool {
-        if self.token.is_empty() {
-            return false;
-        }
-        let (a, b) = (presented.as_bytes(), self.token.as_bytes());
-        let mut diff = a.len() ^ b.len();
-        for i in 0..a.len().max(b.len()) {
-            diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(1));
-        }
-        diff == 0
+        !self.token.is_empty() && ct_eq(presented, &self.token)
     }
 
     /// 从 `Authorization: Bearer xxx` 里取 token。gRPC 侧的 metadata 同名，复用

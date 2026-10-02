@@ -22,6 +22,7 @@ Apache-2.0. Nothing blocks commercial or closed-source adoption.
 * **Embeddable**: link the TC in as a library; branches can be in-process functions
 * **Callable from other languages** via the C ABI: Python, Node, Java, C (Rust natively)
 * **Sub-transaction barrier** for idempotence / empty rollback / suspension, in 5 languages
+* **Topic delivery** for two-phase messages (`topic://name`, DTM-compatible): subscribers register themselves, each one retried independently — see [docs/api.md](docs/api.md#按主题投递topic)
 * Multi-instance with DB leases, crash recovery, exponential backoff, admin console
 * No AT mode — by choice, see [Seata migration](docs/choosing-a-mode.md#从-seata-过来的at-模式对应哪个)
 

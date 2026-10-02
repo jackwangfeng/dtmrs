@@ -11,6 +11,7 @@
 #define DTMRS_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -116,6 +117,48 @@ int dtmrs_xa_register(DtmrsTc *tc, const char *gid, const char *branch_id,
  * grace_secs：prepare 后多久开始回查，负数用默认（10 秒）。 */
 int dtmrs_msg_prepare(DtmrsTc *tc, const char *gid, const char *actions_json,
                       const char *query_prepared, int grace_secs);
+
+/* ---------------- 按主题投递（0.12） ----------------
+ *
+ * actions 里写 "topic://名字" 就是发到主题：prepare 时展开成**当时**的全部订阅者，
+ * 每个订阅者一个分支（分支号 01-01、01-02…，只有一个订阅者时是 01），收到同一份 payload。
+ * 之后的订阅 / 退订不影响已 prepare 的消息，后来才订阅的也**不补发**历史消息 ——
+ * 订阅生效之前那段空窗要靠对账兜底。
+ *
+ * 同一主题的订阅者**并发投递、各自重试**：一个一直失败不挡别的，成功的不重发。
+ * 不同 action 之间仍按顺序（前一个的订阅者全送达才轮到下一个）。
+ *
+ * 主题没有订阅者：默认 prepare 失败（last_error 是 "topic not found"，同 DTM）。
+ * 带 DTMRS_MSG_ALLOW_EMPTY_TOPIC 时照常成功（这一步没人收），打 WARN 并计数。 */
+
+#define DTMRS_MSG_ALLOW_EMPTY_TOPIC 1
+
+/* 同 dtmrs_msg_prepare，多了：
+ * payloads_json：跟 actions 等长的字符串数组（每个 action 的请求体），NULL 表示都不带；
+ * flags：DTMRS_MSG_ALLOW_EMPTY_TOPIC 或 0。 */
+int dtmrs_msg_prepare_ex(DtmrsTc *tc, const char *gid, const char *actions_json,
+                         const char *payloads_json, const char *query_prepared,
+                         int grace_secs, int flags);
+
+/* **start 之前**静态登记订阅（单体部署用）。local:// 的订阅者在 start 时检查是否注册了 */
+int dtmrs_topic_static(DtmrsTc *tc, const char *topic, const char *url);
+
+/* **start 之后**订阅 / 退订（存进存储，重启后还在）。remark 可为 NULL。
+ * 重复订阅失败（"this url exists"），退订不存在的失败（"no such a topic" / "no such an url "） */
+int dtmrs_subscribe(DtmrsTc *tc, const char *topic, const char *url, const char *remark);
+int dtmrs_unsubscribe(DtmrsTc *tc, const char *topic, const char *url);
+
+/* **start 之后**在 addr 开放主题订阅接口，让订阅方自己登记（拆分部署用）。
+ * addr 如 "10.0.0.5:36800"，端口给 0 自动分配。返回实际端口，失败返回 DTMRS_ERR。
+ * 只开放 GET /api/dtmsvr/subscribe?topic=&url=&remark= 、GET /api/dtmsvr/unsubscribe 、
+ * DELETE /api/dtmsvr/topic/{名字} 、GET /api/dtmsvr/queryKV?cat=topics[&key=] 、
+ * GET /api/dtmsvr/scanKV 和不鉴权的 /health。
+ * 请求必须带 "Authorization: Bearer <token>"，token 不能为空。随 dtmrs_close 一起停。 */
+int dtmrs_serve_topic_api(DtmrsTc *tc, const char *addr, const char *token);
+
+/* DTMRS_MSG_ALLOW_EMPTY_TOPIC 放行了多少次「主题没有订阅者」（进程内累计）。
+ * 一直在涨说明订阅方没登记上 —— 适合接进监控 */
+uint64_t dtmrs_empty_topic_count(DtmrsTc *tc);
 
 /* tcc / xa / msg 的二阶段提交。幂等。 */
 int dtmrs_submit(DtmrsTc *tc, const char *gid);

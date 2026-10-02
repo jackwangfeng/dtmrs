@@ -155,6 +155,8 @@ pub struct DtmrsTc {
     pending_pull: Option<Vec<String>>,
     /// start 之前收集的 workflow 函数
     pending_wf: Option<Vec<(String, WorkflowPtr)>>,
+    /// start 之前收集的静态主题订阅 (主题, 地址)
+    pending_topics: Option<Vec<(String, String)>>,
     db: String,
     tc: Option<Embedded>,
     pull: Arc<PullQueue>,
@@ -297,6 +299,7 @@ pub extern "C" fn dtmrs_open(db_url: *const c_char) -> *mut DtmrsTc {
         rt,
         pending: Some(Vec::new()),
         pending_pull: Some(Vec::new()),
+        pending_topics: Some(Vec::new()),
         pending_wf: Some(Vec::new()),
         db: db.to_string(),
         tc: None,
@@ -495,6 +498,9 @@ pub extern "C" fn dtmrs_start(tc: *mut DtmrsTc) -> c_int {
     let pending_wf = h.pending_wf.take().unwrap_or_default();
 
     let mut b = Embedded::builder(&h.db).tick(Duration::from_millis(50));
+    for (t, u) in h.pending_topics.take().unwrap_or_default() {
+        b = b.subscribe(&t, &u);
+    }
 
     for (name, wp) in pending_wf {
         b = b.workflow(&name, move |ctx: WorkflowCtx| async move {
@@ -816,6 +822,191 @@ pub extern "C" fn dtmrs_msg_prepare(
         b = b.grace_secs(grace_secs as i64);
     }
     run(h, b.prepare())
+}
+
+/// `dtmrs_msg_prepare_ex` 的 flags：主题没有订阅者时放行而不是报 `topic not found`
+pub const DTMRS_MSG_ALLOW_EMPTY_TOPIC: c_int = 1;
+
+/// 同 `dtmrs_msg_prepare`，多两样：
+///
+/// - `payloads_json`：跟 actions 等长的字符串数组，每个 action 的请求体；
+///   传 NULL 表示都不带。`topic://名字` 那一步的所有订阅者收到同一份
+/// - `flags`：`DTMRS_MSG_ALLOW_EMPTY_TOPIC` —— 主题没有订阅者时 prepare 照常成功
+///   （这一步没人收），而不是失败。通知类消息用，免得下游没登记就把业务堵死
+///
+/// actions 里写 `topic://名字` 就是发到主题，prepare 时展开成当时的全部订阅者。
+#[no_mangle]
+pub extern "C" fn dtmrs_msg_prepare_ex(
+    tc: *mut DtmrsTc,
+    gid: *const c_char,
+    actions_json: *const c_char,
+    payloads_json: *const c_char,
+    query_prepared: *const c_char,
+    grace_secs: c_int,
+    flags: c_int,
+) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
+    let (Some(gid), Some(js), Some(q)) = (unsafe {
+        (
+            cstr(gid, "gid"),
+            cstr(actions_json, "actions_json"),
+            cstr(query_prepared, "query_prepared"),
+        )
+    }) else {
+        return DTMRS_ERR;
+    };
+    let actions: Vec<String> = match serde_json::from_str(js) {
+        Ok(v) => v,
+        Err(e) => {
+            set_err(format!("actions_json 解析失败（要的是字符串数组）: {e}"));
+            return DTMRS_ERR;
+        }
+    };
+    let payloads: Vec<String> = if payloads_json.is_null() {
+        vec![String::new(); actions.len()]
+    } else {
+        let Some(pj) = (unsafe { cstr(payloads_json, "payloads_json") }) else {
+            return DTMRS_ERR;
+        };
+        match serde_json::from_str(pj) {
+            Ok(v) => v,
+            Err(e) => {
+                set_err(format!("payloads_json 解析失败（要的是字符串数组）: {e}"));
+                return DTMRS_ERR;
+            }
+        }
+    };
+    if payloads.len() != actions.len() {
+        set_err(format!(
+            "payloads 有 {} 个，跟 {} 个 action 对不上",
+            payloads.len(),
+            actions.len()
+        ));
+        return DTMRS_ERR;
+    }
+    let inner = h.tc.as_ref().unwrap();
+    let mut b = inner.msg(gid).query_prepared(q);
+    for (a, p) in actions.iter().zip(&payloads) {
+        b = b.action_with(a, p);
+    }
+    if grace_secs >= 0 {
+        b = b.grace_secs(grace_secs as i64);
+    }
+    if flags & DTMRS_MSG_ALLOW_EMPTY_TOPIC != 0 {
+        b = b.allow_empty_topic();
+    }
+    run(h, b.prepare())
+}
+
+/// **start 之前**静态登记一个主题订阅（同 Rust 的 `EmbeddedBuilder::subscribe`）。
+/// 单体部署用；拆分部署让订阅方通过 `dtmrs_serve_topic_api` 自己登记
+#[no_mangle]
+pub extern "C" fn dtmrs_topic_static(
+    tc: *mut DtmrsTc,
+    topic: *const c_char,
+    url: *const c_char,
+) -> c_int {
+    clear_err();
+    let Some(h) = (unsafe { tc.as_mut() }) else {
+        set_err("句柄是空指针");
+        return DTMRS_ERR;
+    };
+    let (Some(t), Some(u)) = (unsafe { (cstr(topic, "topic"), cstr(url, "url")) }) else {
+        return DTMRS_ERR;
+    };
+    match h.pending_topics.as_mut() {
+        Some(v) => {
+            v.push((t.to_string(), u.to_string()));
+            DTMRS_OK
+        }
+        None => {
+            set_err("已经 start 了，静态订阅要在 start 之前登记；运行时用 dtmrs_subscribe");
+            DTMRS_ERR
+        }
+    }
+}
+
+/// **start 之后**订阅（存进存储，重启后还在）。重复订阅报 `this url exists`
+#[no_mangle]
+pub extern "C" fn dtmrs_subscribe(
+    tc: *mut DtmrsTc,
+    topic: *const c_char,
+    url: *const c_char,
+    remark: *const c_char,
+) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
+    let (Some(t), Some(u)) = (unsafe { (cstr(topic, "topic"), cstr(url, "url")) }) else {
+        return DTMRS_ERR;
+    };
+    let r = if remark.is_null() {
+        ""
+    } else {
+        match unsafe { cstr(remark, "remark") } {
+            Some(r) => r,
+            None => return DTMRS_ERR,
+        }
+    };
+    run(h, h.tc.as_ref().unwrap().subscribe(t, u, r))
+}
+
+#[no_mangle]
+pub extern "C" fn dtmrs_unsubscribe(
+    tc: *mut DtmrsTc,
+    topic: *const c_char,
+    url: *const c_char,
+) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
+    let (Some(t), Some(u)) = (unsafe { (cstr(topic, "topic"), cstr(url, "url")) }) else {
+        return DTMRS_ERR;
+    };
+    run(h, h.tc.as_ref().unwrap().unsubscribe(t, u))
+}
+
+/// **start 之后**在 `addr`（如 `"10.0.0.5:36800"`，端口给 0 自动分配）开放主题订阅接口，
+/// 让订阅方自己登记。返回实际端口，失败返回 `DTMRS_ERR`。
+///
+/// 只开放 subscribe / unsubscribe / DELETE topic / queryKV / scanKV 和 /health；
+/// 请求必须带 `Authorization: Bearer <token>`，`token` 不能为空。
+/// 随 `dtmrs_close` 一起停，停干净才返回。
+#[no_mangle]
+pub extern "C" fn dtmrs_serve_topic_api(
+    tc: *mut DtmrsTc,
+    addr: *const c_char,
+    token: *const c_char,
+) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
+    let (Some(a), Some(t)) = (unsafe { (cstr(addr, "addr"), cstr(token, "token")) }) else {
+        return DTMRS_ERR;
+    };
+    match h.rt.block_on(h.tc.as_ref().unwrap().serve_topic_api(a, t)) {
+        Ok(local) => c_int::from(local.port()),
+        Err(e) => {
+            set_err(format!("{e}"));
+            DTMRS_ERR
+        }
+    }
+}
+
+/// `DTMRS_MSG_ALLOW_EMPTY_TOPIC` 放行了多少次「主题没有订阅者」。没 start 返回 0。
+/// 一直在涨说明订阅方没登记上，消息在靠对账兜底 —— 适合接进监控
+#[no_mangle]
+pub extern "C" fn dtmrs_empty_topic_count(tc: *mut DtmrsTc) -> u64 {
+    match unsafe { tc.as_ref() }.and_then(|h| h.tc.as_ref()) {
+        Some(e) => e.empty_topic_count(),
+        None => 0,
+    }
 }
 
 /// 二阶段提交 tcc / xa / msg：一阶段全成功了，交给 TC 推。幂等。
@@ -1904,6 +2095,143 @@ mod tests {
         assert_eq!(wait(tc, "ffi-msg"), "succeed");
         assert_eq!(*log.lock().unwrap(), ["act@01", "act@02"]);
         dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    extern "C" fn pay_handler(
+        _g: *const c_char,
+        b: *const c_char,
+        _o: *const c_char,
+        p: *const c_char,
+        ud: *mut c_void,
+    ) -> c_int {
+        let log = unsafe { &*(ud as *const Mutex<Vec<String>>) };
+        let b = unsafe { CStr::from_ptr(b) }.to_str().unwrap();
+        let p = unsafe { CStr::from_ptr(p) }.to_str().unwrap();
+        log.lock().unwrap().push(format!("pay@{b}:{p}"));
+        DTMRS_SUCCESS
+    }
+
+    #[test]
+    fn c接口按主题投递_静态和动态订阅都收到同一份payload() {
+        let (url, path) = db("topic");
+        let tc = dtmrs_open(url.as_ptr());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let rec = |tag: &'static str| {
+            Box::new(Rec {
+                tag,
+                ret: DTMRS_SUCCESS,
+                log: log.clone(),
+            })
+        };
+        let (ra, rq) = (rec("a"), rec("q"));
+        let pay_log: Box<Mutex<Vec<String>>> = Box::new(Mutex::new(Vec::new()));
+        let ud = |r: &Rec| r as *const Rec as *mut c_void;
+        dtmrs_register_ex(tc, cs("a").as_ptr(), Some(rec_handler), ud(&ra));
+        dtmrs_register_ex(tc, cs("q").as_ptr(), Some(rec_handler), ud(&rq));
+        dtmrs_register_ex(
+            tc,
+            cs("pay").as_ptr(),
+            Some(pay_handler),
+            &*pay_log as *const Mutex<Vec<String>> as *mut c_void,
+        );
+        assert_eq!(
+            dtmrs_topic_static(tc, cs("t").as_ptr(), cs("local://a").as_ptr()),
+            DTMRS_OK
+        );
+        assert_eq!(dtmrs_start(tc), DTMRS_OK, "{}", last_err());
+        assert_eq!(
+            dtmrs_topic_static(tc, cs("t").as_ptr(), cs("local://pay").as_ptr()),
+            DTMRS_ERR,
+            "start 之后不能再静态登记"
+        );
+        assert_eq!(
+            dtmrs_subscribe(
+                tc,
+                cs("t").as_ptr(),
+                cs("local://pay").as_ptr(),
+                std::ptr::null()
+            ),
+            DTMRS_OK,
+            "{}",
+            last_err()
+        );
+        assert_eq!(
+            dtmrs_subscribe(
+                tc,
+                cs("t").as_ptr(),
+                cs("local://pay").as_ptr(),
+                std::ptr::null()
+            ),
+            DTMRS_ERR
+        );
+        assert!(last_err().contains("this url exists"), "{}", last_err());
+
+        let payload = r#"{"store_id":3,"sku_ids":[11,12]}"#;
+        let pj = serde_json::to_string(&[payload]).unwrap();
+        let prep = |gid: &str, topic: &str, flags: c_int| {
+            dtmrs_msg_prepare_ex(
+                tc,
+                cs(gid).as_ptr(),
+                cs(&format!(r#"["topic://{topic}"]"#)).as_ptr(),
+                cs(&pj).as_ptr(),
+                cs("local://q").as_ptr(),
+                -1,
+                flags,
+            )
+        };
+        assert_eq!(prep("ffi-topic", "t", 0), DTMRS_OK, "{}", last_err());
+        assert_eq!(dtmrs_submit(tc, cs("ffi-topic").as_ptr()), DTMRS_OK);
+        assert_eq!(wait(tc, "ffi-topic"), "succeed");
+        assert_eq!(*log.lock().unwrap(), ["a@01-01"], "静态订阅排前面");
+        assert_eq!(*pay_log.lock().unwrap(), [format!("pay@01-02:{payload}")]);
+
+        // 没人订的主题：默认失败，带 ALLOW_EMPTY 照常成功并计数
+        assert_eq!(prep("ffi-none", "没人", 0), DTMRS_ERR);
+        assert!(last_err().contains("topic not found"), "{}", last_err());
+        assert_eq!(dtmrs_empty_topic_count(tc), 0);
+        assert_eq!(
+            prep("ffi-empty", "没人", DTMRS_MSG_ALLOW_EMPTY_TOPIC),
+            DTMRS_OK,
+            "{}",
+            last_err()
+        );
+        assert_eq!(dtmrs_empty_topic_count(tc), 1);
+        assert_eq!(dtmrs_submit(tc, cs("ffi-empty").as_ptr()), DTMRS_OK);
+        assert_eq!(wait(tc, "ffi-empty"), "succeed");
+
+        // payloads 个数对不上要报出来
+        assert_eq!(
+            dtmrs_msg_prepare_ex(
+                tc,
+                cs("ffi-bad").as_ptr(),
+                cs(r#"["topic://t","local://a"]"#).as_ptr(),
+                cs(&pj).as_ptr(),
+                cs("local://q").as_ptr(),
+                -1,
+                0
+            ),
+            DTMRS_ERR
+        );
+
+        // 订阅接口：不带密钥不能开；开了返回真实端口
+        assert_eq!(
+            dtmrs_serve_topic_api(tc, cs("127.0.0.1:0").as_ptr(), cs("").as_ptr()),
+            DTMRS_ERR
+        );
+        let port = dtmrs_serve_topic_api(tc, cs("127.0.0.1:0").as_ptr(), cs("k").as_ptr());
+        assert!(port > 0, "{}", last_err());
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port as u16)).is_ok());
+
+        assert_eq!(
+            dtmrs_unsubscribe(tc, cs("t").as_ptr(), cs("local://pay").as_ptr()),
+            DTMRS_OK
+        );
+        dtmrs_close(tc);
+        // close 要把订阅接口一起停掉
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port as u16)).is_err());
+        assert_eq!(dtmrs_empty_topic_count(std::ptr::null_mut()), 0);
+        drop((ra, rq, pay_log));
         let _ = std::fs::remove_file(path);
     }
 

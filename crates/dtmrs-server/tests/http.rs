@@ -294,6 +294,117 @@ mod 等价 {
         assert_eq!(http_ok, grpc_ok, "空 gid：HTTP {http_ok} / gRPC {grpc_ok}");
     }
 
+    /// 一个主题订阅相关的请求，两个协议各发一遍
+    enum TopicOp {
+        Sub(&'static str, &'static str),
+        Unsub(&'static str, &'static str),
+        Del(&'static str),
+        /// prepare 一条发到主题的 msg：(主题, payload 个数, allow_empty_topic)
+        Prep(&'static str, usize, bool),
+    }
+
+    async fn http_topic(base: &str, gid: &str, op: &TopicOp) -> bool {
+        let c = reqwest::Client::new();
+        let r = match op {
+            TopicOp::Sub(t, u) => c
+                .get(format!("{base}/api/dtmsvr/subscribe"))
+                .query(&[("topic", *t), ("url", *u)])
+                .send(),
+            TopicOp::Unsub(t, u) => c
+                .get(format!("{base}/api/dtmsvr/unsubscribe"))
+                .query(&[("topic", *t), ("url", *u)])
+                .send(),
+            TopicOp::Del(t) => c.delete(format!("{base}/api/dtmsvr/topic/{t}")).send(),
+            TopicOp::Prep(t, n, allow) => {
+                let body = serde_json::json!({
+                    "gid": gid, "trans_type": "msg",
+                    "actions": [format!("topic://{t}")],
+                    "payloads": vec!["{}"; *n],
+                    "query_prepared": "http://x/q",
+                    "allow_empty_topic": allow,
+                });
+                return {
+                    let (c, b) = post(base, "/api/dtmsvr/prepare", &body.to_string()).await;
+                    accepted(c, &b)
+                };
+            }
+        };
+        let r = r.await.unwrap();
+        let code = r.status().as_u16();
+        accepted(code, &r.text().await.unwrap())
+    }
+
+    async fn grpc_topic(
+        cli: &mut pb::tc_client::TcClient<tonic::transport::Channel>,
+        gid: &str,
+        op: &TopicOp,
+    ) -> bool {
+        let req = |t: &str, u: &str| pb::TopicRequest {
+            topic: t.into(),
+            url: u.into(),
+            remark: String::new(),
+        };
+        match op {
+            TopicOp::Sub(t, u) => cli.subscribe(req(t, u)).await.is_ok(),
+            TopicOp::Unsub(t, u) => cli.unsubscribe(req(t, u)).await.is_ok(),
+            TopicOp::Del(t) => cli.delete_topic(req(t, "")).await.is_ok(),
+            TopicOp::Prep(t, n, allow) => cli
+                .prepare(pb::PrepareRequest {
+                    gid: gid.into(),
+                    trans_type: "msg".into(),
+                    actions: vec![format!("topic://{t}")],
+                    query_prepared: "http://x/q".into(),
+                    grace_secs: 0,
+                    payloads: vec!["{}".into(); *n],
+                    allow_empty_topic: *allow,
+                })
+                .await
+                .is_ok(),
+        }
+    }
+
+    #[tokio::test]
+    async fn 主题订阅和发到主题的受理结论两边必须一致() {
+        use TopicOp::*;
+        // 顺序执行，前面的请求造出后面要的状态（两边各自一份存储，互不干扰）
+        // (说明, 请求, 应该受理吗)
+        let script = [
+            ("空主题名", Sub("", "http://a"), false),
+            ("空地址", Sub("t", ""), false),
+            ("订阅地址是主题", Sub("t", "topic://u"), false),
+            ("没订阅者时发消息", Prep("t", 1, false), false),
+            ("没订阅者但允许为空", Prep("t", 1, true), true),
+            ("正常订阅", Sub("t", "http://a"), true),
+            ("重复订阅", Sub("t", "http://a"), false),
+            ("有订阅者时发消息", Prep("t", 1, false), true),
+            ("payload 个数对不上", Prep("t", 2, false), false),
+            ("退订不存在的主题", Unsub("没有", "http://a"), false),
+            ("退订不存在的地址", Unsub("t", "http://b"), false),
+            ("正常退订", Unsub("t", "http://a"), true),
+            ("删不存在的主题", Del("没有"), false),
+            ("再订阅一个", Sub("t2", "http://a"), true),
+            ("正常删主题", Del("t2"), true),
+        ];
+        let (hs, gs) = (store().await, store().await);
+        let http_base = spawn_http(Api::new(hs)).await;
+        let mut cli = pb::tc_client::TcClient::connect(spawn_grpc(Api::new(gs)).await)
+            .await
+            .unwrap();
+        for (i, (what, op, want)) in script.iter().enumerate() {
+            let gid = format!("eq-topic-{i}");
+            let h = http_topic(&http_base, &gid, op).await;
+            let g = grpc_topic(&mut cli, &gid, op).await;
+            assert_eq!(h, g, "{what}：HTTP {h} / gRPC {g}");
+            // 两边一致还不够，一起错也是错
+            assert_eq!(
+                h,
+                *want,
+                "{what}：应该{}",
+                if *want { "受理" } else { "拒绝" }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn 中止的受理结论两边必须一致() {
         for 状态 in [GlobalStatus::Submitted, GlobalStatus::Succeed] {

@@ -89,8 +89,45 @@ impl pb::tc_server::Tc for TcService {
             None
         };
         self.api
-            .prepare(&r.gid, &r.trans_type, &r.actions, &r.query_prepared, grace)
+            .prepare_with(
+                &r.gid,
+                &r.trans_type,
+                &r.actions,
+                &r.query_prepared,
+                grace,
+                &crate::api::PrepareOpts {
+                    payloads: r.payloads,
+                    allow_empty_topic: r.allow_empty_topic,
+                },
+            )
             .await?;
+        Ok(Response::new(pb::Empty {}))
+    }
+
+    async fn subscribe(
+        &self,
+        req: Request<pb::TopicRequest>,
+    ) -> Result<Response<pb::Empty>, Status> {
+        let r = req.into_inner();
+        self.api.subscribe(&r.topic, &r.url, &r.remark).await?;
+        Ok(Response::new(pb::Empty {}))
+    }
+
+    async fn unsubscribe(
+        &self,
+        req: Request<pb::TopicRequest>,
+    ) -> Result<Response<pb::Empty>, Status> {
+        let r = req.into_inner();
+        self.api.unsubscribe(&r.topic, &r.url).await?;
+        Ok(Response::new(pb::Empty {}))
+    }
+
+    async fn delete_topic(
+        &self,
+        req: Request<pb::TopicRequest>,
+    ) -> Result<Response<pb::Empty>, Status> {
+        let r = req.into_inner();
+        self.api.delete_topic(&r.topic).await?;
         Ok(Response::new(pb::Empty {}))
     }
 

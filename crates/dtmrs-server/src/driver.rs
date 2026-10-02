@@ -5,8 +5,8 @@
 
 use crate::registry::{parse_target, BranchCtx, Registry, Target};
 use dtmrs_core::{
-    msg_advance, saga_advance, tcc_advance, xa_advance, Advance, BranchOp, BranchResult,
-    BranchStatus, GlobalStatus, SagaStep, TransType,
+    msg_fanout_advance, saga_advance, tcc_advance, xa_advance, Advance, BranchOp, BranchResult,
+    BranchStatus, GlobalStatus, MsgBranch, SagaStep, TransType,
 };
 use dtmrs_store::{GlobalRow, Store};
 use std::sync::Arc;
@@ -283,6 +283,11 @@ impl Driver {
                     }
                 }
 
+                // 只有按主题扇出的 msg 会出现。同 RunWorkflow：不 panic
+                Advance::CallEach { .. } => {
+                    warn!(gid = %g.gid, "非 msg 事务收到 CallEach 决策，跳过");
+                    return Ok(());
+                }
                 Advance::Call { index, op } => {
                     let bid = branch_id(index);
                     let Some(url) = url_of(&rows, &bid, op) else {
@@ -344,6 +349,11 @@ impl Driver {
                 // **不 panic** —— 推进器是常驻的，崩了整个 TC 就停了
                 Advance::RunWorkflow => {
                     warn!(gid = %g.gid, "非 workflow 事务收到 RunWorkflow 决策，跳过");
+                    return Ok(());
+                }
+                // 只有按主题扇出的 msg 会出现。同 RunWorkflow：不 panic
+                Advance::CallEach { .. } => {
+                    warn!(gid = %g.gid, "非 msg 事务收到 CallEach 决策，跳过");
                     return Ok(());
                 }
                 Advance::Call { index, op } => {
@@ -491,6 +501,11 @@ impl Driver {
                     warn!(gid = %g.gid, "非 workflow 事务收到 RunWorkflow 决策，跳过");
                     return Ok(());
                 }
+                // 只有按主题扇出的 msg 会出现。同 RunWorkflow：不 panic
+                Advance::CallEach { .. } => {
+                    warn!(gid = %g.gid, "非 msg 事务收到 CallEach 决策，跳过");
+                    return Ok(());
+                }
                 Advance::Call { index, op } => {
                     let bid = branch_id(index);
                     let Some(url) = url_of(&rows, &bid, op) else {
@@ -583,45 +598,96 @@ impl Driver {
             }
         }
 
-        let steps: Vec<SagaStep> = serde_json::from_str(&g.payload).unwrap_or_default();
-        if steps.is_empty() {
+        // 0.12 起 payload 是展开过主题的 MsgBranch 列表；老数据（Vec<SagaStep>）
+        // 也能解，fill_defaults 按下标补出跟以前一样的分支号
+        let mut branches: Vec<MsgBranch> = serde_json::from_str(&g.payload).unwrap_or_default();
+        MsgBranch::fill_defaults(&mut branches);
+        if branches.is_empty() {
+            // 没有分支：要么本来就空，要么主题按 allow_empty_topic 放行成了 0 个
             self.transition(g, status, GlobalStatus::Succeed, "")
                 .await?;
             return Ok(());
         }
+        let steps: Vec<usize> = branches.iter().map(|b| b.step.unwrap_or(0)).collect();
         loop {
-            let (actions, _) = self.branch_states(&g.gid, steps.len()).await?;
-            match msg_advance(status, &actions) {
+            let done: std::collections::HashSet<String> = self
+                .store
+                .list_branches(&g.gid)
+                .await?
+                .into_iter()
+                .filter(|r| r.op == BranchOp::Action && r.status == BranchStatus::Succeed)
+                .map(|r| r.branch_id)
+                .collect();
+            let states: Vec<BranchStatus> = branches
+                .iter()
+                .map(|b| {
+                    if done.contains(&b.branch_id) {
+                        BranchStatus::Succeed
+                    } else {
+                        BranchStatus::Prepared
+                    }
+                })
+                .collect();
+            let indices = match msg_fanout_advance(status, &steps, &states) {
                 Advance::Finish(s) => {
                     info!(gid = %g.gid, status = s.as_str(), "消息事务终结");
                     self.transition(g, status, s, "").await?;
                     return Ok(());
                 }
                 Advance::Wait => return Ok(()),
-                // 只有 workflow 模式会出现，别的模式走到这里说明状态机接错了。
-                // **不 panic** —— 推进器是常驻的，崩了整个 TC 就停了
+                Advance::CallEach { indices, .. } => indices,
+                // 扇出决策只会给 CallEach。别的变体说明状态机接错了 ——
+                // **不 panic**，推进器是常驻的，崩了整个 TC 就停了
+                Advance::Call { index, .. } => vec![index],
                 Advance::RunWorkflow => {
                     warn!(gid = %g.gid, "非 workflow 事务收到 RunWorkflow 决策，跳过");
                     return Ok(());
                 }
-                Advance::Call { index, op } => {
-                    let bid = branch_id(index);
-                    match self
-                        .call_branch(g, &bid, op, &steps[index].action, &steps[index].payload)
-                        .await
-                    {
-                        BranchResult::Success => {
-                            self.store
-                                .set_branch_status(&g.gid, &bid, op, BranchStatus::Succeed)
-                                .await?;
-                        }
-                        // msg 保证"最终一定送达"，没有补偿一说。失败只能重试。
-                        BranchResult::Failure | BranchResult::Ongoing | BranchResult::Unknown => {
-                            self.retry_later(g).await?;
-                            return Ok(());
-                        }
+            };
+            // 同一个 step 的分支（一个主题的订阅者）**并发**调、各自记成败：
+            // 一个订阅者挂着（超时要 branch_timeout 那么久）不能拖住别的。
+            // 成功的立刻落库，下一轮不会重发；没成功的留给退避重试
+            let mut set = tokio::task::JoinSet::new();
+            for i in indices {
+                let (d, g2, b) = (self.clone(), g.clone(), branches[i].clone());
+                set.spawn(async move {
+                    let r = d
+                        .call_branch(&g2, &b.branch_id, BranchOp::Action, &b.action, &b.payload)
+                        .await;
+                    (b.branch_id, r)
+                });
+            }
+            let mut all_ok = true;
+            while let Some(joined) = set.join_next().await {
+                let (bid, r) = match joined {
+                    Ok(x) => x,
+                    Err(e) => {
+                        // 调用任务 panic 了：结果未知，跟超时一样只重试
+                        warn!(gid = %g.gid, error = %e, "msg 分支调用异常终止，按结果未知处理");
+                        all_ok = false;
+                        continue;
+                    }
+                };
+                match r {
+                    BranchResult::Success => {
+                        self.store
+                            .set_branch_status(
+                                &g.gid,
+                                &bid,
+                                BranchOp::Action,
+                                BranchStatus::Succeed,
+                            )
+                            .await?;
+                    }
+                    // msg 保证"最终一定送达"，没有补偿一说。失败只能重试
+                    BranchResult::Failure | BranchResult::Ongoing | BranchResult::Unknown => {
+                        all_ok = false;
                     }
                 }
+            }
+            if !all_ok {
+                self.retry_later(g).await?;
+                return Ok(());
             }
         }
     }

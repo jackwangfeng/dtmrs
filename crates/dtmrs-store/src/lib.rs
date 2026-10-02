@@ -32,6 +32,23 @@ pub const BIG: usize = 8192;
 /// url / reason 一类中等长度列的字符上限
 pub const MID: usize = 1024;
 
+/// 主题名的字符上限（主键的一部分，MySQL 上是 VARCHAR(128)）
+pub const TOPIC_LEN: usize = 128;
+/// 订阅地址的字符上限。比别的 url 列短：它跟主题名一起做主键，MySQL 的 utf8mb4
+/// 索引上限 3072 字节，`4 × (128 + 512)` 刚好放得下，1024 就超了
+pub const SUB_URL_LEN: usize = 512;
+
+/// 一条主题订阅。一行一个（主题, 地址），主题本身没有单独的行 ——
+/// 最后一个订阅者退订后主题就不存在了（DTM 会留一个空列表，效果一样：
+/// 两边都按「没有订阅者」处理）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicSub {
+    pub topic: String,
+    pub url: String,
+    pub remark: String,
+    pub create_time: i64,
+}
+
 /// 把超长字段变成错误。
 ///
 /// **不能省**：MySQL 的 `INSERT IGNORE` 遇到超长值会静默截断而不是报错，
@@ -341,8 +358,100 @@ impl SqlStore {
         ))
         .execute(&self.pool)
         .await?;
+        // 二阶段消息的主题订阅（0.12）。一行一个订阅者，主键防重复订阅
+        let sub_url = self.be.text(SUB_URL_LEN);
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS topic_sub (
+              topic       {idt} NOT NULL,
+              url         {sub_url} NOT NULL,
+              remark      {mid} NOT NULL,
+              create_time BIGINT NOT NULL,
+              PRIMARY KEY (topic, url)
+            )"
+        ))
+        .execute(&self.pool)
+        .await?;
         self.add_missing_columns().await?;
         Ok(())
+    }
+
+    // ---------------- 主题订阅 ----------------
+
+    /// 订阅。已经订阅过返回 `false`（不报错，由上层决定怎么说）
+    pub async fn subscribe(&self, topic: &str, url: &str, remark: &str) -> Result<bool> {
+        len_ok("topic", topic, TOPIC_LEN)?;
+        len_ok("url", url, SUB_URL_LEN)?;
+        len_ok("remark", remark, MID)?;
+        let n = sqlx::query(
+            &self
+                .be
+                .q("{INS} topic_sub (topic,url,remark,create_time) VALUES (?,?,?,?) {NOCONFLICT}"),
+        )
+        .bind(topic)
+        .bind(url)
+        .bind(remark)
+        .bind(now())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// 退订。本来就没订阅返回 `false`
+    pub async fn unsubscribe(&self, topic: &str, url: &str) -> Result<bool> {
+        let n = sqlx::query(&self.be.q("DELETE FROM topic_sub WHERE topic=? AND url=?"))
+            .bind(topic)
+            .bind(url)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// 删整个主题，返回删掉的订阅数
+    pub async fn delete_topic(&self, topic: &str) -> Result<u64> {
+        Ok(
+            sqlx::query(&self.be.q("DELETE FROM topic_sub WHERE topic=?"))
+                .bind(topic)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    /// 列订阅。`topic` 为 `None` 列全部。按主题、登记先后排序 ——
+    /// 展开出来的分支号（01-01、01-02…）跟这个顺序走，得是确定的
+    pub async fn list_subscriptions(&self, topic: Option<&str>) -> Result<Vec<TopicSub>> {
+        let rows = match topic {
+            Some(t) => {
+                sqlx::query(&self.be.q(
+                    "SELECT topic,url,remark,create_time FROM topic_sub WHERE topic=?
+                     ORDER BY create_time, url",
+                ))
+                .bind(t)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    &self
+                        .be
+                        .q("SELECT topic,url,remark,create_time FROM topic_sub
+                     ORDER BY topic, create_time, url"),
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows
+            .iter()
+            .map(|r| TopicSub {
+                topic: r.get("topic"),
+                url: r.get("url"),
+                remark: r.get("remark"),
+                create_time: r.get("create_time"),
+            })
+            .collect())
     }
 
     /// 给**已存在**的表补新增的列。
@@ -1073,7 +1182,7 @@ mod tests {
                 let s = Store::open(&url)
                     .await
                     .unwrap_or_else(|e| panic!("连不上 {env}: {e}"));
-                for t in ["trans_branch_op", "trans_global"] {
+                for t in ["trans_branch_op", "trans_global", "topic_sub"] {
                     sqlx::query(&format!("DELETE FROM {t}"))
                         .execute(s.pool().expect("SQL 后端才有连接池"))
                         .await
@@ -1100,6 +1209,95 @@ mod tests {
             v.push(("redis", s));
         }
         (guard, v)
+    }
+
+    #[tokio::test]
+    async fn 主题订阅_重复订阅和退订不存在的都返回false_列举顺序确定() {
+        let (_g, backends) = backends().await;
+        for (name, s) in backends {
+            assert!(
+                s.subscribe("库存跨零", "http://core/a", "core")
+                    .await
+                    .unwrap(),
+                "{name}"
+            );
+            assert!(
+                !s.subscribe("库存跨零", "http://core/a", "又来")
+                    .await
+                    .unwrap(),
+                "{name}: 重复订阅"
+            );
+            assert!(
+                s.subscribe("库存跨零", "local://b", "").await.unwrap(),
+                "{name}"
+            );
+            assert!(s.subscribe("别的", "http://x", "").await.unwrap(), "{name}");
+
+            let one = s.list_subscriptions(Some("库存跨零")).await.unwrap();
+            let mut urls: Vec<_> = one.iter().map(|x| x.url.as_str()).collect();
+            // 同一秒登记的按 url 排，跨秒的按先后 —— 测试里多半同一秒
+            urls.sort();
+            assert_eq!(urls, ["http://core/a", "local://b"], "{name}");
+            assert_eq!(
+                one.iter()
+                    .find(|x| x.url == "http://core/a")
+                    .unwrap()
+                    .remark,
+                "core",
+                "{name}: 重复订阅不能改掉原来的备注"
+            );
+            let all = s.list_subscriptions(None).await.unwrap();
+            assert_eq!(all.len(), 3, "{name}");
+            assert!(
+                all.windows(2).all(|w| w[0].topic <= w[1].topic),
+                "{name}: 按主题排"
+            );
+
+            assert!(
+                s.unsubscribe("库存跨零", "local://b").await.unwrap(),
+                "{name}"
+            );
+            assert!(
+                !s.unsubscribe("库存跨零", "local://b").await.unwrap(),
+                "{name}"
+            );
+            assert!(
+                !s.unsubscribe("没这个", "http://x").await.unwrap(),
+                "{name}"
+            );
+            // 最后一个退订后主题就不在了
+            assert!(s.unsubscribe("别的", "http://x").await.unwrap(), "{name}");
+            let left = s.list_subscriptions(None).await.unwrap();
+            assert_eq!(left.len(), 1, "{name}");
+            assert_eq!(left[0].topic, "库存跨零", "{name}");
+
+            assert_eq!(s.delete_topic("库存跨零").await.unwrap(), 1, "{name}");
+            assert_eq!(s.delete_topic("库存跨零").await.unwrap(), 0, "{name}");
+            assert!(
+                s.list_subscriptions(None).await.unwrap().is_empty(),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn 主题订阅_超长的主题和地址要拒绝不能截断() {
+        let (_g, backends) = backends().await;
+        for (name, s) in backends {
+            let long_topic = "t".repeat(TOPIC_LEN + 1);
+            let long_url = format!("http://{}", "u".repeat(SUB_URL_LEN));
+            assert!(
+                s.subscribe(&long_topic, "http://x", "").await.is_err(),
+                "{name}"
+            );
+            assert!(s.subscribe("t", &long_url, "").await.is_err(), "{name}");
+            // 刚好到上限的要能存
+            let max_url = format!("http://{}", "u".repeat(SUB_URL_LEN - 7));
+            assert!(s.subscribe("t", &max_url, "").await.unwrap(), "{name}");
+            let got = s.list_subscriptions(Some("t")).await.unwrap();
+            assert_eq!(got[0].url, max_url, "{name}: 不能被截断");
+            s.delete_topic("t").await.unwrap();
+        }
     }
 
     fn g(gid: &str) -> GlobalRow {
@@ -1767,6 +1965,43 @@ impl Store {
             Inner::Sql(s) => s.touch_token(hash, ip).await,
             #[cfg(feature = "redis")]
             Inner::Redis(r) => r.touch_token(hash, ip).await.map_err(redis_err),
+        }
+    }
+
+    // ---------------- 主题订阅 ----------------
+    //
+    // 两个后端语义逐条一致：重复订阅 / 退订不存在的都返回 false 不报错，
+    // 列举按主题、登记先后排序（决定扇出的分支号，必须确定）。
+
+    pub async fn subscribe(&self, topic: &str, url: &str, remark: &str) -> Result<bool> {
+        match &self.inner {
+            Inner::Sql(s) => s.subscribe(topic, url, remark).await,
+            #[cfg(feature = "redis")]
+            Inner::Redis(r) => r.subscribe(topic, url, remark).await.map_err(redis_err),
+        }
+    }
+
+    pub async fn unsubscribe(&self, topic: &str, url: &str) -> Result<bool> {
+        match &self.inner {
+            Inner::Sql(s) => s.unsubscribe(topic, url).await,
+            #[cfg(feature = "redis")]
+            Inner::Redis(r) => r.unsubscribe(topic, url).await.map_err(redis_err),
+        }
+    }
+
+    pub async fn delete_topic(&self, topic: &str) -> Result<u64> {
+        match &self.inner {
+            Inner::Sql(s) => s.delete_topic(topic).await,
+            #[cfg(feature = "redis")]
+            Inner::Redis(r) => r.delete_topic(topic).await.map_err(redis_err),
+        }
+    }
+
+    pub async fn list_subscriptions(&self, topic: Option<&str>) -> Result<Vec<TopicSub>> {
+        match &self.inner {
+            Inner::Sql(s) => s.list_subscriptions(topic).await,
+            #[cfg(feature = "redis")]
+            Inner::Redis(r) => r.list_subscriptions(topic).await.map_err(redis_err),
         }
     }
 
