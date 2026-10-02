@@ -496,8 +496,24 @@ mod 认证 {
 
     /// 用给定的 token 分别打两个协议，返回 (http 通过吗, grpc 通过吗)
     async fn 两边带token(token: Option<&str>) -> (bool, bool) {
+        两边带token_库里有(token, &[]).await
+    }
+
+    /// 同上，先在库里放好几个托管令牌：(明文, 是否已作废)
+    async fn 两边带token_库里有(
+        token: Option<&str>,
+        managed: &[(&str, bool)],
+    ) -> (bool, bool) {
         let st = store().await;
-        let a = auth();
+        for (plain, revoked) in managed {
+            let h = dtmrs_store::hash_token(plain);
+            st.create_token(&h, "测试", "").await.unwrap();
+            if *revoked {
+                st.revoke_token(&h).await.unwrap();
+            }
+        }
+        // 跟 main.rs 一样接上存储，托管令牌才生效
+        let a = auth().with_store(st.clone());
         let h = spawn_http_auth(Api::new(st.clone()), a.clone(), st.clone()).await;
         let g = spawn_grpc_auth(Api::new(st.clone()), a.clone()).await;
 
@@ -527,6 +543,19 @@ mod 认证 {
     async fn 不带token两个协议都拒绝() {
         // 这条如果失败，多半是某个协议层漏挂了认证 —— 0.5.0 的 gRPC 就是这样
         let (h, g) = 两边带token(None).await;
+        assert!(!h && !g, "HTTP {h} / gRPC {g}，都该拒绝");
+    }
+
+    #[tokio::test]
+    async fn 管理台签发的托管令牌两个协议都放行() {
+        // 曾经 gRPC 只认 env 里的静态令牌：同一个托管令牌走 HTTP 放行、走 gRPC 被拒
+        let (h, g) = 两边带token_库里有(Some("managed-ok-1"), &[("managed-ok-1", false)]).await;
+        assert!(h && g, "HTTP {h} / gRPC {g}，都该放行");
+    }
+
+    #[tokio::test]
+    async fn 作废的托管令牌两个协议都拒绝() {
+        let (h, g) = 两边带token_库里有(Some("managed-gone"), &[("managed-gone", true)]).await;
         assert!(!h && !g, "HTTP {h} / gRPC {g}，都该拒绝");
     }
 

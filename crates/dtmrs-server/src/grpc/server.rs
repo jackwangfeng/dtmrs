@@ -42,24 +42,86 @@ impl TcService {
     ///
     /// gRPC 没有 cookie 和登录页的概念，所以这里**只认 Bearer token**
     /// （metadata 的 `authorization` 键）。管理台的会话 cookie 只在 HTTP 侧有意义。
-    pub fn into_server_with_auth(
-        self,
-        auth: std::sync::Arc<crate::auth::Auth>,
-    ) -> tonic::service::interceptor::InterceptedService<
-        pb::tc_server::TcServer<Self>,
-        impl tonic::service::Interceptor + Clone,
-    > {
-        pb::tc_server::TcServer::with_interceptor(self, move |req: tonic::Request<()>| {
-            let ok = req
-                .metadata()
+    pub fn into_server_with_auth(self, auth: std::sync::Arc<crate::auth::Auth>) -> AuthedTc {
+        AuthedTc {
+            inner: pb::tc_server::TcServer::new(self),
+            auth,
+        }
+    }
+}
+
+/// 带认证的 gRPC 服务。
+///
+/// # 为什么不用 tonic 的 interceptor
+///
+/// interceptor 是**同步**的，而托管令牌（管理台签发的那种）要查缓存、过期了还得
+/// 异步刷新一次存储。早先这里用 interceptor，只能比 env 里的静态令牌 ——
+/// 结果同一个托管令牌**走 HTTP 放行、走 gRPC 被拒**，正是两个协议层不许出现的漂移
+/// （`管理台签发的托管令牌两个协议都放行` 钉着）。
+///
+/// 现在包一层异步的 tower Service，判定跟 HTTP 的 `auth::guard` 走同一套：
+/// 先比静态令牌，再查托管令牌。
+#[derive(Clone)]
+pub struct AuthedTc {
+    inner: pb::tc_server::TcServer<TcService>,
+    auth: std::sync::Arc<crate::auth::Auth>,
+}
+
+impl tonic::server::NamedService for AuthedTc {
+    const NAME: &'static str =
+        <pb::tc_server::TcServer<TcService> as tonic::server::NamedService>::NAME;
+}
+
+impl<B> tonic::codegen::Service<tonic::codegen::http::Request<B>> for AuthedTc
+where
+    B: tonic::codegen::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+    pb::tc_server::TcServer<TcService>: tonic::codegen::Service<
+        tonic::codegen::http::Request<B>,
+        Response = tonic::codegen::http::Response<tonic::body::Body>,
+        Error = std::convert::Infallible,
+    >,
+    <pb::tc_server::TcServer<TcService> as tonic::codegen::Service<
+        tonic::codegen::http::Request<B>,
+    >>::Future: Send + 'static,
+{
+    type Response = tonic::codegen::http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        tonic::codegen::Service::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, req: tonic::codegen::http::Request<B>) -> Self::Future {
+        // 按 tower 的惯例：用 poll_ready 过的那个实例处理这次请求，留一个新克隆给下次
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let auth = self.auth.clone();
+        Box::pin(async move {
+            let presented = req
+                .headers()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
                 .and_then(crate::auth::Auth::bearer)
-                .is_some_and(|t| auth.token_ok(t));
+                .map(str::to_string);
+            let ip = req
+                .extensions()
+                .get::<tonic::transport::server::TcpConnectInfo>()
+                .and_then(|c| c.remote_addr())
+                .map(|a| a.ip().to_string())
+                .unwrap_or_default();
+            let ok = match &presented {
+                Some(t) => auth.token_ok(t) || auth.managed_ok(t, &ip).await,
+                None => false,
+            };
             if ok {
-                Ok(req)
+                inner.call(req).await
             } else {
-                Err(tonic::Status::unauthenticated("需要 Bearer token"))
+                Ok(tonic::Status::unauthenticated("需要 Bearer token").into_http())
             }
         })
     }
