@@ -17,7 +17,7 @@
 //! abort），换成 4xx 会打破现有客户端。
 
 use crate::driver;
-use crate::{msg_rows_expanded, saga_rows, tcc_rows};
+use crate::{msg_rows_expanded, saga_rows, tcc_rows_with_timeout};
 use dtmrs_core::{expand_msg_steps, BranchOp, GlobalStatus, SagaStep, TransType, MSG_TOPIC_PREFIX};
 use dtmrs_store::{Store, SubmitOutcome, TopicSub};
 use serde::Serialize;
@@ -72,6 +72,10 @@ pub struct TransView {
     pub rollback_reason: String,
     pub create_time: i64,
     pub finish_time: Option<i64>,
+    /// 退避重试了多少轮。一直涨说明卡住了（confirm 失败只能重试、订阅方一直失败……）
+    pub retry_count: i64,
+    /// 下次推进的时刻（unix 秒）
+    pub next_cron_time: i64,
     pub branches: Vec<BranchView>,
 }
 
@@ -85,6 +89,10 @@ pub struct RegisterBranch {
     pub r#try: String,
     pub commit: String,
     pub rollback: String,
+    /// 分支的业务数据（同 DTM registerBranch 的 `data`），TCC 的 confirm / cancel
+    /// 收到的请求体就是它 —— 二阶段要知道 try 冻结了什么，不用业务方自己另建表回查。
+    /// 空表示不带（分支收到 `{}`）。重复登记以第一次的为准
+    pub data: String,
 }
 
 /// msg prepare 的可选项（DTM 协议之外的扩展，都有默认值）
@@ -97,6 +105,9 @@ pub struct PrepareOpts {
     /// 给「晚到或漏一次可以接受、但不能挡住业务」的通知类消息用 ——
     /// 发送方往往是在业务本地事务里 prepare 的，报错会把业务本身也带失败
     pub allow_empty_topic: bool,
+    /// tcc / xa 用：停在 prepared 多少秒没人 submit / abort 就由 TC 回滚（同 DTM 的
+    /// `timeout_to_fail`）。0 = 全局默认（`DTMRS_TIMEOUT_TO_FAIL`，默认 35）
+    pub timeout_to_fail: i64,
 }
 
 #[derive(Clone)]
@@ -500,7 +511,10 @@ impl Api {
                 Ok(())
             }
             Some(tt @ (TransType::Tcc | TransType::Xa)) => {
-                let mut g = tcc_rows(gid);
+                if opts.timeout_to_fail < 0 {
+                    return Err(ApiError::BadRequest("timeout_to_fail 不能是负数".into()));
+                }
+                let mut g = tcc_rows_with_timeout(gid, opts.timeout_to_fail);
                 g.trans_type = tt;
                 self.store.create_global(&g, &[]).await.map_err(internal)?;
                 Ok(())
@@ -603,7 +617,7 @@ impl Api {
         // 两个请求同时登记同一个号时，输的那个也能看见赢家的 URL。
         match self
             .store
-            .register_branch(&r.gid, &r.branch_id, &ops)
+            .register_branch_with(&r.gid, &r.branch_id, &ops, &r.data)
             .await
             .map_err(internal)?
         {
@@ -722,6 +736,8 @@ impl Api {
             rollback_reason: g.rollback_reason,
             create_time: g.create_time,
             finish_time: g.finish_time,
+            retry_count: g.retry_count,
+            next_cron_time: g.next_cron_time,
             branches: branches
                 .into_iter()
                 .map(|b| BranchView {
@@ -747,8 +763,25 @@ impl Api {
                 rollback_reason: g.rollback_reason,
                 create_time: g.create_time,
                 finish_time: g.finish_time,
+                retry_count: g.retry_count,
+                next_cron_time: g.next_cron_time,
                 branches: Vec::new(),
             })
             .collect()
+    }
+
+    /// 卡住的事务：没终结、退避重试了至少 `min_retries` 轮，最老的在前，
+    /// **带上分支明细**（一眼看出卡在哪个分支）。巡检 / 管理台用
+    pub async fn list_stuck(&self, min_retries: i64, limit: i64) -> Result<Vec<TransView>> {
+        let rows = self
+            .store
+            .list_stuck(min_retries.max(0), limit.clamp(1, 1000))
+            .await
+            .map_err(internal)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for g in rows {
+            out.push(self.query(&g.gid).await?);
+        }
+        Ok(out)
     }
 }

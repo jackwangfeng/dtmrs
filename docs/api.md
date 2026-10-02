@@ -116,6 +116,14 @@ gRPC：`Tc.Submit(SubmitRequest) → Empty`
 | `grace_secs` | 否 | `10` | 回查前的宽限秒数 |
 | `payloads` | 否 | `[]` | msg 每个 action 的请求体，跟 `actions` 等长（字段名同 DTM）。不给则分支收到 `{}` |
 | `allow_empty_topic` | 否 | `false` | `topic://` 没有订阅者时放行而不是报错，见[按主题投递](#按主题投递topic) |
+| `timeout_to_fail` | 否 | `0` | tcc / xa：停在 prepared 多少秒没人 submit / abort 就由 TC 回滚（同 DTM）。`0` = 全局默认（`DTMRS_TIMEOUT_TO_FAIL`，默认 35），见下 |
+
+> **发起方崩了谁收尾（tcc / xa）**：begin → register → try（或 XA PREPARE）之后、submit / abort
+> 之前发起方崩了，到 `timeout_to_fail` 时限 TC 自己转回滚（`rollback_reason` 是
+> `Timeout after N seconds`，同 DTM），调每个已登记分支的 cancel / rollback。
+> 迟到的 try 由屏障挡住（cancel 先到 = 空回滚，try 后到 = 悬挂）。
+> **只管 prepared**：已经 submit 的，confirm / commit 失败照样无限重试，绝不因为超时转回滚。
+> try 阶段本来就要跑很久的业务，把 `timeout_to_fail` 调大。
 
 > ⚠ **msg 不给 `query_prepared` 会被直接拒绝。** 客户端崩在 prepare 和 submit 之间时，没有回查地址就没人能决断这单——猜「已提交」会重复执行，猜「没提交」会丢单。
 
@@ -218,6 +226,7 @@ gRPC：`Tc.Subscribe` / `Tc.Unsubscribe` / `Tc.DeleteTopic`（`TopicRequest{topi
 | `confirm` / `cancel` | TCC 必填 | 缺任一个会被拒 |
 | `commit` / `rollback` | XA 必填 | 缺任一个会被拒 |
 | `try` | 否 | 只为可观测性存一份 |
+| `data` | 否 | 分支的业务数据（同 DTM）。confirm / cancel（commit / rollback）收到的请求体就是它 —— 二阶段要知道 try 冻结了什么，靠它带过去。重复登记以**第一次**的为准 |
 
 > ⚠ **必须先登记再做一阶段。** 反过来的话，一阶段成功了但登记失败，TC 就不知道有这个分支——回滚时会漏掉它。TCC 是预留资源永久泄漏，XA 更糟：留下一个永久持锁的 prepared 事务。
 
@@ -292,6 +301,8 @@ gRPC：`Tc.Retry(RetryRequest) → Empty`
   "rollback_reason": "分支 02 返回 FAILURE",
   "create_time": 1786400000,
   "finish_time": 1786400012,
+  "retry_count": 0,
+  "next_cron_time": 1786400012,
   "branches": [
     {"branch_id": "01", "op": "action",     "url": "http://pay/deduct", "status": "succeed"},
     {"branch_id": "01", "op": "compensate", "url": "http://pay/undo",   "status": "succeed"}
@@ -309,8 +320,19 @@ gRPC：`Tc.Retry(RetryRequest) → Empty`
 分支 `status`：`prepared`（还没成功）/ `succeed` / `failed`。
 
 `finish_time` 只有终态才有。gid 不存在返回 404。
+`retry_count` 是退避重试过的轮数，一直在涨说明卡住了；`next_cron_time` 是下次推进的时刻。
 
 gRPC：`Tc.Query(QueryRequest) → TransView`
+
+---
+
+## `GET /api/dtmsvr/stuck?min_retries=3&limit=100`
+
+卡住的事务：**还没终结**、退避重试了至少 `min_retries`（默认 3）轮，**最老的在前**，
+每项同 `query` 的形状（带分支明细，一眼看出卡在哪个分支）。`limit` 默认 100、最多 1000。
+
+confirm / commit 失败只能无限重试、等人介入；msg 的订阅方一直失败也只能重试 ——
+这类「刻意只重试」的事务在这里能看到。配合告警见 [排错](troubleshooting.md#怎么发现卡住的事务)。
 
 ---
 

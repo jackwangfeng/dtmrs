@@ -84,6 +84,7 @@ fn opts(payload: &str, allow_empty: bool) -> PrepareOpts {
     PrepareOpts {
         payloads: vec![payload.to_string()],
         allow_empty_topic: allow_empty,
+        ..Default::default()
     }
 }
 
@@ -413,6 +414,7 @@ async fn 允许为空时没订阅者照常受理_提交后直接完成并计数(
         &PrepareOpts {
             payloads: vec!["x".into(), "y".into()],
             allow_empty_topic: true,
+            ..Default::default()
         },
     )
     .await

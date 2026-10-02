@@ -28,6 +28,8 @@ pub struct Driver {
     pub workers: usize,
     /// 进程内分支注册表。嵌入式模式用，纯 HTTP 部署时是空表
     pub registry: Arc<Registry>,
+    /// 重试到上限就告警，`None` 不告警。见 [`crate::alert`]
+    pub alert: Option<crate::alert::AlertConfig>,
     /// gRPC 分支调用器（带 channel 缓存）
     #[cfg(feature = "grpc")]
     pub grpc: crate::grpc::client::GrpcCaller,
@@ -73,12 +75,19 @@ impl Driver {
             branch_timeout_secs: cfg.branch_timeout_secs.max(1) as u64,
             workers: cfg.workers.max(1),
             registry: Arc::new(Registry::new()),
+            alert: None,
             #[cfg(feature = "grpc")]
             grpc: crate::grpc::client::GrpcCaller::new(Duration::from_secs(
                 cfg.branch_timeout_secs.max(1) as u64,
             )),
             workflows: Arc::new(crate::workflow::WorkflowRegistry::new()),
         }
+    }
+
+    /// 重试到上限就告警（见 [`crate::alert`]）。`None` 关掉
+    pub fn with_alert(mut self, a: Option<crate::alert::AlertConfig>) -> Self {
+        self.alert = a;
+        self
     }
 
     /// 当前的分支调用超时（秒），启动日志里打出来方便确认配置生效
@@ -197,6 +206,40 @@ impl Driver {
     ///
     /// 可以被重复调用（崩溃恢复就靠这个）—— 分支的幂等由客户端屏障保证。
     pub async fn process(&self, g: &GlobalRow) -> anyhow::Result<()> {
+        // 停在 prepared 的 TCC / XA：发起方没来 submit / abort，到时限就由 TC 回滚。
+        // 「该不该超时、超时推到哪」由 core 决定，这里只落状态
+        if let Some(to) = dtmrs_core::prepared_timeout_to(g.status, g.trans_type) {
+            let now = dtmrs_store::now();
+            let deadline = dtmrs_core::prepared_deadline(
+                g.create_time,
+                g.timeout_to_fail,
+                crate::timeout_to_fail_default(),
+            );
+            let Some(d) = deadline.filter(|d| now >= *d) else {
+                // 没到点就被捞起来了（0.13 之前建的事务排在建立那一刻；或者被「立刻重试」
+                // 提前了）：排回时限那一刻。会让重试计数多一，无所谓
+                let at = deadline.unwrap_or(crate::NEVER);
+                self.store
+                    .release_lease(&g.gid, g.lease_until, (at - now).max(1))
+                    .await?;
+                return Ok(());
+            };
+            // 文案同 DTM
+            let reason = format!("Timeout after {} seconds", d - g.create_time);
+            warn!(gid = %g.gid, trans_type = %g.trans_type, %reason,
+                  "prepared 超时没人 submit / abort（发起方多半崩了），TC 转回滚");
+            // 比较后再写：恰好在这一刻 submit / abort 的，以先落库的为准
+            if !self.transition(g, g.status, to, &reason).await? {
+                return Ok(());
+            }
+            let mut g2 = g.clone();
+            g2.status = to;
+            g2.rollback_reason = reason;
+            return match g2.trans_type {
+                TransType::Xa => self.process_xa(&g2).await,
+                _ => self.process_tcc(&g2).await,
+            };
+        }
         match g.trans_type {
             TransType::Saga => self.process_saga(g).await,
             TransType::Tcc => self.process_tcc(g).await,
@@ -697,6 +740,34 @@ impl Driver {
     async fn retry_later(&self, g: &GlobalRow) -> anyhow::Result<()> {
         let iv = dtmrs_core::next_interval_with(g.next_cron_interval, self.retry);
         self.store.release_lease(&g.gid, g.lease_until, iv).await?;
+        // release_lease 刚把计数加了一
+        let n = g.retry_count + 1;
+        if let Some(a) = self.alert.as_ref().filter(|a| a.should_fire(n)) {
+            // 只在真要报的时候才去读分支，正常路径不多一次存储往返
+            let pending = match self.store.list_branches(&g.gid).await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter(|r| r.status != BranchStatus::Succeed)
+                    .map(|r| crate::alert::PendingBranch {
+                        branch_id: r.branch_id,
+                        op: r.op.as_str().to_string(),
+                        url: r.url,
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            a.fire(
+                &self.http,
+                crate::alert::Alert {
+                    gid: g.gid.clone(),
+                    trans_type: g.trans_type.to_string(),
+                    status: g.status.as_str().to_string(),
+                    retry_count: n,
+                    rollback_reason: g.rollback_reason.clone(),
+                    pending,
+                },
+            );
+        }
         Ok(())
     }
 

@@ -732,6 +732,94 @@ pub fn msg_advance(status: GlobalStatus, actions: &[BranchStatus]) -> Advance {
     }
 }
 
+/// TCC / XA 停在 prepared 的默认时限（秒），同 DTM 的 `TimeoutToFail`。
+/// 环境变量 `DTMRS_TIMEOUT_TO_FAIL` 可以改，0 表示关掉。
+pub const DEFAULT_TIMEOUT_TO_FAIL: i64 = 35;
+
+/// 停在 prepared 的事务到了时限，TC 该把它推到哪。
+///
+/// # 解决什么
+///
+/// TCC / XA 的发起方在 begin → register → try（或 XA PREPARE）之后、submit / abort
+/// 之前崩了，**没有人会再来收尾**：try 冻结的资源永久泄漏；XA 更糟，prepared 事务
+/// 永久持锁（Postgres 上还挡住 VACUUM）。所以到点由 TC 自己转 `Aborting`，走 cancel /
+/// rollback。迟到的 try 由屏障挡住（cancel 先到 = 空回滚，try 后到 = 悬挂，都会空转）。
+///
+/// 只对 TCC / XA：
+/// - msg 停在 prepared 有回查（`query_prepared`），问业务方就能决断，不能靠超时猜
+/// - saga / workflow 没有 prepared 这一段
+///
+/// 超时只看 **prepared**：一旦 submit，方向就定了，confirm / commit 失败绝不能转回滚
+/// （见 [`tcc_advance`]）。
+pub fn prepared_timeout_to(status: GlobalStatus, tt: TransType) -> Option<GlobalStatus> {
+    match (status, tt) {
+        (GlobalStatus::Prepared, TransType::Tcc | TransType::Xa) => Some(GlobalStatus::Aborting),
+        _ => None,
+    }
+}
+
+/// prepared 的 TCC / XA 什么时候到期。`timeout_to_fail` 是这笔事务自己的设置
+/// （0 = 用全局默认 `default`）；生效的时限 ≤ 0 表示不超时，返回 `None`
+pub fn prepared_deadline(create_time: i64, timeout_to_fail: i64, default: i64) -> Option<i64> {
+    let t = if timeout_to_fail > 0 {
+        timeout_to_fail
+    } else {
+        default
+    };
+    (t > 0).then(|| create_time.saturating_add(t))
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn 只有prepared的tcc和xa会超时回滚() {
+        for tt in [
+            TransType::Saga,
+            TransType::Tcc,
+            TransType::Msg,
+            TransType::Xa,
+            TransType::Workflow,
+        ] {
+            for st in [
+                GlobalStatus::Prepared,
+                GlobalStatus::Submitted,
+                GlobalStatus::Aborting,
+                GlobalStatus::Succeed,
+                GlobalStatus::Failed,
+            ] {
+                let want = (st == GlobalStatus::Prepared
+                    && matches!(tt, TransType::Tcc | TransType::Xa))
+                .then_some(GlobalStatus::Aborting);
+                assert_eq!(prepared_timeout_to(st, tt), want, "{tt:?} {st:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn 已submit的tcc超时也绝不能转回滚() {
+        // confirm 失败无限重试是铁律，超时不能成为绕过它的后门
+        assert_eq!(
+            prepared_timeout_to(GlobalStatus::Submitted, TransType::Tcc),
+            None
+        );
+        assert_eq!(
+            prepared_timeout_to(GlobalStatus::Submitted, TransType::Xa),
+            None
+        );
+    }
+
+    #[test]
+    fn 时限按事务自己的设置_没设用默认_都是0就不超时() {
+        assert_eq!(prepared_deadline(1000, 0, 35), Some(1035));
+        assert_eq!(prepared_deadline(1000, 300, 35), Some(1300));
+        assert_eq!(prepared_deadline(1000, 0, 0), None);
+        // 事务自己设了就以它为准，哪怕全局关掉了
+        assert_eq!(prepared_deadline(1000, 5, 0), Some(1005));
+    }
+}
+
 /// 按主题投递时 action 的前缀，跟 DTM 的 `MsgTopicPrefix` 一致：`topic://库存跨零`
 pub const MSG_TOPIC_PREFIX: &str = "topic://";
 

@@ -18,6 +18,38 @@ curl 'localhost:36789/api/dtmsvr/query?gid=order-1001'
 
 ---
 
+## 怎么发现卡住的事务
+
+有些卡住是**刻意**的：confirm / commit 失败只能无限重试（绝不转 cancel），msg 的订阅方
+一直失败也只能重试。语义没错，但得有人知道。三个手段：
+
+1. **查**：`curl 'localhost:36789/api/dtmsvr/stuck?min_retries=3'` —— 没终结、重试 ≥ 3 轮的，
+   最老的在前，带分支明细。单笔看 `query` 返回里的 `retry_count`。
+2. **告警**：设 `DTMRS_ALERT_WEBHOOK`，重试到第 `DTMRS_ALERT_RETRY_LIMIT`（默认 3）轮起每轮 POST：
+   ```json
+   {"gid":"order-1","trans_type":"tcc","status":"submitted","retry_count":3,
+    "rollback_reason":"","pending":[{"branch_id":"01","op":"confirm","url":"http://busi/confirm"}]}
+   ```
+   退避封顶 300 秒，所以一笔最多 5 分钟一条，报警系统按 gid 去重即可。webhook 挂了只打日志，不影响推进。
+   嵌入式用 `EmbeddedBuilder::alert_webhook` / `on_alert`（回调），C 是 start 之前调 `dtmrs_alert_webhook`。
+3. **日志**：告警时同时打一条 WARN「事务重试到告警上限，需要人看一眼」。
+
+修好下游之后用 `POST /api/dtmsvr/retry` 让它立刻再推一次，不用等退避。
+
+---
+
+## TCC / XA 停在 `prepared` 又自己变成 `failed`
+
+`rollback_reason` 是 `Timeout after N seconds` 的话，是**发起方没在时限内 submit / abort**
+（多半是进程崩了），TC 按 `timeout_to_fail`（默认 35 秒）替它回滚了。这是保护：不然 try 冻结的
+资源永久泄漏，XA 的 prepared 事务永久持锁。
+
+如果发起方其实还活着、只是 try 阶段跑得久：prepare 时把 `timeout_to_fail` 调大
+（嵌入式 `tcc_with_timeout` / `xa_with_timeout`，C 是 `dtmrs_tcc_begin_ex` / `dtmrs_xa_begin_ex`），
+或者调全局的 `DTMRS_TIMEOUT_TO_FAIL`。超时之后发起方再来 submit 会被拒绝，按失败处理。
+
+---
+
 ## 事务一直停在 `submitted`
 
 **这是最常见的现象。** 它表示「某个正向分支还没返回明确成功」，TC 在按指数退避重试。

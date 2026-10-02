@@ -160,6 +160,7 @@ impl pb::tc_server::Tc for TcService {
                 &crate::api::PrepareOpts {
                     payloads: r.payloads,
                     allow_empty_topic: r.allow_empty_topic,
+                    timeout_to_fail: r.timeout_to_fail,
                 },
             )
             .await?;
@@ -207,6 +208,7 @@ impl pb::tc_server::Tc for TcService {
                 r#try: r.r#try,
                 commit: r.commit,
                 rollback: r.rollback,
+                data: r.data,
             })
             .await?;
         Ok(Response::new(pb::Empty {}))
@@ -254,6 +256,8 @@ impl pb::tc_server::Tc for TcService {
             rollback_reason: v.rollback_reason,
             create_time: v.create_time,
             finish_time: v.finish_time,
+            retry_count: v.retry_count,
+            next_cron_time: v.next_cron_time,
             branches: v
                 .branches
                 .into_iter()

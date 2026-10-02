@@ -41,7 +41,8 @@ async fn main() -> anyhow::Result<()> {
     let store = Store::open(&db).await?;
     let store_for_auth = store.clone();
     // 按环境变量配超时/租约/退避，非法值退回默认
-    let driver = Driver::from_env(store.clone(), owner.clone());
+    let driver = Driver::from_env(store.clone(), owner.clone())
+        .with_alert(dtmrs::server::alert::AlertConfig::from_env());
     info!(db = %db, http = %addr, grpc = %grpc_addr, owner = %owner,
           branch_timeout = driver.http_timeout_secs(), lease = driver.lease,
           retry_initial = driver.retry.initial, retry_max = driver.retry.max, tick_ms,

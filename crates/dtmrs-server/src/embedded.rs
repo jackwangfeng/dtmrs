@@ -73,6 +73,7 @@ pub struct EmbeddedBuilder {
     tick: Duration,
     /// 代码里静态登记的主题订阅：(主题, 地址)
     topics: Vec<(String, String)>,
+    alert: Option<crate::alert::AlertConfig>,
 }
 
 impl EmbeddedBuilder {
@@ -84,6 +85,36 @@ impl EmbeddedBuilder {
     ///
     /// 跟存储里的订阅（[`Embedded::subscribe`]、HTTP 的 subscribe）取并集。
     /// `local://` 的订阅者在 [`start`](Self::start) 时检查是否注册了 handler。
+    /// 事务退避重试到第 `retry_limit` 轮（0 = 默认 3）时把它 POST 到 `url`。
+    /// 内容见 [`crate::alert::Alert`]。confirm 一直失败这类「刻意只重试」的卡住靠它发现
+    pub fn alert_webhook(mut self, url: &str, retry_limit: i64) -> Self {
+        self.alert = Some(crate::alert::AlertConfig {
+            sink: crate::alert::AlertSink::Webhook(url.to_string()),
+            retry_limit: if retry_limit > 0 {
+                retry_limit
+            } else {
+                crate::alert::DEFAULT_ALERT_RETRY_LIMIT
+            },
+        });
+        self
+    }
+
+    /// 同 [`Self::alert_webhook`]，但直接回调（接进宿主自己的监控）。**别在里面阻塞**
+    pub fn on_alert<F>(mut self, retry_limit: i64, f: F) -> Self
+    where
+        F: Fn(crate::alert::Alert) + Send + Sync + 'static,
+    {
+        self.alert = Some(crate::alert::AlertConfig {
+            sink: crate::alert::AlertSink::Callback(Arc::new(f)),
+            retry_limit: if retry_limit > 0 {
+                retry_limit
+            } else {
+                crate::alert::DEFAULT_ALERT_RETRY_LIMIT
+            },
+        });
+        self
+    }
+
     pub fn subscribe(mut self, topic: &str, url: &str) -> Self {
         self.topics.push((topic.to_string(), url.to_string()));
         self
@@ -141,6 +172,7 @@ impl EmbeddedBuilder {
         let registry = Arc::new(self.registry);
         let workflows = Arc::new(self.workflows);
         let driver = Driver::new(store.clone(), self.owner)
+            .with_alert(self.alert)
             .with_registry(registry.clone())
             .with_workflows(workflows.clone());
         // 常驻推进器。重启后未终结的事务会被它自动捞起继续推 —— 崩溃恢复就靠这个
@@ -184,6 +216,7 @@ impl Embedded {
             workflows: WorkflowRegistry::new(),
             tick: Duration::from_millis(200),
             topics: Vec::new(),
+            alert: None,
         }
     }
 
@@ -223,7 +256,14 @@ impl Embedded {
     /// 之后用 [`Tcc::try_branch`] 逐个分支「先登记、再跑 try」，全成功就
     /// [`Tcc::submit`]，任何一个不是 `Success` 就 [`Tcc::abort`]。
     pub async fn tcc(&self, gid: &str) -> anyhow::Result<Tcc<'_>> {
-        self.api.prepare(gid, "tcc", &[], "", None).await?;
+        self.tcc_with_timeout(gid, 0).await
+    }
+
+    /// 同 [`Self::tcc`]，指定这笔事务停在 prepared 的时限（秒，0 = 全局默认 35）：
+    /// 到点还没 submit / abort（发起方崩了），TC 自己转回滚、调 cancel。
+    /// try 阶段本来就要跑很久的业务用这个调大
+    pub async fn tcc_with_timeout(&self, gid: &str, timeout_secs: i64) -> anyhow::Result<Tcc<'_>> {
+        self.begin_two_phase(gid, "tcc", timeout_secs).await?;
         Ok(Tcc {
             tc: self,
             gid: gid.to_string(),
@@ -237,12 +277,35 @@ impl Embedded {
     /// commit / rollback 分支通常是个 `local://` handler，里面调 `dtmrs-xa` 的
     /// `commit_prepared` / `rollback_prepared`。
     pub async fn xa(&self, gid: &str) -> anyhow::Result<Xa<'_>> {
-        self.api.prepare(gid, "xa", &[], "", None).await?;
+        self.xa_with_timeout(gid, 0).await
+    }
+
+    /// 同 [`Self::xa`]，指定 prepared 时限。XA 尤其要紧：发起方崩了的话，
+    /// 各库里 PREPARE 过的事务会一直持锁，直到这个时限到了 TC 去 rollback
+    pub async fn xa_with_timeout(&self, gid: &str, timeout_secs: i64) -> anyhow::Result<Xa<'_>> {
+        self.begin_two_phase(gid, "xa", timeout_secs).await?;
         Ok(Xa {
             tc: self,
             gid: gid.to_string(),
             next: 0,
         })
+    }
+
+    async fn begin_two_phase(&self, gid: &str, tt: &str, timeout_secs: i64) -> anyhow::Result<()> {
+        self.api
+            .prepare_with(
+                gid,
+                tt,
+                &[],
+                "",
+                None,
+                &crate::api::PrepareOpts {
+                    timeout_to_fail: timeout_secs,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     /// 开一个二阶段消息。见 [`MsgBuilder`]。
@@ -272,6 +335,20 @@ impl Embedded {
         confirm: &str,
         cancel: &str,
     ) -> anyhow::Result<()> {
+        self.register_tcc_branch_with(gid, branch_id, confirm, cancel, "")
+            .await
+    }
+
+    /// 同 [`Self::register_tcc_branch`]，带分支的业务数据：confirm / cancel 收到的
+    /// 请求体（`BranchCtx::payload`）就是它。二阶段要知道 try 冻结了什么，靠它带过去
+    pub async fn register_tcc_branch_with(
+        &self,
+        gid: &str,
+        branch_id: &str,
+        confirm: &str,
+        cancel: &str,
+        payload: &str,
+    ) -> anyhow::Result<()> {
         self.check_local(&[confirm, cancel])?;
         self.api
             .register_branch(&RegisterBranch {
@@ -279,6 +356,7 @@ impl Embedded {
                 branch_id: branch_id.to_string(),
                 confirm: confirm.to_string(),
                 cancel: cancel.to_string(),
+                data: payload.to_string(),
                 ..Default::default()
             })
             .await?;
@@ -381,6 +459,15 @@ impl Embedded {
         topic: Option<&str>,
     ) -> anyhow::Result<Vec<dtmrs_store::TopicSub>> {
         Ok(self.api.list_topic_subs(topic).await?)
+    }
+
+    /// 卡住的事务（没终结、重试 ≥ `min_retries` 轮），最老的在前，带分支明细
+    pub async fn stuck(
+        &self,
+        min_retries: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::api::TransView>> {
+        Ok(self.api.list_stuck(min_retries, limit).await?)
     }
 
     /// `allow_empty_topic` 放行了多少次「主题没有订阅者」（进程内累计）。
@@ -573,15 +660,41 @@ impl Tcc<'_> {
         F: FnOnce(String) -> Fut,
         Fut: Future<Output = BranchResult>,
     {
-        let bid = self.register(confirm, cancel).await?;
+        self.try_branch_with(confirm, cancel, "", try_fn).await
+    }
+
+    /// 同 [`Self::try_branch`]，带分支的业务数据（confirm / cancel 共用一份）。
+    /// 比如 try 冻结了哪个账户、多少钱 —— 二阶段照着它解冻或扣减
+    pub async fn try_branch_with<F, Fut>(
+        &mut self,
+        confirm: &str,
+        cancel: &str,
+        payload: &str,
+        try_fn: F,
+    ) -> anyhow::Result<BranchResult>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: Future<Output = BranchResult>,
+    {
+        let bid = self.register_with(confirm, cancel, payload).await?;
         Ok(try_fn(bid).await)
     }
 
     /// 只登记下一个分支，返回分支号。try 自己去跑 —— **必须在这之后**。
     pub async fn register(&mut self, confirm: &str, cancel: &str) -> anyhow::Result<String> {
+        self.register_with(confirm, cancel, "").await
+    }
+
+    /// 同 [`Self::register`]，带分支的业务数据
+    pub async fn register_with(
+        &mut self,
+        confirm: &str,
+        cancel: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
         let bid = crate::driver::branch_id(self.next);
         self.tc
-            .register_tcc_branch(&self.gid, &bid, confirm, cancel)
+            .register_tcc_branch_with(&self.gid, &bid, confirm, cancel, payload)
             .await?;
         // 登记成功才占号：失败了重试这一步还用同一个号，不会留下空洞
         self.next += 1;
@@ -751,6 +864,7 @@ impl MsgBuilder<'_> {
                 &crate::api::PrepareOpts {
                     payloads,
                     allow_empty_topic: self.allow_empty_topic,
+                    ..Default::default()
                 },
             )
             .await?;

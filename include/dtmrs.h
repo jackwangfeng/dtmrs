@@ -118,6 +118,39 @@ int dtmrs_xa_register(DtmrsTc *tc, const char *gid, const char *branch_id,
 int dtmrs_msg_prepare(DtmrsTc *tc, const char *gid, const char *actions_json,
                       const char *query_prepared, int grace_secs);
 
+/* ---------------- TCC / XA 的补充（0.13） ----------------
+ *
+ * prepared 超时：begin 之后发起方崩了（没来 submit / abort），TC 到时限自己回滚 ——
+ * TCC 调 cancel，XA 调 rollback。默认 35 秒（同 DTM 的 timeout_to_fail），
+ * 环境变量 DTMRS_TIMEOUT_TO_FAIL 改全局默认，0 表示关掉。
+ * 只管 prepared：**已 submit 的 confirm / commit 失败照样无限重试，绝不转回滚**。
+ * 迟到的 try 由屏障挡住（cancel 先到 = 空回滚，try 后到 = 悬挂）。 */
+
+/* 同 dtmrs_tcc_begin / dtmrs_xa_begin，指定这笔事务的 prepared 时限（秒，0 = 全局默认）。
+ * try 阶段本来就要跑很久的业务用这个调大 */
+int dtmrs_tcc_begin_ex(DtmrsTc *tc, const char *gid, int timeout_secs);
+int dtmrs_xa_begin_ex(DtmrsTc *tc, const char *gid, int timeout_secs);
+
+/* 同 dtmrs_tcc_register，多一个 payload：分支的业务数据，confirm / cancel 收到的
+ * 请求体就是它（同 DTM registerBranch 的 data）。NULL = 不带。重复登记以第一次的为准 */
+int dtmrs_tcc_register_ex(DtmrsTc *tc, const char *gid, const char *branch_id,
+                          const char *confirm, const char *cancel, const char *payload);
+
+/* ---------------- 卡住的事务（0.13） ----------------
+ * confirm / commit 失败只能无限重试、等人介入（绝不转回滚）；msg 的订阅方一直失败也只能重试。
+ * 语义没错，但得有人知道它卡着。 */
+
+/* **start 之前**设告警：事务退避重试到第 retry_limit 轮（0 = 默认 3，同 DTM 的 AlertRetryLimit）
+ * 起每轮 POST JSON 到 url：
+ *   {"gid","trans_type","status","retry_count","rollback_reason","pending":[{"branch_id","op","url"}]}
+ * 退避封顶 300 秒，所以一笔事务最多 5 分钟一条。webhook 发不出去只打日志，不影响推进 */
+int dtmrs_alert_webhook(DtmrsTc *tc, const char *url, int retry_limit);
+
+/* 卡住的事务：没终结、退避重试 ≥ min_retries 轮，最老的在前（最多 100 笔），
+ * JSON 数组写进 out，每项同 HTTP GET /api/dtmsvr/query 的形状（带 retry_count / next_cron_time / branches）。
+ * out 不够大返回 DTMRS_ERR */
+int dtmrs_stuck(DtmrsTc *tc, int min_retries, char *out, size_t out_len);
+
 /* ---------------- 按主题投递（0.12） ----------------
  *
  * actions 里写 "topic://名字" 就是发到主题：prepare 时展开成**当时**的全部订阅者，

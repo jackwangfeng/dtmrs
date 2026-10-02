@@ -226,6 +226,7 @@ mod 等价 {
                 r#try: String::new(),
                 commit: String::new(),
                 rollback: String::new(),
+                data: String::new(),
             })
             .await
             .is_ok();
@@ -357,6 +358,7 @@ mod 等价 {
                     grace_secs: 0,
                     payloads: vec!["{}".into(); *n],
                     allow_empty_topic: *allow,
+                    ..Default::default()
                 })
                 .await
                 .is_ok(),
@@ -401,6 +403,45 @@ mod 等价 {
                 *want,
                 "{what}：应该{}",
                 if *want { "受理" } else { "拒绝" }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn 登记分支带的data两边都要落库() {
+        // 字段漏接是另一种漂移：两边都「受理」了，但一边把 data 丢了
+        let st = store().await;
+        let http_base = spawn_http(Api::new(st.clone())).await;
+        let mut cli = pb::tc_client::TcClient::connect(spawn_grpc(Api::new(st.clone())).await)
+            .await
+            .unwrap();
+        for gid in ["eq-data-h", "eq-data-g"] {
+            st.create_global(&tcc_rows(gid), &[]).await.unwrap();
+        }
+        let (c, b) = post(
+            &http_base,
+            "/api/dtmsvr/registerBranch",
+            r#"{"gid":"eq-data-h","branch_id":"01","confirm":"http://x/c","cancel":"http://x/n","data":"{\"amount\":1}"}"#,
+        )
+        .await;
+        assert!(accepted(c, &b), "{c} {b}");
+        cli.register_branch(pb::RegisterBranchRequest {
+            gid: "eq-data-g".into(),
+            branch_id: "01".into(),
+            confirm: "http://x/c".into(),
+            cancel: "http://x/n".into(),
+            data: r#"{"amount":1}"#.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        for gid in ["eq-data-h", "eq-data-g"] {
+            let rows = st.list_branches(gid).await.unwrap();
+            assert_eq!(rows.len(), 2, "{gid}");
+            assert!(
+                rows.iter().all(|r| r.payload == r#"{"amount":1}"#),
+                "{gid}: {:?}",
+                rows.iter().map(|r| &r.payload).collect::<Vec<_>>()
             );
         }
     }

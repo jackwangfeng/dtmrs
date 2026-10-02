@@ -16,7 +16,7 @@ Apache-2.0。只实现 DTM 的协议，不抄它的代码。
 
 ```bash
 cargo build --release                 # 二进制在 target/release/dtmrs
-cargo test --workspace                # 280 个测试（真库那部分会被跳过，见下）
+cargo test --workspace                # 305 个测试（真库那部分会被跳过，见下）
 cargo run --example embedded -p dtmrs-server   # 嵌入式模式的可运行示例
 cargo run --example workflow -p dtmrs-server   # workflow 模式（重放/断点续跑）
 
@@ -26,7 +26,7 @@ DTMRS_DB=sqlite:dtmrs.db DTMRS_ADDR=127.0.0.1:36789 ./target/release/dtmrs
 
 环境变量：`DTMRS_DB`（默认 `sqlite:dtmrs.db`）、`DTMRS_ADDR`（默认 `0.0.0.0:36789`）、
 `DTMRS_GRPC_ADDR`（默认 `0.0.0.0:36790`）、`DTMRS_OWNER`（默认 `tc-<pid>`，
-多实例部署时用来区分租约持有者）。
+多实例部署时用来区分租约持有者）。完整列表见 `docs/deployment.md`。
 
 编 gRPC 需要 **protoc**；关掉 `grpc` feature 就不需要（`dtmrs-ffi` 就是这么做的）。
 
@@ -217,6 +217,13 @@ crates/
   Redis 上只对 `dtmrs_core::status_contested` 的状态真比较（要走 Lua，落终态原本是 MULTI）。
   **改 `Api` 里 abort / submit 的放行规则时必须同步改 `status_contested`**，
   `外部能改的状态必须跟api的放行规则一致` 会逐格核对。
+- **prepared 的 TCC / XA 会超时回滚（0.13）**：「该不该超时、推到哪」在
+  `dtmrs_core::prepared_timeout_to`（只管 prepared，submitted 绝不返回回滚），driver 的
+  `process()` 开头落状态。调度条件因此改了**三处**：SQL `lock_one_due` 的 WHERE、Redis 的
+  `schedulable()` 和 `LUA_SCHEDULABLE` —— 少改一处两种后端行为就不一样。
+  ⚠ `tcc_rows()` 的调度时间仍是「现在」：它被嵌入式 workflow 当通用模板用，改成时限
+  会让 workflow 晚 35 秒才开推（踩过）。真正的 prepare 走 `tcc_rows_with_timeout`。
+  `release_lease` 的 interval 为 0（立刻重排）不算 `retry_count`。
 - **msg 按主题投递（`topic://`）在 prepare 时展开**（`dtmrs_core::expand_msg_steps`，纯函数），
   全局事务的 payload 存展开后的 `MsgBranch` 列表（带分支号和所属 step），推进器按它调，
   **不再按下标算分支号**（扇出是 `01-01`）。老数据靠 `serde(default)` + `fill_defaults` 兼容。

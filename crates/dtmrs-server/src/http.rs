@@ -60,6 +60,9 @@ struct PrepareReq {
     /// msg 用：`topic://` 没有订阅者时放行而不是报错（dtmrs 扩展）
     #[serde(default)]
     allow_empty_topic: bool,
+    /// tcc / xa 用：prepared 多少秒没人 submit / abort 就回滚（同 DTM），0 = 默认
+    #[serde(default)]
+    timeout_to_fail: i64,
 }
 
 /// subscribe / unsubscribe 的参数。**走 query string**，跟 DTM 一样（GET 请求）
@@ -116,6 +119,9 @@ struct RegisterBranchReq {
     commit: String,
     #[serde(default)]
     rollback: String,
+    /// 分支的业务数据（字段名同 DTM），confirm / cancel 收到的请求体
+    #[serde(default)]
+    data: String,
 }
 
 fn default_trans_type() -> String {
@@ -263,6 +269,7 @@ fn routes(app: App) -> Router {
         .route("/api/dtmsvr/retry", post(retry))
         .route("/api/dtmsvr/query", get(query))
         .route("/api/dtmsvr/all", get(all))
+        .route("/api/dtmsvr/stuck", get(stuck))
         .merge(topic_routes())
         .route("/health", get(|| async { "ok" }))
         // 管理台。单文件内嵌，没有构建步骤也没有外部依赖 ——
@@ -292,6 +299,7 @@ async fn prepare(State(app): State<App>, Json(req): Json<PrepareReq>) -> (Status
                 &PrepareOpts {
                     payloads: req.payloads,
                     allow_empty_topic: req.allow_empty_topic,
+                    timeout_to_fail: req.timeout_to_fail,
                 },
             )
             .await,
@@ -418,6 +426,7 @@ async fn register_branch(
                 r#try: req.r#try,
                 commit: req.commit,
                 rollback: req.rollback,
+                data: req.data,
             })
             .await,
     )
@@ -447,6 +456,33 @@ async fn query(
     Query(q): Query<GidQuery>,
 ) -> Result<Json<TransView>, (StatusCode, Json<Reply>)> {
     app.api.query(&q.gid).await.map(Json).map_err(http_err)
+}
+
+#[derive(Deserialize)]
+struct StuckReq {
+    /// 至少重试了几轮，默认 3（同告警的默认上限）
+    #[serde(default)]
+    min_retries: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// 卡住的事务：`GET /api/dtmsvr/stuck?min_retries=3&limit=100`。
+/// confirm 一直失败、订阅方一直失败这类「刻意只重试」的事务在这里能看到
+async fn stuck(State(app): State<App>, Query(q): Query<StuckReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match app
+        .api
+        .list_stuck(
+            q.min_retries
+                .unwrap_or(crate::alert::DEFAULT_ALERT_RETRY_LIMIT),
+            q.limit.unwrap_or(100),
+        )
+        .await
+    {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => http_err(e).into_response(),
+    }
 }
 
 async fn all(State(app): State<App>) -> Json<Vec<TransView>> {

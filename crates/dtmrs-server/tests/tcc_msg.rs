@@ -358,12 +358,15 @@ async fn msg_prepared状态会被cron捞起来() {
     assert!(got.is_some(), "prepared 的 msg 必须能被 cron 捞到");
     assert_eq!(got.unwrap().gid, "msg-5");
 
-    // 对照：prepared 的 tcc 不该被捞
+    // 对照：prepared 的 tcc **在时限之前**不该被捞（try 阶段由客户端驱动）。
+    // 0.13 起时限到了会被捞去超时回滚，见 tests/timeout.rs
     let s2 = store().await;
-    s2.create_global(&tcc_rows("tcc-x"), &[]).await.unwrap();
+    s2.create_global(&dtmrs_server::tcc_rows_with_timeout("tcc-x", 30), &[])
+        .await
+        .unwrap();
     assert!(
         s2.lock_one_due("tc", 30).await.unwrap().is_none(),
-        "prepared 的 tcc 不能被 cron 碰，那是客户端的 try 阶段"
+        "时限之前 prepared 的 tcc 不能被 cron 碰，那是客户端的 try 阶段"
     );
 }
 
@@ -466,6 +469,7 @@ async fn 登记分支(状态: GlobalStatus) -> Result<(), dtmrs_server::api::Api
         r#try: "http://x/try".into(),
         commit: String::new(),
         rollback: String::new(),
+        data: String::new(),
     })
     .await
 }
@@ -536,6 +540,7 @@ async fn 登记分支号(bid: &str) -> Result<(), dtmrs_server::api::ApiError> {
         r#try: "http://x/try".into(),
         commit: String::new(),
         rollback: String::new(),
+        data: String::new(),
     })
     .await
 }
@@ -688,6 +693,7 @@ async fn 登记(
         r#try: format!("{base}/try"),
         commit: String::new(),
         rollback: String::new(),
+        data: String::new(),
     })
     .await
 }

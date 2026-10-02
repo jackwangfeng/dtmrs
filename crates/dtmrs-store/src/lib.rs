@@ -134,6 +134,12 @@ pub struct GlobalRow {
     pub query_prepared: String,
     pub create_time: i64,
     pub finish_time: Option<i64>,
+    /// TCC / XA 停在 prepared 的时限（秒）。0 = 用全局默认（`DTMRS_TIMEOUT_TO_FAIL`，
+    /// 默认 35）。到点 TC 自己转回滚，见 `dtmrs_core::prepared_timeout_to`
+    pub timeout_to_fail: i64,
+    /// 退避重试了多少轮（推进器每次因分支没成功而退避就加一）。
+    /// 看「卡住了多久」和触发告警用；只增不减
+    pub retry_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +316,8 @@ impl SqlStore {
               lease_until        BIGINT NOT NULL DEFAULT 0,
               rollback_reason    {mid} NOT NULL,
               query_prepared     {mid} NOT NULL,
+              timeout_to_fail    BIGINT NOT NULL DEFAULT 0,
+              retry_count        BIGINT NOT NULL DEFAULT 0,
               create_time        BIGINT NOT NULL,
               update_time        BIGINT NOT NULL,
               finish_time        BIGINT,
@@ -467,7 +475,7 @@ impl SqlStore {
     /// 加新列时在这个数组里加一行就行。
     async fn add_missing_columns(&self) -> Result<()> {
         let mid = self.be.text(MID);
-        let adds: [(&str, String); 2] = [
+        let adds: [(&str, String); 4] = [
             ("auth_token", format!("secret {mid} NOT NULL DEFAULT ''")),
             // 0.11：租约单独一列（见 GlobalRow::lease_until）。老行补出来是 0 =
             // 没人持有，正在跑的老租约会失效一次 —— 最坏是升级那一刻某笔被推两遍，
@@ -476,6 +484,15 @@ impl SqlStore {
             (
                 "trans_global",
                 "lease_until BIGINT NOT NULL DEFAULT 0".to_string(),
+            ),
+            // 0.13：prepared 超时回滚 + 重试计数。老行是 0 = 用全局默认时限 / 还没重试过
+            (
+                "trans_global",
+                "timeout_to_fail BIGINT NOT NULL DEFAULT 0".to_string(),
+            ),
+            (
+                "trans_global",
+                "retry_count BIGINT NOT NULL DEFAULT 0".to_string(),
             ),
         ];
         for (table, coldef) in adds {
@@ -519,8 +536,9 @@ impl SqlStore {
         let t = now();
         let n = sqlx::query(&self.be.q("{INS} trans_global
              (gid,trans_type,status,payload,next_cron_time,next_cron_interval,
-              owner,lease_until,rollback_reason,query_prepared,create_time,update_time)
-             VALUES (?,?,?,?,?,?,?,?,'',?,?,?)
+              owner,lease_until,rollback_reason,query_prepared,create_time,update_time,
+              timeout_to_fail)
+             VALUES (?,?,?,?,?,?,?,?,'',?,?,?,?)
              {NOCONFLICT}"))
         .bind(&g.gid)
         .bind(g.trans_type.to_string())
@@ -537,6 +555,7 @@ impl SqlStore {
         .bind(&g.query_prepared)
         .bind(t)
         .bind(t)
+        .bind(g.timeout_to_fail)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -833,7 +852,7 @@ impl SqlStore {
         let gid: Option<String> = sqlx::query_scalar(&self.be.q(&format!(
             "SELECT gid FROM trans_global
              WHERE (status IN ('submitted','aborting')
-                    OR (status = 'prepared' AND trans_type = 'msg'))
+                    OR (status = 'prepared' AND trans_type IN ('msg','tcc','xa')))
                AND next_cron_time <= ?
                AND lease_until <= ?
              LIMIT 1{}",
@@ -914,12 +933,15 @@ impl SqlStore {
         let t = now();
         sqlx::query(&self.be.q(
             "UPDATE trans_global SET
+               retry_count = retry_count + ?,
                next_cron_interval = CASE WHEN next_cron_time < lease_until THEN 0 ELSE ? END,
                next_cron_time = CASE WHEN next_cron_time < lease_until THEN next_cron_time ELSE ? END,
                update_time = ?,
                lease_until = 0
              WHERE gid=? AND lease_until=?",
         ))
+        // interval 为 0 是「状态被外面改了、立刻重排」，不算一轮重试
+        .bind(i64::from(interval > 0))
         .bind(interval)
         .bind(t + interval)
         .bind(t)
@@ -1015,22 +1037,36 @@ impl SqlStore {
         branch_id: &str,
         ops: &[(BranchOp, String)],
     ) -> Result<RegisterOutcome> {
+        self.register_branch_with(gid, branch_id, ops, "").await
+    }
+
+    /// 同 `register_branch`，带分支的业务数据（TCC 的 confirm / cancel 共用一份）。
+    /// 重复登记以**第一次**的数据为准（跟地址不同，数据不同不算撞号）
+    pub async fn register_branch_with(
+        &self,
+        gid: &str,
+        branch_id: &str,
+        ops: &[(BranchOp, String)],
+        payload: &str,
+    ) -> Result<RegisterOutcome> {
         len_ok("gid", gid, Backend::ID_MAX)?;
         len_ok("branch_id", branch_id, Backend::ID_MAX)?;
         for (_, url) in ops {
             len_ok("url", url, MID)?;
         }
+        len_ok("payload", payload, MID)?;
         let mut tx = self.pool.begin().await?;
         let t = now();
         for (op, url) in ops {
             sqlx::query(&self.be.q("{INS} trans_branch_op
                  (gid,branch_id,op,url,payload,status,create_time,update_time)
-                 VALUES (?,?,?,?,'',?,?,?)
+                 VALUES (?,?,?,?,?,?,?,?)
                  {NOCONFLICT}"))
             .bind(gid)
             .bind(branch_id)
             .bind(op.as_str())
             .bind(url)
+            .bind(payload)
             .bind(BranchStatus::Prepared.as_str())
             .bind(t)
             .bind(t)
@@ -1073,11 +1109,26 @@ impl SqlStore {
         .await?;
         Ok(rows.into_iter().map(global_from_row).collect())
     }
+
+    /// 卡住的事务：还没终结、退避重试了至少 `min_retries` 轮。**最老的在前**
+    /// （卡得最久的最该先看）。给管理台 / 巡检用，不在热路径上
+    pub async fn list_stuck(&self, min_retries: i64, limit: i64) -> Result<Vec<GlobalRow>> {
+        let rows = sqlx::query(&self.be.q(&format!(
+            "{SELECT_GLOBAL} WHERE status IN ('prepared','submitted','aborting')
+               AND retry_count >= ? ORDER BY create_time LIMIT ?"
+        )))
+        .bind(min_retries)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(global_from_row).collect())
+    }
 }
 
 /// 列清单只写一处 —— 三个地方读 trans_global，列顺序漂移过一次就够难查了
 const SELECT_GLOBAL: &str = "SELECT gid,trans_type,status,payload,next_cron_time,
-    next_cron_interval,owner,lease_until,rollback_reason,query_prepared,create_time,finish_time
+    next_cron_interval,owner,lease_until,rollback_reason,query_prepared,create_time,finish_time,
+    timeout_to_fail,retry_count
     FROM trans_global";
 
 fn token_from_row(r: &AnyRow) -> TokenRow {
@@ -1109,6 +1160,8 @@ fn global_from_row(r: AnyRow) -> GlobalRow {
         query_prepared: r.get("query_prepared"),
         create_time: r.get("create_time"),
         finish_time: r.get("finish_time"),
+        timeout_to_fail: r.get("timeout_to_fail"),
+        retry_count: r.get("retry_count"),
     }
 }
 
@@ -1314,6 +1367,8 @@ mod tests {
             query_prepared: String::new(),
             create_time: 0,
             finish_time: None,
+            timeout_to_fail: 0,
+            retry_count: 0,
         }
     }
 
@@ -1781,26 +1836,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn msg的prepared会被捞tcc的不会() {
+    async fn prepared的msg和到期的tcc_xa会被捞_没到期的不会() {
+        // 0.13 之前 prepared 的 tcc 永远不会被捞 —— 发起方崩了就没人收尾。
+        // 现在到期（next_cron_time 排的是 prepared 时限）就要被捞去超时回滚
         let (_g, bes) = backends().await;
         for (name, s) in bes {
             let mut m = g("m1");
             m.trans_type = TransType::Msg;
             m.status = GlobalStatus::Prepared;
             s.create_global(&m, &[]).await.unwrap();
-            let mut t = g("c1");
-            t.trans_type = TransType::Tcc;
-            t.status = GlobalStatus::Prepared;
-            s.create_global(&t, &[]).await.unwrap();
+            for (gid, tt) in [("c1", TransType::Tcc), ("x1", TransType::Xa)] {
+                let mut t = g(gid);
+                t.trans_type = tt;
+                t.status = GlobalStatus::Prepared;
+                s.create_global(&t, &[]).await.unwrap();
+            }
+            let mut later = g("c2");
+            later.trans_type = TransType::Tcc;
+            later.status = GlobalStatus::Prepared;
+            later.next_cron_time = now() + 3600;
+            s.create_global(&later, &[]).await.unwrap();
+            // prepared 的 saga 不存在于正常流程，也不该被捞
+            let mut sg = g("s1");
+            sg.status = GlobalStatus::Prepared;
+            s.create_global(&sg, &[]).await.unwrap();
 
-            let got = s.lock_one_due("w", 60).await.unwrap();
-            assert_eq!(
-                got.map(|x| x.gid),
-                Some("m1".to_string()),
-                "{name}: 只该捞到 msg"
-            );
-            // 再捞一次应该没有了（msg 被租约占住，tcc 不该被碰）
-            assert!(s.lock_one_due("w2", 60).await.unwrap().is_none(), "{name}");
+            let mut got = Vec::new();
+            while let Some(x) = s.lock_one_due("w", 60).await.unwrap() {
+                got.push(x.gid);
+                assert!(got.len() <= 5, "{name}: 捞个没完");
+            }
+            got.sort();
+            assert_eq!(got, ["c1", "m1", "x1"], "{name}");
         }
     }
 
@@ -2128,5 +2195,9 @@ dispatch! {
     /// 登记分支。**重号但 URL 不同时返回 [`RegisterOutcome::Conflict`]**，
     /// 调用方必须拒绝 —— 见那个类型的文档
     fn register_branch(&self, gid: &str, branch_id: &str, ops: &[(BranchOp, String)]) -> RegisterOutcome;
+    /// 同上，带分支的业务数据（TCC 的 confirm / cancel 共用一份）。重复登记以第一次的为准
+    fn register_branch_with(&self, gid: &str, branch_id: &str, ops: &[(BranchOp, String)], payload: &str) -> RegisterOutcome;
     fn list_recent(&self, limit: i64) -> Vec<GlobalRow>;
+    /// 卡住的事务（没终结、重试 ≥ `min_retries` 轮），最老的在前
+    fn list_stuck(&self, min_retries: i64, limit: i64) -> Vec<GlobalRow>;
 }

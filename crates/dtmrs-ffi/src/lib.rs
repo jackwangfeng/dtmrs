@@ -157,6 +157,8 @@ pub struct DtmrsTc {
     pending_wf: Option<Vec<(String, WorkflowPtr)>>,
     /// start 之前收集的静态主题订阅 (主题, 地址)
     pending_topics: Option<Vec<(String, String)>>,
+    /// start 之前设的告警 webhook：(地址, 第几轮开始报)
+    pending_alert: Option<(String, i64)>,
     db: String,
     tc: Option<Embedded>,
     pull: Arc<PullQueue>,
@@ -300,6 +302,7 @@ pub extern "C" fn dtmrs_open(db_url: *const c_char) -> *mut DtmrsTc {
         pending: Some(Vec::new()),
         pending_pull: Some(Vec::new()),
         pending_topics: Some(Vec::new()),
+        pending_alert: None,
         pending_wf: Some(Vec::new()),
         db: db.to_string(),
         tc: None,
@@ -500,6 +503,9 @@ pub extern "C" fn dtmrs_start(tc: *mut DtmrsTc) -> c_int {
     let mut b = Embedded::builder(&h.db).tick(Duration::from_millis(50));
     for (t, u) in h.pending_topics.take().unwrap_or_default() {
         b = b.subscribe(&t, &u);
+    }
+    if let Some((url, limit)) = h.pending_alert.take() {
+        b = b.alert_webhook(&url, limit);
     }
 
     for (name, wp) in pending_wf {
@@ -727,6 +733,89 @@ pub extern "C" fn dtmrs_tcc_register(
     };
     let inner = h.tc.as_ref().unwrap();
     run(h, inner.register_tcc_branch(gid, bid, c, x))
+}
+
+/// 同 `dtmrs_tcc_register`，多一个 `payload`：分支的业务数据，confirm / cancel 收到的
+/// 请求体就是它（同 DTM registerBranch 的 data）。二阶段要知道 try 冻结了什么，
+/// 靠它带过去。传 NULL 等于不带。重复登记以第一次的为准
+#[no_mangle]
+pub extern "C" fn dtmrs_tcc_register_ex(
+    tc: *mut DtmrsTc,
+    gid: *const c_char,
+    branch_id: *const c_char,
+    confirm: *const c_char,
+    cancel: *const c_char,
+    payload: *const c_char,
+) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
+    let (Some(gid), Some(bid), Some(c), Some(x)) = (unsafe {
+        (
+            cstr(gid, "gid"),
+            cstr(branch_id, "branch_id"),
+            cstr(confirm, "confirm"),
+            cstr(cancel, "cancel"),
+        )
+    }) else {
+        return DTMRS_ERR;
+    };
+    let p = if payload.is_null() {
+        ""
+    } else {
+        match unsafe { cstr(payload, "payload") } {
+            Some(p) => p,
+            None => return DTMRS_ERR,
+        }
+    };
+    let inner = h.tc.as_ref().unwrap();
+    run(h, inner.register_tcc_branch_with(gid, bid, c, x, p))
+}
+
+/// 同 `dtmrs_tcc_begin`，指定这笔事务停在 prepared 的时限（秒，0 = 全局默认 35）：
+/// 到点还没 `dtmrs_submit` / `dtmrs_abort`（发起方崩了），TC 自己走 cancel
+#[no_mangle]
+pub extern "C" fn dtmrs_tcc_begin_ex(
+    tc: *mut DtmrsTc,
+    gid: *const c_char,
+    timeout_secs: c_int,
+) -> c_int {
+    begin_ex(tc, gid, timeout_secs, false)
+}
+
+/// 同 `dtmrs_xa_begin`，指定 prepared 时限。到点 TC 自己走 rollback ——
+/// 不然发起方崩了的话，各库里 PREPARE 过的事务会一直持锁
+#[no_mangle]
+pub extern "C" fn dtmrs_xa_begin_ex(
+    tc: *mut DtmrsTc,
+    gid: *const c_char,
+    timeout_secs: c_int,
+) -> c_int {
+    begin_ex(tc, gid, timeout_secs, true)
+}
+
+fn begin_ex(tc: *mut DtmrsTc, gid: *const c_char, timeout_secs: c_int, xa: bool) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
+    let Some(gid) = (unsafe { cstr(gid, "gid") }) else {
+        return DTMRS_ERR;
+    };
+    if timeout_secs < 0 {
+        set_err("timeout_secs 不能是负数（0 = 全局默认）");
+        return DTMRS_ERR;
+    }
+    let inner = h.tc.as_ref().unwrap();
+    let t = i64::from(timeout_secs);
+    if xa {
+        run(h, async { inner.xa_with_timeout(gid, t).await.map(|_| ()) })
+    } else {
+        run(h, async {
+            inner.tcc_with_timeout(gid, t).await.map(|_| ())
+        })
+    }
 }
 
 /// 开一个 XA 事务。幂等。
@@ -997,6 +1086,57 @@ pub extern "C" fn dtmrs_serve_topic_api(
             DTMRS_ERR
         }
     }
+}
+
+/// **start 之前**设告警：事务退避重试到第 `retry_limit` 轮（0 = 默认 3）起，每轮把
+/// `{gid, trans_type, status, retry_count, rollback_reason, pending:[{branch_id,op,url}]}`
+/// POST 到 `url`。confirm 一直失败这类「只能重试、等人介入」的卡住靠它发现
+#[no_mangle]
+pub extern "C" fn dtmrs_alert_webhook(
+    tc: *mut DtmrsTc,
+    url: *const c_char,
+    retry_limit: c_int,
+) -> c_int {
+    clear_err();
+    let Some(h) = (unsafe { tc.as_mut() }) else {
+        set_err("句柄是空指针");
+        return DTMRS_ERR;
+    };
+    let Some(u) = (unsafe { cstr(url, "url") }) else {
+        return DTMRS_ERR;
+    };
+    if h.tc.is_some() {
+        set_err("已经 start 了，告警要在 start 之前设");
+        return DTMRS_ERR;
+    }
+    h.pending_alert = Some((u.to_string(), i64::from(retry_limit)));
+    DTMRS_OK
+}
+
+/// 卡住的事务：没终结、重试 ≥ `min_retries` 轮，最老的在前，JSON 数组写进 `out`
+/// （每项同 HTTP `GET /api/dtmsvr/query` 的形状，多了 `retry_count` / `next_cron_time`）。
+/// 成功返回 DTMRS_OK；`out` 不够大返回 DTMRS_ERR（last_error 里有需要的字节数）
+#[no_mangle]
+pub extern "C" fn dtmrs_stuck(
+    tc: *mut DtmrsTc,
+    min_retries: c_int,
+    out: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    clear_err();
+    let Some(h) = started(tc) else {
+        return DTMRS_ERR;
+    };
+    let inner = h.tc.as_ref().unwrap();
+    let v = match h.rt.block_on(inner.stuck(i64::from(min_retries), 100)) {
+        Ok(v) => v,
+        Err(e) => {
+            set_err(format!("{e}"));
+            return DTMRS_ERR;
+        }
+    };
+    let js = serde_json::to_string(&v).unwrap_or_else(|_| "[]".into());
+    write_out(&js, out, out_len)
 }
 
 /// `DTMRS_MSG_ALLOW_EMPTY_TOPIC` 放行了多少次「主题没有订阅者」。没 start 返回 0。
@@ -2232,6 +2372,152 @@ mod tests {
         assert!(std::net::TcpStream::connect(("127.0.0.1", port as u16)).is_err());
         assert_eq!(dtmrs_empty_topic_count(std::ptr::null_mut()), 0);
         drop((ra, rq, pay_log));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口tcc登记带数据_confirm收到它() {
+        let (url, path) = db("tcc_pl");
+        let tc = dtmrs_open(url.as_ptr());
+        let pay_log: Box<Mutex<Vec<String>>> = Box::new(Mutex::new(Vec::new()));
+        let ud = &*pay_log as *const Mutex<Vec<String>> as *mut c_void;
+        dtmrs_register_ex(tc, cs("confirm").as_ptr(), Some(pay_handler), ud);
+        dtmrs_register_ex(tc, cs("cancel").as_ptr(), Some(pay_handler), ud);
+        assert_eq!(dtmrs_start(tc), DTMRS_OK);
+        let g = cs("ffi-tcc-pl");
+        assert_eq!(
+            dtmrs_tcc_begin_ex(tc, g.as_ptr(), -1),
+            DTMRS_ERR,
+            "负数时限要拒绝"
+        );
+        assert_eq!(
+            dtmrs_tcc_begin_ex(tc, g.as_ptr(), 60),
+            DTMRS_OK,
+            "{}",
+            last_err()
+        );
+        assert_eq!(
+            dtmrs_tcc_register_ex(
+                tc,
+                g.as_ptr(),
+                cs("01").as_ptr(),
+                cs("local://confirm").as_ptr(),
+                cs("local://cancel").as_ptr(),
+                cs(r#"{"amount":100}"#).as_ptr()
+            ),
+            DTMRS_OK,
+            "{}",
+            last_err()
+        );
+        assert_eq!(dtmrs_submit(tc, g.as_ptr()), DTMRS_OK);
+        assert_eq!(wait(tc, "ffi-tcc-pl"), "succeed");
+        assert_eq!(*pay_log.lock().unwrap(), [r#"pay@01:{"amount":100}"#]);
+        dtmrs_close(tc);
+        drop(pay_log);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口xa发起方崩了_到时限tc自己rollback() {
+        let (tc, log, _k, path) = tc_with(
+            "xa_to",
+            &[("commit", DTMRS_SUCCESS), ("rollback", DTMRS_SUCCESS)],
+        );
+        let g = cs("ffi-xa-to");
+        assert_eq!(
+            dtmrs_xa_begin_ex(tc, g.as_ptr(), 1),
+            DTMRS_OK,
+            "{}",
+            last_err()
+        );
+        assert_eq!(
+            dtmrs_xa_register(
+                tc,
+                g.as_ptr(),
+                cs("01").as_ptr(),
+                cs("local://commit").as_ptr(),
+                cs("local://rollback").as_ptr()
+            ),
+            DTMRS_OK
+        );
+        // 宿主到这里「崩了」：不 submit 也不 abort
+        assert_eq!(wait(tc, "ffi-xa-to"), "failed");
+        assert_eq!(*log.lock().unwrap(), ["rollback@01"]);
+        dtmrs_close(tc);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn c接口告警要在start之前设_卡住的事务能查到() {
+        let (url, path) = db("stuck");
+        let tc = dtmrs_open(url.as_ptr());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let fail = Box::new(Rec {
+            tag: "confirm",
+            ret: DTMRS_FAILURE,
+            log: log.clone(),
+        });
+        dtmrs_register_ex(
+            tc,
+            cs("confirm").as_ptr(),
+            Some(rec_handler),
+            &*fail as *const Rec as *mut c_void,
+        );
+        dtmrs_register_ex(
+            tc,
+            cs("cancel").as_ptr(),
+            Some(rec_handler),
+            &*fail as *const Rec as *mut c_void,
+        );
+        assert_eq!(
+            dtmrs_alert_webhook(tc, cs("http://127.0.0.1:9/a").as_ptr(), 1),
+            DTMRS_OK
+        );
+        assert_eq!(dtmrs_start(tc), DTMRS_OK);
+        assert_eq!(
+            dtmrs_alert_webhook(tc, cs("http://127.0.0.1:9/a").as_ptr(), 1),
+            DTMRS_ERR,
+            "start 之后不能再设"
+        );
+        let g = cs("ffi-stuck");
+        dtmrs_tcc_begin(tc, g.as_ptr());
+        dtmrs_tcc_register(
+            tc,
+            g.as_ptr(),
+            cs("01").as_ptr(),
+            cs("local://confirm").as_ptr(),
+            cs("local://cancel").as_ptr(),
+        );
+        assert_eq!(dtmrs_submit(tc, g.as_ptr()), DTMRS_OK);
+        // 等它重试一轮（嵌入式默认 10 秒起退避，第一轮失败就记一次）
+        let mut buf = vec![0u8; 8192];
+        let mut found = false;
+        for _ in 0..100 {
+            assert_eq!(
+                dtmrs_stuck(tc, 1, buf.as_mut_ptr() as *mut c_char, buf.len()),
+                DTMRS_OK,
+                "{}",
+                last_err()
+            );
+            let js = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            if js.contains("ffi-stuck") {
+                assert!(js.contains("\"retry_count\":1"), "{js}");
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(found, "卡住的事务要能查到");
+        assert_eq!(
+            dtmrs_stuck(tc, 1, buf.as_mut_ptr() as *mut c_char, 4),
+            DTMRS_ERR,
+            "缓冲区太小要报错"
+        );
+        dtmrs_close(tc);
+        drop(fail);
         let _ = std::fs::remove_file(path);
     }
 

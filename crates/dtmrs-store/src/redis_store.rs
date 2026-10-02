@@ -76,14 +76,15 @@ fn err(msg: &str) -> redis::RedisError {
 /// 会有不同的推进行为。Lua 脚本里也有一份同样的判断（防索引漂移）。
 fn schedulable(status: GlobalStatus, tt: TransType) -> bool {
     matches!(status, GlobalStatus::Submitted | GlobalStatus::Aborting)
-        || (status == GlobalStatus::Prepared && tt == TransType::Msg)
+        || (status == GlobalStatus::Prepared
+            && matches!(tt, TransType::Msg | TransType::Tcc | TransType::Xa))
 }
 
 /// 每个脚本都要用的那段判断，避免抄三遍抄漏
 const LUA_SCHEDULABLE: &str = r#"
 local function schedulable(status, tt)
   if status == 'submitted' or status == 'aborting' then return true end
-  if status == 'prepared' and tt == 'msg' then return true end
+  if status == 'prepared' and (tt == 'msg' or tt == 'tcc' or tt == 'xa') then return true end
   return false
 end
 "#;
@@ -309,6 +310,9 @@ impl RedisStore {
             create_time: num("create_time"),
             // 没到终态时这个字段压根不存在，不能当成 0
             finish_time: map.get("finish_time").and_then(|v| v.parse::<i64>().ok()),
+            // 老数据没有这两个字段 = 用默认时限 / 没重试过
+            timeout_to_fail: num("timeout_to_fail"),
+            retry_count: num("retry_count"),
         })
     }
 
@@ -336,13 +340,13 @@ impl RedisStore {
                 'payload', ARGV[4], 'next_cron_time', ARGV[5],
                 'next_cron_interval', ARGV[6], 'owner', ARGV[10], 'rollback_reason', '',
                 'query_prepared', ARGV[7], 'create_time', ARGV[8], 'update_time', ARGV[8],
-                'lease_until', ARGV[11])
-            -- 分支从第 12 个 ARGV 开始，每两个一组（field, value），
+                'lease_until', ARGV[11], 'timeout_to_fail', ARGV[12])
+            -- 分支从第 13 个 ARGV 开始，每两个一组（field, value），
             -- 定义和状态各占一组。**一条 HSET 全写完** —— 原来是每个字段
             -- 一条 HSETNX，分支多的时候命令数线性涨。
             -- 上面已经确认过全局键不存在，所以不需要 NX 语义
-            if #ARGV >= 12 then
-                redis.call('HSET', KEYS[2], unpack(ARGV, 12))
+            if #ARGV >= 13 then
+                redis.call('HSET', KEYS[2], unpack(ARGV, 13))
             end
             if ARGV[9] == '1' then
                 redis.call('ZADD', KEYS[3], ARGV[5], ARGV[1])
@@ -382,7 +386,8 @@ impl RedisStore {
             // ⚠ owner 要真的写进去（原来写死空串）。提交方可以在建事务时
             // 就把租约占在自己手上，直接开推，省掉一次抢占往返 —— 见 `Api::submit`
             .arg(&g.owner)
-            .arg(g.lease_until);
+            .arg(g.lease_until)
+            .arg(g.timeout_to_fail);
         for b in branches {
             inv.arg(Self::bfield(&b.branch_id, b.op))
                 .arg(Self::branch_value(b));
@@ -689,6 +694,8 @@ impl RedisStore {
             end
             redis.call('HSET', KEYS[1], 'next_cron_time', newt, 'next_cron_interval', newi,
                        'lease_until', 0, 'update_time', ARGV[4])
+            -- interval 为 0 是「状态被外面改了、立刻重排」，不算一轮重试（同 SQL）
+            if tonumber(ARGV[3]) > 0 then redis.call('HINCRBY', KEYS[1], 'retry_count', 1) end
             -- 只更新已经在索引里的，别把不该调度的塞回去
             if redis.call('ZSCORE', KEYS[2], ARGV[5]) then
                 redis.call('ZADD', KEYS[2], newt, ARGV[5])
@@ -904,11 +911,23 @@ impl RedisStore {
         branch_id: &str,
         ops: &[(BranchOp, String)],
     ) -> Result<crate::RegisterOutcome> {
+        self.register_branch_with(gid, branch_id, ops, "").await
+    }
+
+    /// 语义同 SQL 后端：重复登记以第一次的数据为准（HSETNX 本来就是这样）
+    pub async fn register_branch_with(
+        &self,
+        gid: &str,
+        branch_id: &str,
+        ops: &[(BranchOp, String)],
+        payload: &str,
+    ) -> Result<crate::RegisterOutcome> {
         check_len("gid", gid, Backend::ID_MAX).map_err(|e| err(&e.to_string()))?;
         check_len("branch_id", branch_id, Backend::ID_MAX).map_err(|e| err(&e.to_string()))?;
         for (_, url) in ops {
             check_len("url", url, MID).map_err(|e| err(&e.to_string()))?;
         }
+        check_len("payload", payload, MID).map_err(|e| err(&e.to_string()))?;
         let mut c = self.conn.clone();
         for (op, url) in ops {
             let row = BranchRow {
@@ -916,7 +935,7 @@ impl RedisStore {
                 branch_id: branch_id.to_string(),
                 op: *op,
                 url: url.clone(),
-                payload: String::new(),
+                payload: payload.to_string(),
                 status: BranchStatus::Prepared,
             };
             // hset_nx 返回 1=写进去了 / 0=这个字段已经有值了。
@@ -963,6 +982,26 @@ impl RedisStore {
                 out.push(g);
             }
         }
+        Ok(out)
+    }
+
+    /// 语义同 SQL 后端。没终结的事务都在调度索引里（`schedulable` 覆盖了所有
+    /// 非终态），所以扫它就够，不用扫全库
+    pub async fn list_stuck(&self, min_retries: i64, limit: i64) -> Result<Vec<GlobalRow>> {
+        let mut c = self.conn.clone();
+        let gids: Vec<String> = c.zrange(self.ikey(), 0, -1).await?;
+        let mut out = Vec::new();
+        for gid in gids {
+            let map: std::collections::HashMap<String, String> = c.hgetall(self.gkey(&gid)).await?;
+            if let Some(g) = Self::global_from(&map) {
+                if !g.status.is_final() && g.retry_count >= min_retries {
+                    out.push(g);
+                }
+            }
+        }
+        // 跟 SQL 的 ORDER BY create_time 一致
+        out.sort_by_key(|g| g.create_time);
+        out.truncate(limit.max(0) as usize);
         Ok(out)
     }
 
@@ -1195,8 +1234,10 @@ mod tests {
         assert!(schedulable(GlobalStatus::Aborting, TransType::Saga));
         // 只有 msg 的 prepared 要被捞起来回查
         assert!(schedulable(GlobalStatus::Prepared, TransType::Msg));
-        assert!(!schedulable(GlobalStatus::Prepared, TransType::Tcc));
-        assert!(!schedulable(GlobalStatus::Prepared, TransType::Xa));
+        // 0.13 起 prepared 的 tcc / xa 也要调度：到时限没人 submit 就超时回滚
+        assert!(schedulable(GlobalStatus::Prepared, TransType::Tcc));
+        assert!(schedulable(GlobalStatus::Prepared, TransType::Xa));
+        assert!(!schedulable(GlobalStatus::Prepared, TransType::Saga));
         // 终态一律不调度
         for tt in [TransType::Saga, TransType::Msg, TransType::Workflow] {
             assert!(!schedulable(GlobalStatus::Succeed, tt));

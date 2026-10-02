@@ -20,6 +20,9 @@ DTMRS_DB=sqlite:dtmrs.db dtmrs
 | `DTMRS_WORKERS` | `16` | 并行推进的 worker 数，见下面「吞吐不够怎么调」 |
 | `DTMRS_DB_POOL` | `32` | 存储连接池上限。**要和 `DTMRS_WORKERS` 一起调** |
 | `DTMRS_INLINE_SUBMIT` | 开 | 提交后直接开推，省掉每笔一次抢占往返。`0` 关掉 |
+| `DTMRS_TIMEOUT_TO_FAIL` | `35` | TCC / XA 停在 prepared 多少秒没人 submit / abort 就由 TC 回滚（同 DTM）。`0` 关掉。单笔事务可在 prepare 时用 `timeout_to_fail` 覆盖 |
+| `DTMRS_ALERT_WEBHOOK` | 无 | 事务重试到上限就 POST 告警到这里，见 [排错：怎么发现卡住的事务](troubleshooting.md#怎么发现卡住的事务) |
+| `DTMRS_ALERT_RETRY_LIMIT` | `3` | 重试到第几轮开始告警（同 DTM 的 `AlertRetryLimit`） |
 | `DTMRS_GRPC_CA` | 无 | `grpcs://` 分支的额外 CA（PEM 文件路径）。系统信任库和内置 Mozilla 根本来就会被信任，这个是给两者都不认的自签证书用的 |
 
 ### 内联提交（默认开）

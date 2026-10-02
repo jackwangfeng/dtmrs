@@ -83,6 +83,9 @@ message PrepareRequest {
   repeated string payloads = 6;
   // msg 用：topic:// 没有订阅者时放行（展开成 0 个分支）而不是报 topic not found
   bool allow_empty_topic = 7;
+  // tcc / xa 用：停在 prepared 多少秒没人 submit / abort 就由 TC 回滚（同 DTM 的
+  // timeout_to_fail），0 表示用默认值（DTMRS_TIMEOUT_TO_FAIL，默认 35）
+  int64 timeout_to_fail = 8;
 }
 
 message AbortRequest {
@@ -108,6 +111,9 @@ message RegisterBranchRequest {
   // XA 用
   string commit = 6;
   string rollback = 7;
+  // 分支的业务数据（同 DTM 的 data），confirm / cancel 收到的请求体。
+  // 二阶段要知道 try 冻结了什么，靠它带过去。重复登记以第一次的为准
+  string data = 8;
 }
 
 message BranchView {
@@ -126,4 +132,8 @@ message TransView {
   // 没终结时没有这个字段
   optional int64 finish_time = 6;
   repeated BranchView branches = 7;
+  // 退避重试了多少轮。一直涨说明卡住了
+  int64 retry_count = 8;
+  // 下次推进的时刻（unix 秒）
+  int64 next_cron_time = 9;
 }

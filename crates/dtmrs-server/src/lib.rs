@@ -6,6 +6,7 @@
 //! 是 0% —— 而「两边不许漂移」恰恰是这个项目最要紧的结构约束之一。
 //! 现在两边都能被 tests/ 拿到，可以用同一组用例做等价性测试。
 
+pub mod alert;
 pub mod api;
 pub mod auth;
 pub mod driver;
@@ -34,8 +35,26 @@ fn global(gid: &str, tt: TransType, status: GlobalStatus, payload: String) -> Gl
         query_prepared: String::new(),
         create_time: 0,
         finish_time: None,
+        timeout_to_fail: 0,
+        retry_count: 0,
     }
 }
+
+/// TCC / XA 停在 prepared 的全局默认时限（秒）：`DTMRS_TIMEOUT_TO_FAIL`，
+/// 没配用 [`dtmrs_core::DEFAULT_TIMEOUT_TO_FAIL`]（35，同 DTM），0 表示不超时。
+/// 进程内只读一次
+pub fn timeout_to_fail_default() -> i64 {
+    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DTMRS_TIMEOUT_TO_FAIL")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(dtmrs_core::DEFAULT_TIMEOUT_TO_FAIL)
+    })
+}
+
+/// 不超时的事务排到哪：远到不会到期，又留足余量不会在加法里溢出
+pub const NEVER: i64 = i64::MAX / 4;
 
 /// 把一组 SAGA 步骤展开成"1 个全局事务 + 2N 个分支"。
 ///
@@ -134,6 +153,25 @@ pub fn msg_rows_expanded(
 
 /// TCC：`prepare` 只建全局事务，**分支是客户端在 try 阶段动态登记的**
 /// （`Store::register_branch`）。所以这里不产生任何分支行。
+///
+/// ⚠ 调度时间是「现在」，不是 prepared 时限 —— 这个函数也被当成通用模板用
+/// （嵌入式的 workflow 拿它改成 submitted 直接开推）。真正的 TCC / XA prepare 走
+/// [`tcc_rows_with_timeout`]。排早了也不出错：推进器捞到没到点的 prepared 会排回时限
 pub fn tcc_rows(gid: &str) -> GlobalRow {
     global(gid, TransType::Tcc, GlobalStatus::Prepared, "[]".into())
+}
+
+/// TCC / XA prepare 用：带这笔事务自己的 prepared 时限（0 = 全局默认），
+/// 调度时间直接排到时限那一刻 —— prepared 的 TCC / XA 要被推进器捞起来的唯一理由
+/// 就是超时回滚，排早了只是白抢一次
+pub fn tcc_rows_with_timeout(gid: &str, timeout_to_fail: i64) -> GlobalRow {
+    let mut g = global(gid, TransType::Tcc, GlobalStatus::Prepared, "[]".into());
+    g.timeout_to_fail = timeout_to_fail.max(0);
+    g.next_cron_time = dtmrs_core::prepared_deadline(
+        dtmrs_store::now(),
+        g.timeout_to_fail,
+        timeout_to_fail_default(),
+    )
+    .unwrap_or(NEVER);
+    g
 }
